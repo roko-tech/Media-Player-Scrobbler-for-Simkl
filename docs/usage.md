@@ -64,6 +64,22 @@ Right-click the tray icon to access the app menu with options to:
 - Start/stop/pause monitoring
 - View currently detected media
 - Access settings
+- **Tools:**
+    - **Try Scrobble Again:** If media is misidentified or fails to scrobble, use this option. It clears the cache for the currently playing item and attempts to re-identify and scrobble it. You'll see a notification like `Attempting to re-identify 'Your Media Title'...` when triggered, followed by the usual scrobbling notifications if successful.
+    - **Clear Cache:** Removes all cached media identification data and backlog entries. This option:
+        - Clears all stored media cache files
+        - Removes all backlog data (pending scrobbles)
+        - Resets currently tracked media
+        - Shows a confirmation dialog before proceeding
+        - Helpful when experiencing persistent identification issues or after major updates
+    - **Clear All Data:** Completely resets the application by removing:
+        - All cached media data
+        - All log files
+        - Backlog and playback history
+        - Watch history
+        - All settings and credentials
+        - Environment configuration
+        - **Note:** This is a drastic action that will exit the application after completion and require re-authentication
 - Exit the application
 
 ## 🚦 Real-World Performance Timings
