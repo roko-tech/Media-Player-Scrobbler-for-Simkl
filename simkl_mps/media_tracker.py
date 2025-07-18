@@ -69,7 +69,7 @@ class MediaTracker:
             return None
 
         try:
-            movie = search_movie(title, self.client_id, self.access_token)
+            movie = search_movie(title, self.client_id, self.access_token, file_path=None)
             
             if not movie:
                 logger.warning(f"No match found for '{title}'")

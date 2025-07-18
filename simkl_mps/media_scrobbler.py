@@ -92,6 +92,7 @@ class MediaScrobbler:
         self.episode = None # Episode number for episodes
         self.last_backlog_attempt_time = {} # Track last offline sync attempt per item {cache_key: timestamp}
         self._last_connection_error_log = {} # Tracks last log time for player connection errors
+        self._backlog_notification_throttle = {} # Track last notification time per item {item_key: timestamp}
 
         self.playback_log_file = self.app_data_dir / 'playback_log.jsonl'
         self.playback_logger = logging.getLogger('PlaybackLogger')
@@ -122,6 +123,19 @@ class MediaScrobbler:
         """Set a callback function for notifications"""
         self.notification_callback = callback
 
+    def clear_backlog_processing_state(self):
+        """Clear the in-memory backlog processing state. Called when cache is cleared."""
+        with self._processing_lock:
+            items_cleared = len(self._processing_backlog_items)
+            self._processing_backlog_items.clear()
+            # Also clear notification throttle to allow fresh notifications after cache clear
+            notification_items_cleared = len(self._backlog_notification_throttle)
+            self._backlog_notification_throttle.clear()
+            if items_cleared > 0 or notification_items_cleared > 0:
+                logger.info(f"Cleared {items_cleared} items from backlog processing state and {notification_items_cleared} notification throttles")
+            else:
+                logger.debug("Backlog processing state and notification throttles were already empty")
+
     def _send_notification(self, title, message, online_only=False, offline_only=False):
         """
         Safely sends a notification if the callback is set, respecting online/offline constraints.
@@ -138,6 +152,28 @@ class MediaScrobbler:
                 logger.debug(f"Sent notification: '{title}'")
             except Exception as e:
                 logger.error(f"Failed to send notification '{title}': {e}", exc_info=True)
+
+    def _send_throttled_backlog_notification(self, item_key, title, message, throttle_minutes=30):
+        """
+        Sends a notification for backlog sync errors with throttling to prevent spam.
+        Only sends a notification if enough time has passed since the last notification for this item.
+        
+        Args:
+            item_key (str): The unique key for the backlog item
+            title (str): Notification title
+            message (str): Notification message
+            throttle_minutes (int): Minutes to wait between notifications for the same item
+        """
+        current_time = time.time()
+        last_notification_time = self._backlog_notification_throttle.get(item_key, 0)
+        throttle_seconds = throttle_minutes * 60
+        
+        if current_time - last_notification_time >= throttle_seconds:
+            self._send_notification(title, message)
+            self._backlog_notification_throttle[item_key] = current_time
+            logger.debug(f"Sent throttled notification for item '{item_key}'")
+        else:
+            logger.debug(f"Notification throttled for item '{item_key}' (last sent {(current_time - last_notification_time)/60:.1f} minutes ago)")
 
     def _log_playback_event(self, event_type, extra_data=None):
         """Logs a structured playback event to the playback log file."""
@@ -859,7 +895,7 @@ class MediaScrobbler:
                 if title == '?' or year == 0:
                     if retry_attempt <= max_retries:
                         logger.warning(f"Invalid offline guessit detection for file '{filepath}' (attempt {retry_attempt}/{max_retries}): title='{title}', year={year}. Retrying...")
-                        # Wait a moment and retry with fresh parsing
+                        # Wait a moment and retry
                         time.sleep(1)
                         try:
                             new_guessit_info = guessit.guessit(os.path.basename(filepath))
@@ -869,7 +905,7 @@ class MediaScrobbler:
                             return
                     else:
                         logger.error(f"Failed to get valid offline detection after {max_retries} attempts for file '{filepath}'. Skipping.")
-                        self._send_notification("Offline Media Detection Failed", f" File skipped. Could not identify '{os.path.basename(filepath)}' after {max_retries} attempts.", offline_only=True)
+                        self._send_notification("Offline Media Detection Failed", f" File skipped. Could not extract title from '{os.path.basename(filepath)}' after {max_retries} attempts.", offline_only=True)
                         return
                 
                 self.media_type = info_to_use.get('type', 'episode') # Guessit 'episode' or 'movie'
@@ -1114,20 +1150,20 @@ class MediaScrobbler:
                     )
             return
 
-        logger.info(f"Attempting Simkl movie title search for: '{title_to_search}'")
+        logger.info(f"Attempting Simkl movie search for: '{title_to_search}'")
         try:
-            results = search_movie(title_to_search, self.client_id, self.access_token)
+            # Use file search directly if filepath is available, otherwise fall back to title search
+            results = search_movie(title_to_search, self.client_id, self.access_token, file_path=self.current_filepath)
             if results:
                 # search_movie can return a list or a single movie dict
                 # _process_simkl_search_result handles both list (takes first) and dict
                 self._process_simkl_search_result(results, title_to_search, cache_key, "simkl_search_movie")
             else:
                 logger.warning(f"Simkl movie search for '{title_to_search}' returned no results.")
-                # No specific fallback here for movies other than what might be in cache already
         except RequestException as e:
-            logger.warning(f"Network error during Simkl movie title search for '{title_to_search}': {e}")
+            logger.warning(f"Network error during Simkl movie search for '{title_to_search}': {e}")
         except Exception as e:
-            logger.error(f"Error during Simkl movie title search for '{title_to_search}': {e}", exc_info=True)
+            logger.error(f"Error during Simkl movie search for '{title_to_search}': {e}", exc_info=True)
 
     def _clear_backlog_entry_if_temp_identified(self):
         """Removes a temporary 'identification_pending' backlog entry if the current item was resolved from it."""
@@ -1559,6 +1595,34 @@ class MediaScrobbler:
             logger.error(f"Error storing in local watch history (ID: {simkl_id}): {e}", exc_info=True)
 
 
+    def remove_failed_backlog_items(self):
+        """
+        Remove backlog items that have permanently failed (exceeded MAX_ATTEMPTS).
+        Returns the number of items removed.
+        """
+        MAX_ATTEMPTS = 5
+        removed_count = 0
+        
+        pending_items_dict = self.backlog_cleaner.get_pending()
+        items_to_remove = []
+        
+        for item_key, item_data in pending_items_dict.items():
+            attempt_count = item_data.get("attempt_count", 0)
+            if attempt_count >= MAX_ATTEMPTS:
+                items_to_remove.append((item_key, item_data.get("title", item_key)))
+        
+        for item_key, title in items_to_remove:
+            logger.info(f"[Backlog] Removing permanently failed item: '{title}' (Key: {item_key}, Attempts: {pending_items_dict[item_key].get('attempt_count', 0)})")
+            self.backlog_cleaner.remove(item_key)
+            # Clean up any notification throttle data for this item
+            self._backlog_notification_throttle.pop(item_key, None)
+            removed_count += 1
+        
+        if removed_count > 0:
+            logger.info(f"[Backlog] Removed {removed_count} permanently failed items from backlog.")
+        
+        return removed_count
+
     def process_backlog(self):
         """Processes pending backlog items: identifies, resolves, and syncs to Simkl."""
         MAX_ATTEMPTS = 5
@@ -1577,8 +1641,18 @@ class MediaScrobbler:
         if not pending_items_dict:
             return {'processed': 0, 'attempted': 0, 'failed': False, 'reason': 'No items'}
 
+        # Clean up items that have permanently failed before processing
+        removed_count = self.remove_failed_backlog_items()
+        if removed_count > 0:
+            # Refresh the pending items after cleanup
+            pending_items_dict = self.backlog_cleaner.get_pending()
+            if not pending_items_dict:
+                logger.info(f"[Backlog] All {removed_count} items were permanently failed and removed. Nothing left to process.")
+                return {'processed': 0, 'attempted': 0, 'failed': False, 'reason': 'All items permanently failed'}
+
         logger.info(f"[Backlog] Processing {len(pending_items_dict)} items...")
-        self._send_notification("Simkl Backlog Sync", f"Started: Attempting to sync {len(pending_items_dict)} items...")
+        # Send start notification - simplified message
+        self._send_notification("Simkl Backlog Sync", f"{len(pending_items_dict)} items ready to sync")
         success_count = 0
         attempted_this_cycle = 0
         failure_this_cycle = False
@@ -1608,8 +1682,10 @@ class MediaScrobbler:
                 last_attempt_ts = item_data.get("last_attempt_timestamp")
 
                 if attempt_count >= MAX_ATTEMPTS:
-                    logger.warning(f"[Backlog] Item '{display_title}' (Key: {item_key}) max attempts reached. Skipping.")
-                    # Consider permanent failure logic here if needed (e.g., move to a "failed" log)
+                    # This should rarely happen now since we remove failed items at the start
+                    logger.debug(f"[Backlog] Item '{display_title}' (Key: {item_key}) max attempts reached. Removing permanently.")
+                    self.backlog_cleaner.remove(item_key)
+                    self._backlog_notification_throttle.pop(item_key, None)
                     continue
 
                 if last_attempt_ts:
@@ -1627,7 +1703,7 @@ class MediaScrobbler:
                 
                 if not resolution_success:
                     logger.warning(f"[Backlog] Failed to resolve identity for '{display_title}' (Key: {item_key}): {api_error_msg}")
-                    self._send_notification("Simkl Backlog Sync", f"Error with '{display_title}': Failed to resolve identity ({api_error_msg or 'Unknown error'}). Will retry.")
+                    # Removed individual error notification - only log the error
                     self.backlog_cleaner.update_item(item_key, {
                         'attempt_count': attempt_count + 1,
                         'last_attempt_timestamp': current_time,
@@ -1648,7 +1724,7 @@ class MediaScrobbler:
 
                 if not simkl_id_to_sync or not media_type_to_sync:
                     logger.error(f"[Backlog] Resolved item '{title_to_sync}' missing Simkl ID or Type. Cannot sync.")
-                    self._send_notification("Simkl Backlog Sync", f"Error with '{title_to_sync}': Resolved item missing critical data. Will retry.")
+                    # Removed individual error notification - only log the error
                     self.backlog_cleaner.update_item(item_key, {
                         'attempt_count': attempt_count + 1, 'last_attempt_timestamp': current_time,
                         'last_error': "Resolved item missing ID/Type"
@@ -1680,7 +1756,7 @@ class MediaScrobbler:
 
                 if not payload:
                     logger.error(f"[Backlog] Failed to build payload for '{title_to_sync}' (ID: {simkl_id_to_sync}). Error in item data.")
-                    self._send_notification("Simkl Backlog Sync", f"Error with '{title_to_sync}': Failed to prepare item for sync. Will retry.")
+                    # Removed individual error notification - only log the error
                     self.backlog_cleaner.update_item(item_key, {
                         'attempt_count': attempt_count + 1, 'last_attempt_timestamp': current_time,
                         'last_error': "Payload build failed"
@@ -1731,7 +1807,7 @@ class MediaScrobbler:
 
                 if sync_api_error:
                     logger.warning(f"[Backlog] Sync failed for '{title_to_sync}': {sync_api_error}")
-                    self._send_notification("Simkl Backlog Sync", f"Error with '{title_to_sync}': Sync failed ({sync_api_error}). Will retry.")
+                    # Removed individual error notification - only log the error
                     self.backlog_cleaner.update_item(item_key, {
                         'attempt_count': attempt_count + 1,
                         'last_attempt_timestamp': current_time,
@@ -1744,15 +1820,17 @@ class MediaScrobbler:
                     if item_key in self._processing_backlog_items:
                         self._processing_backlog_items.remove(item_key)
         
-        # Summary Notifications
+        # Summary Notifications - simplified format
         if not pending_items_dict: # Should have been caught by initial check if backlog was empty
             pass # No notification needed here as initial check handles it.
-        elif success_count == attempted_this_cycle and success_count > 0: # All attempted items succeeded
-            self._send_notification("Simkl Backlog Sync", f"Successful: Synced all {success_count} attempted items.")
-        elif success_count > 0 and success_count < attempted_this_cycle: # Some succeeded, some failed
-            self._send_notification("Simkl Backlog Sync", f"Partially Successful: Synced {success_count} items. {attempted_this_cycle - success_count} items had errors and will be retried.")
-        elif success_count == 0 and attempted_this_cycle > 0: # All attempted items failed
-            self._send_notification("Simkl Backlog Sync", f"Failed: Attempted {attempted_this_cycle} items, but none synced due to errors. Will retry.")
+        elif attempted_this_cycle > 0:
+            failed_count = attempted_this_cycle - success_count
+            if failed_count == 0:
+                # All items synced successfully
+                self._send_notification("Simkl Backlog Sync", f"{success_count} items synced")
+            else:
+                # Some items failed
+                self._send_notification("Simkl Backlog Sync", f"{success_count} items synced, {failed_count} items failed. Will retry.")
         # Fallback log, no specific notification for this general case unless it's a new state.
         elif attempted_this_cycle > 0 : # Generic completion if other states not met
              logger.info(f"[Backlog] Cycle complete. Attempted: {attempted_this_cycle}, Synced: {success_count}.")
@@ -1819,7 +1897,7 @@ class MediaScrobbler:
             episode_patterns = [
                 r'[sS]\d{1,3}[eE]\d{1,4}',  # S01E02, s1e2
                 r'\d{1,3}x\d{1,4}',         # 1x02, 10x5
-                r'[sS]\d{1,3}\.?[eE]?\d{1,4}', # S01.E02, S01.02, S0102
+                r'[sS]\d{1,3}\.?[eE]?\d{1,4}', # S01.E02, S01E02, S01.01
                 r'episode\s*\d{1,4}',       # episode 1, episode 12
                 r'\s\d{1,2}\s',             # space-padded episode numbers (anime)
             ]
@@ -1839,7 +1917,7 @@ class MediaScrobbler:
                 # This works because search_file can handle titles that look like episode filenames
                 api_search_result = search_file(search_term_title, self.client_id)
             elif media_type_guess == 'movie':
-                api_search_result = search_movie(search_term_title, self.client_id, self.access_token)
+                api_search_result = search_movie(search_term_title, self.client_id, self.access_token, file_path=original_filepath)
             elif not original_filepath:
                 # Fallback: no filepath and no clear type hint - try movie search
                 logger.info(f"[Backlog Resolve] No filepath and ambiguous type, defaulting to movie search for '{search_term_title}'")

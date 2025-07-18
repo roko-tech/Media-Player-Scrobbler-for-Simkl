@@ -56,14 +56,18 @@ def _add_user_agent(headers):
     headers["User-Agent"] = USER_AGENT
     return headers
 
-def search_movie(title, client_id, access_token):
+def search_movie(title, client_id, access_token, file_path=None):
     """
-    Searches for a movie by title on Simkl using the /search/movie endpoint.
+    Searches for a movie using multiple endpoints in order:
+    1. /search/movie (title search)
+    2. /search/file (if file_path provided)
+    3. /search/anime (for anime movies)
 
     Args:
         title (str): The movie title to search for.
         client_id (str): Simkl API client ID.
         access_token (str): Simkl API access token.
+        file_path (str, optional): The file path to use for file-based search.
 
     Returns:
         dict | None: The first matching movie result dictionary, or None if
@@ -82,125 +86,96 @@ def search_movie(title, client_id, access_token):
         'Authorization': f'Bearer {access_token}'
     }
     headers = _add_user_agent(headers)
-    params = {'q': title, 'extended': 'full'}
 
+    # 1. Try movie title search first
+    logger.info(f"Simkl API: Searching for movie by title: '{title}'...")
     try:
-        logger.info(f"Simkl API: Searching for movie '{title}'...")
+        params = {'q': title, 'extended': 'full'}
         response = requests.get(f'{SIMKL_API_BASE_URL}/search/movie', headers=headers, params=params)
 
-        if response.status_code != 200:
-            error_details = ""
-            try:
-                # Try to get JSON details first
-                error_details = response.json()
-            except requests.exceptions.JSONDecodeError:
-                # Fallback to raw text if JSON parsing fails
-                error_details = response.text
-            logger.error(f"Simkl API: Movie search failed for '{title}'. Status: {response.status_code}. Response: {error_details}")
-            return None
+        if response.status_code == 200:
+            results_json = response.json()
+            logger.info(f"Simkl API: Found {len(results_json) if isinstance(results_json, list) else 'N/A'} movie results for '{title}'.")
 
-        # Process the response to find and reshape the movie item
-        results_json = response.json()
-        logger.info(f"Simkl API: Found {len(results_json) if isinstance(results_json, list) else 'N/A'} results for '{title}'.")
+            if isinstance(results_json, list) and results_json:
+                movie_item = results_json[0]
+                
+                # Ensure it's wrapped in {'movie': ...} structure
+                if 'movie' not in movie_item:
+                    logger.info(f"Simkl API: Reshaping movie search result for '{title}' into {{'movie': ...}} structure.")
+                    movie_item = {'movie': movie_item}
+                
+                # ID consistency check
+                if 'movie' in movie_item and isinstance(movie_item.get('movie'), dict) and 'ids' in movie_item['movie']:
+                    ids = movie_item['movie']['ids']
+                    simkl_id_alt = ids.get('simkl_id') 
+                    if simkl_id_alt and not ids.get('simkl'):
+                        logger.info(f"Simkl API: Found ID under 'simkl_id' in movie object, adding 'simkl' key for consistency.")
+                        movie_item['movie']['ids']['simkl'] = simkl_id_alt
+                    elif not ids.get('simkl') and not simkl_id_alt:
+                         logger.warning(f"Simkl API: No 'simkl' or 'simkl_id' found in movie IDs for '{title}'.")
+                
+                logger.info(f"Simkl API: Found movie via title search: '{movie_item['movie'].get('title', title)}'")
+                return movie_item
+        else:
+            logger.warning(f"Simkl API: Movie search failed for '{title}'. Status: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Simkl API: Network error during movie title search for '{title}': {e}")
 
-        final_result_item = None
-
-        if isinstance(results_json, list) and results_json: # Primary search has results in a list
-            final_result_item = results_json[0]
-        elif not isinstance(results_json, list) and results_json is not None : # Unexpected primary search response format but not empty
-            logger.warning(f"Simkl API: Unexpected primary search response format for '{title}'. Expected list, got {type(results_json)}. Response: {results_json}")
-            # final_result_item remains None, fallback will be attempted.
+    # 2. Try file search if file_path is provided
+    if file_path:
+        logger.info(f"Simkl API: Trying file search for: '{file_path}'")
+        file_result = search_file(file_path, client_id)
         
-        # Try fallback if primary search yielded no usable result, was empty, or malformed
-        if not final_result_item: 
-            logger.info(f"Simkl API: No direct match or usable result from primary search for '{title}', attempting fallback search.")
-            final_result_item = _fallback_search_movie(title, client_id, access_token)
-            # _fallback_search_movie returns a single item (dict) or None
+        if file_result and file_result.get('type') == 'movie':
+            movie_info = file_result.get('movie', {})
+            if movie_info and movie_info.get('ids', {}).get('simkl'):
+                # Wrap in the expected format
+                result = {'movie': movie_info}
+                logger.info(f"Simkl API: Found movie via file search: '{movie_info.get('title', title)}'")
+                return result
+        elif file_result:
+            logger.info(f"Simkl API: File search returned '{file_result.get('type')}' instead of movie.")
 
-        if final_result_item: # If we have an item from primary or fallback
-            if isinstance(final_result_item, dict):
-                # Determine if the item is a movie based on 'type' or 'endpoint_type'
-                is_movie_type = (final_result_item.get('type') == 'movie' or \
-                                 final_result_item.get('endpoint_type') == 'movies')
-
-                if is_movie_type:
-                    # If it's a movie type, ensure it's wrapped in {'movie': ...} structure
-                    if 'movie' not in final_result_item:
-                        logger.info(f"Simkl API: Reshaping search result for '{title}' into {{'movie': ...}} structure.")
-                        final_result_item = {'movie': final_result_item}
-                    
-                    # ID consistency check: ensure 'simkl' id exists if 'simkl_id' is present
-                    # This operates on the inner movie dictionary.
-                    if 'movie' in final_result_item and \
-                       isinstance(final_result_item.get('movie'), dict) and \
-                       'ids' in final_result_item['movie']:
-                        ids = final_result_item['movie']['ids']
-                        simkl_id_alt = ids.get('simkl_id') 
-                        if simkl_id_alt and not ids.get('simkl'):
-                            logger.info(f"Simkl API: Found ID under 'simkl_id' in movie object, adding 'simkl' key for consistency.")
-                            final_result_item['movie']['ids']['simkl'] = simkl_id_alt
-                        elif not ids.get('simkl') and not simkl_id_alt:
-                             logger.warning(f"Simkl API: No 'simkl' or 'simkl_id' found in movie IDs for '{title}'.")
-                    # Return the processed (possibly reshaped) movie item
-                    return final_result_item
-                else: # Not identified as a movie type
-                     logger.warning(f"Simkl API: Search for movie '{title}' returned a non-movie item: Type='{final_result_item.get('type')}', EndpointType='{final_result_item.get('endpoint_type')}'. Discarding.")
-                     return None # Explicitly return None if it's not a movie type
-            else: # final_result_item is not a dict (unexpected)
-                logger.warning(f"Simkl API: Expected dictionary for final_result_item from search, got {type(final_result_item)}. Discarding.")
-                return None
-        else: # No results from primary or fallback
-            logger.info(f"Simkl API: No movie results found for '{title}' after primary and fallback search.")
-            return None
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Simkl API: Network error searching for '{title}': {e}", exc_info=True)
-        return None
-
-def _fallback_search_movie(title, client_id, access_token):
-    """
-    Internal fallback search using the /search/all endpoint.
-
-    Args:
-        title (str): The movie title.
-        client_id (str): Simkl API client ID.
-        access_token (str): Simkl API access token.
-
-    Returns:
-        dict | None: The first movie result from the general search, or None.
-    """
-    logger.info(f"Simkl API: Performing fallback search for '{title}'...")
-    headers = {
-        'Content-Type': 'application/json',
-        'simkl-api-key': client_id,
-        'Authorization': f'Bearer {access_token}'
-    }
-    headers = _add_user_agent(headers)
-    params = {'q': title, 'type': 'movie', 'extended': 'full'}
+    # 3. Try anime search for anime movies
+    logger.info(f"Simkl API: Trying anime search for: '{title}'...")
     try:
-        response = requests.get(f'{SIMKL_API_BASE_URL}/search/all', headers=headers, params=params)
-        if response.status_code != 200:
-            logger.error(f"Simkl API: Fallback search failed for '{title}' with status {response.status_code}.")
-            return None
-        results = response.json()
-        logger.info(f"Simkl API: Fallback search found {len(results) if results else 0} total results.")
-        if not results:
-            return None
-            
-        movie_results = [r for r in results if r.get('type') == 'movie']
-        if movie_results:
-            found_title = movie_results[0].get('title', title)
-            logger.info(f"Simkl API: Found movie '{found_title}' in fallback search.")
-            return movie_results[0]
-        logger.info(f"Simkl API: No movie type results found in fallback search for '{title}'.")
-        return None
+        params = {'q': title, 'extended': 'full'}
+        response = requests.get(f'{SIMKL_API_BASE_URL}/search/anime', headers=headers, params=params)
+
+        if response.status_code == 200:
+            results_json = response.json()
+            logger.info(f"Simkl API: Found {len(results_json) if isinstance(results_json, list) else 'N/A'} anime results for '{title}'.")
+
+            if isinstance(results_json, list) and results_json:
+                # Look for anime movies (type='movie')
+                for anime_item in results_json:
+                    if anime_item.get('type') == 'movie':
+                        # Ensure proper ID handling for anime movies
+                        if 'ids' in anime_item:
+                            ids = anime_item['ids']
+                            # Ensure 'simkl' ID exists, use 'simkl_id' if available
+                            if 'simkl_id' in ids and 'simkl' not in ids:
+                                ids['simkl'] = ids['simkl_id']
+                        
+                        # Wrap anime movie in the expected format
+                        result = {'movie': anime_item}
+                        simkl_id = anime_item.get('ids', {}).get('simkl') or anime_item.get('ids', {}).get('simkl_id')
+                        logger.info(f"Simkl API: Found anime movie: '{anime_item.get('title', title)}' (ID: {simkl_id})")
+                        return result
+                
+                logger.info(f"Simkl API: No anime movies found in anime search results for '{title}'.")
+        else:
+            logger.warning(f"Simkl API: Anime search failed for '{title}'. Status: {response.status_code}")
     except requests.exceptions.RequestException as e:
-        logger.error(f"Simkl API: Network error during fallback search for '{title}': {e}", exc_info=True)
-        return None
+        logger.warning(f"Simkl API: Network error during anime search for '{title}': {e}")
+
+    logger.info(f"Simkl API: No movie results found for '{title}' after all search methods.")
+    return None
 
 def search_file(file_path, client_id, part=None):
     """
-    Searches for only tv/anime based on a file path using the Simkl /search/file endpoint.
+    Searches for movies, shows, anime, or episodes based on a file path using the Simkl /search/file endpoint.
 
     Args:
         file_path (str): The full path to the media file.
@@ -209,6 +184,9 @@ def search_file(file_path, client_id, part=None):
 
     Returns:
         dict | None: The parsed JSON response from Simkl, or None if an error occurs.
+        Response can contain 'type' field with values: 'movie', 'episode', 'show', 'anime'
+        For movies: {'type': 'movie', 'movie': {...}}
+        For episodes: {'type': 'episode', 'show': {...}, 'episode': {...}}
     """
     if not is_internet_connected():
         logger.warning(f"Simkl API: Cannot search for file '{file_path}', no internet connection.")
