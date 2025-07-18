@@ -52,6 +52,9 @@ class MediaScrobbler:
     - Falls back to accumulated watch time when web interfaces aren't available
     - Supports multiple media types (movies, episodes, anime)
     """
+    
+    # Class constants
+    MAX_BACKLOG_ATTEMPTS = 5  # Maximum retry attempts for backlog items
 
     def __init__(self, app_data_dir, client_id=None, access_token=None, testing_mode=False):
         self.app_data_dir = pathlib.Path(app_data_dir) # Ensure it's a Path object
@@ -93,6 +96,7 @@ class MediaScrobbler:
         self.last_backlog_attempt_time = {} # Track last offline sync attempt per item {cache_key: timestamp}
         self._last_connection_error_log = {} # Tracks last log time for player connection errors
         self._backlog_notification_throttle = {} # Track last notification time per item {item_key: timestamp}
+        self._general_notification_throttle = {} # Track last notification time for general notifications {key: timestamp}
 
         self.playback_log_file = self.app_data_dir / 'playback_log.jsonl'
         self.playback_logger = logging.getLogger('PlaybackLogger')
@@ -128,11 +132,15 @@ class MediaScrobbler:
         with self._processing_lock:
             items_cleared = len(self._processing_backlog_items)
             self._processing_backlog_items.clear()
-            # Also clear notification throttle to allow fresh notifications after cache clear
+            # Also clear notification throttles to allow fresh notifications after cache clear
             notification_items_cleared = len(self._backlog_notification_throttle)
             self._backlog_notification_throttle.clear()
-            if items_cleared > 0 or notification_items_cleared > 0:
-                logger.info(f"Cleared {items_cleared} items from backlog processing state and {notification_items_cleared} notification throttles")
+            general_notification_items_cleared = len(self._general_notification_throttle)
+            self._general_notification_throttle.clear()
+            
+            total_throttles_cleared = notification_items_cleared + general_notification_items_cleared
+            if items_cleared > 0 or total_throttles_cleared > 0:
+                logger.info(f"Cleared {items_cleared} items from backlog processing state and {total_throttles_cleared} notification throttles")
             else:
                 logger.debug("Backlog processing state and notification throttles were already empty")
 
@@ -174,6 +182,29 @@ class MediaScrobbler:
             logger.debug(f"Sent throttled notification for item '{item_key}'")
         else:
             logger.debug(f"Notification throttled for item '{item_key}' (last sent {(current_time - last_notification_time)/60:.1f} minutes ago)")
+
+    def _send_throttled_notification(self, notification_key, title, message, throttle_minutes=30, **kwargs):
+        """
+        Sends a notification with throttling to prevent spam.
+        Only sends a notification if enough time has passed since the last notification for this key.
+        
+        Args:
+            notification_key (str): The unique key for this type of notification
+            title (str): Notification title
+            message (str): Notification message
+            throttle_minutes (int): Minutes to wait between notifications for the same key
+            **kwargs: Additional arguments to pass to _send_notification
+        """
+        current_time = time.time()
+        last_notification_time = self._general_notification_throttle.get(notification_key, 0)
+        throttle_seconds = throttle_minutes * 60
+        
+        if current_time - last_notification_time >= throttle_seconds:
+            self._send_notification(title, message, **kwargs)
+            self._general_notification_throttle[notification_key] = current_time
+            logger.debug(f"Sent throttled notification for key '{notification_key}'")
+        else:
+            logger.debug(f"Notification throttled for key '{notification_key}' (last sent {(current_time - last_notification_time)/60:.1f} minutes ago)")
 
     def _log_playback_event(self, event_type, extra_data=None):
         """Logs a structured playback event to the playback log file."""
@@ -905,7 +936,13 @@ class MediaScrobbler:
                             return
                     else:
                         logger.error(f"Failed to get valid offline detection after {max_retries} attempts for file '{filepath}'. Skipping.")
-                        self._send_notification("Offline Media Detection Failed", f" File skipped. Could not extract title from '{os.path.basename(filepath)}' after {max_retries} attempts.", offline_only=True)
+                        self._send_throttled_notification(
+                            f"offline_detection_failed_{os.path.basename(filepath)}", 
+                            "Offline Media Detection Failed", 
+                            f" File skipped. Could not extract title from '{os.path.basename(filepath)}' after {max_retries} attempts.", 
+                            throttle_minutes=60,  # Only notify once per hour for the same file
+                            offline_only=True
+                        )
                         return
                 
                 self.media_type = info_to_use.get('type', 'episode') # Guessit 'episode' or 'movie'
@@ -945,7 +982,13 @@ class MediaScrobbler:
                         return
                 else:
                     logger.error(f"Guessit couldn't extract valid title from '{filepath}' for offline fallback after {max_retries} attempts. Skipping.")
-                    self._send_notification("Offline Media Detection Failed", f" File skipped. Could not extract title from '{os.path.basename(filepath)}' after {max_retries} attempts.", offline_only=True)
+                    self._send_throttled_notification(
+                        f"offline_detection_failed_{os.path.basename(filepath)}", 
+                        "Offline Media Detection Failed", 
+                        f" File skipped. Could not extract title from '{os.path.basename(filepath)}' after {max_retries} attempts.", 
+                        throttle_minutes=60,  # Only notify once per hour for the same file
+                        offline_only=True
+                    )
         except Exception as e:
             logger.error(f"Error using guessit for offline fallback: {e}", exc_info=True)
 
@@ -1597,10 +1640,9 @@ class MediaScrobbler:
 
     def remove_failed_backlog_items(self):
         """
-        Remove backlog items that have permanently failed (exceeded MAX_ATTEMPTS).
+        Remove backlog items that have permanently failed (exceeded MAX_BACKLOG_ATTEMPTS).
         Returns the number of items removed.
         """
-        MAX_ATTEMPTS = 5
         removed_count = 0
         
         pending_items_dict = self.backlog_cleaner.get_pending()
@@ -1608,7 +1650,7 @@ class MediaScrobbler:
         
         for item_key, item_data in pending_items_dict.items():
             attempt_count = item_data.get("attempt_count", 0)
-            if attempt_count >= MAX_ATTEMPTS:
+            if attempt_count >= self.MAX_BACKLOG_ATTEMPTS:
                 items_to_remove.append((item_key, item_data.get("title", item_key)))
         
         for item_key, title in items_to_remove:
@@ -1625,7 +1667,6 @@ class MediaScrobbler:
 
     def process_backlog(self):
         """Processes pending backlog items: identifies, resolves, and syncs to Simkl."""
-        MAX_ATTEMPTS = 5
         BASE_RETRY_DELAY_SECONDS = 60 # 1 minute
 
         if not self.client_id or not self.access_token:
@@ -1681,7 +1722,7 @@ class MediaScrobbler:
                 attempt_count = item_data.get("attempt_count", 0)
                 last_attempt_ts = item_data.get("last_attempt_timestamp")
 
-                if attempt_count >= MAX_ATTEMPTS:
+                if attempt_count >= self.MAX_BACKLOG_ATTEMPTS:
                     # This should rarely happen now since we remove failed items at the start
                     logger.debug(f"[Backlog] Item '{display_title}' (Key: {item_key}) max attempts reached. Removing permanently.")
                     self.backlog_cleaner.remove(item_key)

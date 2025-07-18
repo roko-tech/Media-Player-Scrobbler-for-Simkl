@@ -56,6 +56,34 @@ def _add_user_agent(headers):
     headers["User-Agent"] = USER_AGENT
     return headers
 
+def _normalize_simkl_ids(item_dict, item_type="item", title=""):
+    """
+    Normalize Simkl IDs by ensuring 'simkl' key exists if 'simkl_id' is present.
+    
+    Args:
+        item_dict (dict): The item dictionary that may contain an 'ids' field
+        item_type (str): Type of item for logging (e.g., "movie", "anime movie")
+        title (str): Title for logging purposes
+    
+    Returns:
+        bool: True if normalization was successful or not needed, False if no valid ID found
+    """
+    if not isinstance(item_dict, dict) or 'ids' not in item_dict:
+        return False
+    
+    ids = item_dict['ids']
+    simkl_id_alt = ids.get('simkl_id')
+    
+    if simkl_id_alt and not ids.get('simkl'):
+        logger.info(f"Simkl API: Found ID under 'simkl_id' in {item_type}, adding 'simkl' key for consistency.")
+        ids['simkl'] = simkl_id_alt
+        return True
+    elif not ids.get('simkl') and not simkl_id_alt:
+        logger.warning(f"Simkl API: No 'simkl' or 'simkl_id' found in {item_type} IDs for '{title}'.")
+        return False
+    
+    return True  # Already has 'simkl' key or normalization not needed
+
 def search_movie(title, client_id, access_token, file_path=None):
     """
     Searches for a movie using multiple endpoints in order:
@@ -105,15 +133,9 @@ def search_movie(title, client_id, access_token, file_path=None):
                     logger.info(f"Simkl API: Reshaping movie search result for '{title}' into {{'movie': ...}} structure.")
                     movie_item = {'movie': movie_item}
                 
-                # ID consistency check
-                if 'movie' in movie_item and isinstance(movie_item.get('movie'), dict) and 'ids' in movie_item['movie']:
-                    ids = movie_item['movie']['ids']
-                    simkl_id_alt = ids.get('simkl_id') 
-                    if simkl_id_alt and not ids.get('simkl'):
-                        logger.info(f"Simkl API: Found ID under 'simkl_id' in movie object, adding 'simkl' key for consistency.")
-                        movie_item['movie']['ids']['simkl'] = simkl_id_alt
-                    elif not ids.get('simkl') and not simkl_id_alt:
-                         logger.warning(f"Simkl API: No 'simkl' or 'simkl_id' found in movie IDs for '{title}'.")
+                # ID consistency check using helper function
+                if 'movie' in movie_item and isinstance(movie_item.get('movie'), dict):
+                    _normalize_simkl_ids(movie_item['movie'], "movie object", title)
                 
                 logger.info(f"Simkl API: Found movie via title search: '{movie_item['movie'].get('title', title)}'")
                 return movie_item
@@ -151,12 +173,8 @@ def search_movie(title, client_id, access_token, file_path=None):
                 # Look for anime movies (type='movie')
                 for anime_item in results_json:
                     if anime_item.get('type') == 'movie':
-                        # Ensure proper ID handling for anime movies
-                        if 'ids' in anime_item:
-                            ids = anime_item['ids']
-                            # Ensure 'simkl' ID exists, use 'simkl_id' if available
-                            if 'simkl_id' in ids and 'simkl' not in ids:
-                                ids['simkl'] = ids['simkl_id']
+                        # Ensure proper ID handling for anime movies using helper function
+                        _normalize_simkl_ids(anime_item, "anime movie", title)
                         
                         # Wrap anime movie in the expected format
                         result = {'movie': anime_item}
