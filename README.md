@@ -85,7 +85,7 @@ If you find this project useful, consider supporting development:
 - [Simkl](https://simkl.com) – API platform
 - [guessit](https://github.com/guessit-io/guessit) – Filename parsing
 - [iamkroot's Trakt Scrobbler](https://github.com/iamkroot/trakt-scrobbler/) – Inspiration
-- [masyk](https://github.com/masyk) – Logo and technical guidance (SIMKL Dev)
+- [masyk](https://github.com/masyk), [Ichika](https://github.com/ekleop) – Logo and technical guidance (SIMKL Devs)
 
 ## 🛠️ Related Tools
 
