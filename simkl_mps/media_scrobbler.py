@@ -121,6 +121,7 @@ class MediaScrobbler:
         self._mpcqt_integration = None
         self._mpv_integration = None
         self._mpv_wrapper_integration = None
+        self._potplayer_integration = None
         self.watch_history = WatchHistoryManager(self.app_data_dir) # Initialize watch history manager
 
     def set_notification_callback(self, callback):
@@ -262,6 +263,13 @@ class MediaScrobbler:
                 from simkl_mps.players.mpv import MPVIntegration
                 self._mpv_integration = MPVIntegration()
             return self._mpv_integration
+        
+        # PotPlayer support (Windows only)
+        if any(p in process_name_lower for p in ['potplayer', 'potplayermini', 'potplayermini64']):
+            if not self._potplayer_integration:
+                from simkl_mps.players.potplayer import PotPlayerIntegration
+                self._potplayer_integration = PotPlayerIntegration()
+            return self._potplayer_integration
         
         # MPV Wrapper support (must be checked after standalone mpv)
         if not self._mpv_wrapper_integration:

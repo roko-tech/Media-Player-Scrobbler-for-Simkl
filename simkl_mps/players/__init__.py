@@ -7,6 +7,7 @@ from simkl_mps.players.mpv import MPVIntegration
 from simkl_mps.players.mpc import MPCHCIntegration, MPCIntegration
 from simkl_mps.players.mpcqt import MPCQTIntegration
 from simkl_mps.players.mpv_wrappers import MPVWrapperIntegration
+from simkl_mps.players.potplayer import PotPlayerIntegration
 
 __all__ = [
     'VLCIntegration',
@@ -14,5 +15,6 @@ __all__ = [
     'MPCHCIntegration',
     'MPCIntegration',
     'MPCQTIntegration',
-    'MPVWrapperIntegration'
+    'MPVWrapperIntegration',
+    'PotPlayerIntegration'
 ]
