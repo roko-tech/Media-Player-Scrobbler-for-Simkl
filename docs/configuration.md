@@ -10,10 +10,12 @@ Settings can be customized via config files, environment variables, or command-l
 ### Config File Locations
 
 | Platform | Config File Location |
-|----------|---------------------|
-| Windows  | `%APPDATA%\kavin\simkl-mps\.simkl_mps.env` |
-| macOS    | `~/Library/Application Support/kavin/simkl-mps/.simkl_mps.env` |
-| Linux    | `~/.local/share/kavin/simkl-mps/.simkl_mps.env` |
+|----------|----------------------|
+| Windows  | `%USERPROFILE%\kavin\simkl-mps\` |
+| macOS    | `~/kavin/simkl-mps/` |
+| Linux    | `~/kavin/simkl-mps/` |
+
+Note: The application currently uses a unified path scheme based on your home directory rather than OS-specific config folders (e.g. AppData, Library/Application Support, or .local/share). A migration utility transparently moves any older data from `kavinthangavel` to `kavin` on first run.
 
 ### Example Settings
 
