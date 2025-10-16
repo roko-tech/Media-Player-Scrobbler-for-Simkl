@@ -12,11 +12,17 @@ import logging
 import webbrowser
 import subprocess
 from pathlib import Path
+from typing import Any, Optional, TYPE_CHECKING, cast
 from PIL import Image, ImageDraw, ImageFont
 import abc
 import pystray
 import tkinter as tk
 from tkinter import messagebox
+
+if TYPE_CHECKING:
+    from simkl_mps.main import SimklScrobbler
+    from simkl_mps.media_scrobbler import MediaScrobbler
+    from simkl_mps.watch_history_manager import WatchHistoryManager
 
 # Import API and credential functions
 from simkl_mps.simkl_api import get_user_settings, pin_auth_flow
@@ -146,7 +152,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
 
 
     def __init__(self):
-        self.scrobbler = None
+        self.scrobbler: Optional["SimklScrobbler"] = None
         self.monitoring_active = False
         self.status = "stopped"
         self.status_details = ""
@@ -168,7 +174,8 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         # Improved asset path resolution for frozen applications
         if getattr(sys, 'frozen', False):
             # When frozen, look for assets in multiple locations
-            base_dir = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path(sys.executable).parent
+            meipass_dir = getattr(sys, "_MEIPASS", None)
+            base_dir = Path(meipass_dir) if meipass_dir else Path(sys.executable).parent
             possible_asset_paths = [
                 base_dir / "simkl_mps" / "assets",  # Standard location in the frozen app
                 base_dir / "assets",                # Alternative location
@@ -217,6 +224,32 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         if changed and not initial:
             logger.info("Authentication state changed: %s", "authenticated" if authenticated else "not authenticated")
         return changed
+
+    def _get_media_scrobbler(self) -> Any:
+        """Return the active MediaScrobbler instance if available."""
+        scrobbler_instance = self.scrobbler
+        if not scrobbler_instance:
+            return None
+        monitor = getattr(scrobbler_instance, "monitor", None)
+        return getattr(monitor, "scrobbler", None)
+
+    def _get_watch_history_manager(self) -> Any:
+        """Return the active WatchHistoryManager instance if available."""
+        scrobbler_instance = self.scrobbler
+        if scrobbler_instance and hasattr(scrobbler_instance, "watch_history_manager"):
+            return scrobbler_instance.watch_history_manager
+        return None
+
+    def _ensure_threshold_value(self, value: Any) -> int:
+        """Convert stored threshold value to an int with a safe fallback."""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_THRESHOLD
+
+    def check_updates_thread(self):
+        """Optional hook for subclasses that implement update checks."""
+        logger.debug("Update check not implemented for this platform.")
 
     def _get_auth_menu_label(self):
         if self._auth_in_progress:
@@ -655,9 +688,18 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
 
     def process_backlog(self, _=None):
         """Process the backlog from the tray menu"""
+        media_scrobbler = self._get_media_scrobbler()
+        if not media_scrobbler or not hasattr(media_scrobbler, "process_backlog"):
+            logger.warning("Cannot process backlog: media scrobbler is unavailable.")
+            self.show_notification(
+                "simkl-mps Error",
+                "Backlog processing is unavailable because monitoring is not running."
+            )
+            return 0
+
         def _process():
             try:
-                result = self.scrobbler.monitor.scrobbler.process_backlog()
+                result = media_scrobbler.process_backlog()
                 
                 # Handle both the old integer return type and new dictionary return type
                 if isinstance(result, dict):
@@ -831,7 +873,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             # Reset scrobbler state if running
             if self.scrobbler:
                 if hasattr(self.scrobbler, 'monitor') and hasattr(self.scrobbler.monitor, 'scrobbler'):
-                    scrobbler = self.scrobbler.monitor.scrobbler
+                    scrobbler: Any = self.scrobbler.monitor.scrobbler
                     
                     # Use the new reset method for comprehensive state clearing
                     if hasattr(scrobbler, 'reset_tracking_state'):
@@ -876,7 +918,9 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
     def _apply_threshold_change(self, new_threshold: int | None):
         """Applies the threshold change: saves, updates scrobbler, notifies, updates UI."""
         logger.debug(f"TrayBase: _apply_threshold_change called with new_threshold='{new_threshold}' (type: {type(new_threshold)})")
-        current_threshold = get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
+        current_threshold = self._ensure_threshold_value(
+            get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
+        )
         logger.debug(f"TrayBase: Current threshold from settings: {current_threshold}")
 
         if new_threshold is not None and new_threshold != current_threshold:
@@ -887,11 +931,9 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                 self.show_notification("Settings Updated", f"Watch threshold set to {new_threshold}%")
 
                 # Attempt to update the running scrobbler instance
-                if self.scrobbler and hasattr(self.scrobbler, 'monitor') and \
-                   hasattr(self.scrobbler.monitor, 'scrobbler') and \
-                   hasattr(self.scrobbler.monitor.scrobbler, 'completion_threshold'):
-
-                    self.scrobbler.monitor.scrobbler.completion_threshold = new_threshold # Store as percentage
+                media_scrobbler = self._get_media_scrobbler()
+                if media_scrobbler and hasattr(media_scrobbler, 'completion_threshold'):
+                    media_scrobbler.completion_threshold = new_threshold # Store as percentage
                     logger.debug(f"Updated running scrobbler instance threshold to {new_threshold}%")
                 else:
                     logger.warning("Could not update running scrobbler instance threshold (not found or not running).")
@@ -922,9 +964,11 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
     def set_custom_watch_threshold(self, _=None):
         """Handles prompting the user for a custom threshold via platform-specific dialog."""
         logger.debug("TrayBase: set_custom_watch_threshold called.")
-        current_threshold = get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
+        current_threshold = self._ensure_threshold_value(
+            get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
+        )
         logger.debug(f"TrayBase: Current threshold for custom dialog: {current_threshold}%")
-        result_queue = queue.Queue()
+        result_queue: "queue.Queue[int | None]" = queue.Queue()
 
         def _ask_in_thread():
             """Runs the platform-specific dialog in a separate thread."""
@@ -990,7 +1034,9 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         """Builds the list of pystray menu items common to multiple platforms."""
         # Get current threshold for radio button state
         self._refresh_auth_state()
-        current_threshold = get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
+        current_threshold = self._ensure_threshold_value(
+            get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
+        )
         is_preset = lambda val: current_threshold == val
 
         menu_items = [
@@ -1210,15 +1256,17 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                         failed_items.append(f"environment file ({env_path.name})")
             
             # Clear watch history (via scrobbler if available)
-            if self.scrobbler and hasattr(self.scrobbler, 'watch_history_manager'):
-                whm = self.scrobbler.watch_history_manager
-                if hasattr(whm, 'clear_history'):
-                    try:
-                        whm.clear_history()
-                        cleared_items.append("watch history")
-                    except Exception as e:
-                        logger.warning(f"Could not clear watch history: {e}")
-                        failed_items.append("watch history")
+            watch_history_manager = self._get_watch_history_manager()
+            if watch_history_manager:
+                try:
+                    if hasattr(watch_history_manager, 'clear'):
+                        watch_history_manager.clear()
+                    elif hasattr(watch_history_manager, 'clear_history'):
+                        watch_history_manager.clear_history()
+                    cleared_items.append("watch history")
+                except Exception as e:
+                    logger.warning(f"Could not clear watch history: {e}")
+                    failed_items.append("watch history")
             
             # Clear settings file
             settings_file = APP_DATA_DIR / "settings.json"
@@ -1278,23 +1326,20 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         # Show initial notification that the process is starting
         
         try:
-            # Check if we have a scrobbler and it's currently tracking something
-            if not self.scrobbler:
-                self.show_notification("simkl-mps", "No scrobbler instance available.")
+            media_scrobbler = self._get_media_scrobbler()
+            if not media_scrobbler:
+                self.show_notification("simkl-mps", "Monitoring is not active.")
                 return 0
-            
-            # Get the actual scrobbler instance (might be nested in monitor)
-            actual_scrobbler = self.scrobbler
-            if hasattr(self.scrobbler, 'monitor') and hasattr(self.scrobbler.monitor, 'scrobbler'):
-                actual_scrobbler = self.scrobbler.monitor.scrobbler
-            
+
+            actual_scrobbler: Any = media_scrobbler
+
             # Check if something is currently being tracked
-            if not actual_scrobbler.currently_tracking:
+            if not getattr(actual_scrobbler, "currently_tracking", None):
                 self.show_notification("simkl-mps", "No media is currently being tracked.")
                 return 0
             
             current_title = actual_scrobbler.currently_tracking
-            current_filepath = actual_scrobbler.current_filepath
+            current_filepath = getattr(actual_scrobbler, "current_filepath", None)
             
             logger.info(f"Re-identifying currently playing media: '{current_title}' (filepath: '{current_filepath}')")
             self.show_notification("simkl-mps", f"Attempting to re-identify '{current_title}'...")
@@ -1327,12 +1372,12 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             
             # Store current tracking state
             was_tracking = actual_scrobbler.currently_tracking
-            was_filepath = actual_scrobbler.current_filepath
-            was_start_time = actual_scrobbler.start_time
-            was_watch_time = actual_scrobbler.watch_time
-            was_state = actual_scrobbler.state
-            was_position = actual_scrobbler.current_position_seconds
-            was_duration = actual_scrobbler.total_duration_seconds
+            was_filepath = getattr(actual_scrobbler, "current_filepath", None)
+            was_start_time = getattr(actual_scrobbler, "start_time", None)
+            was_watch_time = getattr(actual_scrobbler, "watch_time", 0)
+            was_state = getattr(actual_scrobbler, "state", None)
+            was_position = getattr(actual_scrobbler, "current_position_seconds", 0)
+            was_duration = getattr(actual_scrobbler, "total_duration_seconds", None)
             
             # Clear identification-related state (but preserve tracking progress)
             actual_scrobbler.simkl_id = None
