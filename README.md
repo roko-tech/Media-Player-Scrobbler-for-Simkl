@@ -77,8 +77,8 @@ Contributions are welcome! Please submit a Pull Request.
 
 ## ☕ Support & Donate
 
-If you find this project useful, consider supporting development:
-[Donate via CoinDrop](https://coindrop.to/kavinthangavel)
+Just a little reminder! If you enjoy what I create, you can support me at https://ko-fi.com/itskavin
+
 
 ## 🙏 Acknowledgments
 
