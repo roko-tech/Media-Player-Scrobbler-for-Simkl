@@ -63,6 +63,10 @@ After installation completes:
 For the best tracking experience, configure your preferred media players:
 [Media Players](media-players.md)
 
+## 📁 Directory Filtering (Optional)
+
+If you want to limit tracking to specific folders, configure `allow_dirs` / `deny_dirs` in `settings.json` inside your app data folder. See the [Advanced & Developer Guide](configuration.md) for rules and examples.
+
 
 ## 🖥️ Windows System Integration
 

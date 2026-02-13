@@ -251,6 +251,30 @@ class AppIndicatorTray:
             config_item = gtk_module.MenuItem(label="Open Data Folder")
             config_item.connect("activate", self._wrap_callback(self.app.open_config_dir))
             maintenance_submenu.append(config_item)
+
+            filters_item = gtk_module.MenuItem(label="Directory Filters")
+            filters_submenu = gtk_module.Menu()
+
+            allow_item = gtk_module.MenuItem(label="Edit Allow List")
+            allow_item.connect("activate", self._wrap_callback(self.app.set_allow_dirs))
+            filters_submenu.append(allow_item)
+
+            deny_item = gtk_module.MenuItem(label="Edit Deny List")
+            deny_item.connect("activate", self._wrap_callback(self.app.set_deny_dirs))
+            filters_submenu.append(deny_item)
+
+            filters_submenu.append(gtk_module.SeparatorMenuItem())
+
+            clear_allow_item = gtk_module.MenuItem(label="Clear Allow List")
+            clear_allow_item.connect("activate", self._wrap_callback(self.app.clear_allow_dirs))
+            filters_submenu.append(clear_allow_item)
+
+            clear_deny_item = gtk_module.MenuItem(label="Clear Deny List")
+            clear_deny_item.connect("activate", self._wrap_callback(self.app.clear_deny_dirs))
+            filters_submenu.append(clear_deny_item)
+
+            filters_item.set_submenu(filters_submenu)
+            maintenance_submenu.append(filters_item)
             
             maintenance_submenu.append(gtk_module.SeparatorMenuItem())
             
@@ -869,6 +893,34 @@ class TrayAppLinux(TrayAppBase):
         except FileNotFoundError:
             logger.error("zenity command not found, even after 'which' check (unexpected).")
             self.show_notification("Error", "zenity command not found.")
+            return None
+
+    def _ask_directory_filter_dialog(self, title: str, current_value: str, help_text: str) -> Optional[str]:
+        """Ask user for directory filters using zenity entry (comma/semicolon separated)."""
+        try:
+            if subprocess.run(['which', 'zenity'], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode != 0:
+                self.show_notification("Cannot Edit Filters", "zenity is not installed. Please install zenity.")
+                return None
+
+            initial_value = current_value.replace("\n", "; ") if current_value else ""
+            process = subprocess.run(
+                [
+                    'zenity', '--entry',
+                    f'--title={title}',
+                    f'--text={help_text}\nSeparate entries with commas or semicolons.',
+                    f'--entry-text={initial_value}'
+                ],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+
+            if process.returncode == 0:
+                return process.stdout.strip()
+            return None
+        except Exception as e:
+            logger.error(f"Error using zenity for directory filters: {e}")
+            self.show_notification("Error", f"Could not edit directory filters: {e}")
             return None
         except Exception as e:
             logger.error(f"Error using zenity for threshold input: {e}", exc_info=True)

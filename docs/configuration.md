@@ -31,6 +31,35 @@ SIMKL_ACCESS_TOKEN=your_access_token_here
 USER_ID=your_user_id
 ```
 
+### Directory Whitelisting / Blacklisting
+
+Directory filters live in `settings.json` inside your app data folder. You can allow only specific folders and/or exclude folders you never want tracked.
+
+You can edit these lists from the tray menu: **Maintenance → Directory Filters**.
+
+**Rules (last-match wins):**
+- If `allow_dirs` is empty, all paths are allowed by default.
+- If `allow_dirs` has entries, only those paths are allowed by default.
+- After allow rules are evaluated, `deny_dirs` rules are applied and can override them.
+
+**Glob patterns are supported.** Examples: `D:\\Media\\**\\Anime\\*`, `~/Videos/**/*.mkv`.
+
+Example `settings.json`:
+
+```json
+{
+  "watch_completion_threshold": 80,
+  "auto_sync_interval": 120,
+  "allow_dirs": [
+    "D:\\Media\\Movies",
+    "D:\\Media\\Shows"
+  ],
+  "deny_dirs": [
+    "D:\\Media\\Movies\\Kids"
+  ]
+}
+```
+
 See [Media Players Guide](media-players.md) for player-specific environment variables.
 
 ---

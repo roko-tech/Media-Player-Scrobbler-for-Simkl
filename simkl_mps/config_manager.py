@@ -36,8 +36,20 @@ DEFAULT_THRESHOLD = 80
 DEFAULT_SETTINGS = {
     "watch_completion_threshold": DEFAULT_THRESHOLD,
     "user_subdir": DEFAULT_USER_SUBDIR,
-    "auto_sync_interval": 120  # Auto sync backlog every 2 minutes by default
+    "auto_sync_interval": 120,  # Auto sync backlog every 2 minutes by default
+    "allow_dirs": [],
+    "deny_dirs": []
 }
+
+def _sanitize_dir_list(value):
+    """Ensure allow/deny dir settings are stored as a list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if isinstance(item, str) and item.strip()]
+    return []
 
 def load_settings():
     """Loads settings from the JSON file in the user config directory."""
@@ -75,6 +87,13 @@ def load_settings():
                  log.warning(f"Non-integer watch_completion_threshold '{settings.get('watch_completion_threshold')}' in {SETTINGS_FILE}. Resetting to {DEFAULT_THRESHOLD}.")
                  settings['watch_completion_threshold'] = DEFAULT_THRESHOLD
                  settings_updated = True
+
+            # Sanitize allow/deny directory lists
+            for key in ("allow_dirs", "deny_dirs"):
+                sanitized = _sanitize_dir_list(settings.get(key))
+                if settings.get(key) != sanitized:
+                    settings[key] = sanitized
+                    settings_updated = True
 
             # Save the file only if defaults were added or invalid values corrected
             if settings_updated:
@@ -125,6 +144,9 @@ def set_setting(key, value):
         except (ValueError, TypeError):
              log.error(f"Attempted to set non-integer watch_completion_threshold: {value}.")
              return # Do not save invalid value
+
+    if key in ('allow_dirs', 'deny_dirs'):
+        value = _sanitize_dir_list(value)
     
     log.debug(f"ConfigManager: set_setting proceeding for key='{key}' before user_subdir check.")
     if key == 'user_subdir' and value != get_setting('user_subdir'):

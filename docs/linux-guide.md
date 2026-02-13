@@ -194,6 +194,10 @@ Celluloid is a GTK frontend for MPV, and you'll need to configure the underlying
 3. Add: `input-ipc-server=/tmp/mpvsocket`
 4. Restart Celluloid
 
+## 📁 Directory Filtering (Optional)
+
+You can whitelist or blacklist folders via `allow_dirs` / `deny_dirs` in `settings.json` inside your app data folder. See the [Advanced & Developer Guide](configuration.md) for details.
+
 ## 🖥️ Linux System Integration
 
 ### System Tray Features

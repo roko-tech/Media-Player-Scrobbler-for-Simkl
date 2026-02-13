@@ -40,6 +40,7 @@ except ImportError:
 from simkl_mps.utils.constants import PLAYING, PAUSED, STOPPED, DEFAULT_POLL_INTERVAL
 from simkl_mps.config_manager import get_setting, DEFAULT_THRESHOLD
 from simkl_mps.watch_history_manager import WatchHistoryManager
+from simkl_mps.utils.path_filter import is_path_allowed
 
 class MediaScrobbler:
     """
@@ -127,6 +128,18 @@ class MediaScrobbler:
         self._mpv_wrapper_integration = None
         self._potplayer_integration = None
         self.watch_history = WatchHistoryManager(self.app_data_dir) # Initialize watch history manager
+        self._allow_dirs = get_setting('allow_dirs', [])
+        self._deny_dirs = get_setting('deny_dirs', [])
+        self._dir_filter_last_refresh = 0
+
+    def _refresh_dir_filters(self, min_interval_seconds=60):
+        """Refresh directory allow/deny lists periodically to avoid frequent disk I/O."""
+        current_time = time.time()
+        if current_time - self._dir_filter_last_refresh < min_interval_seconds:
+            return
+        self._allow_dirs = get_setting('allow_dirs', [])
+        self._deny_dirs = get_setting('deny_dirs', [])
+        self._dir_filter_last_refresh = current_time
 
     def set_notification_callback(self, callback):
         """Set a callback function for notifications"""
@@ -400,6 +413,13 @@ class MediaScrobbler:
         if not filepath:
             if self.currently_tracking:
                 logger.info("Media playback ended: No file detected from supported player.")
+                self.stop_tracking()
+            return None
+
+        self._refresh_dir_filters()
+        if not is_path_allowed(filepath, self._allow_dirs, self._deny_dirs):
+            logger.info("Filepath excluded by directory filters: '%s'", filepath)
+            if self.currently_tracking:
                 self.stop_tracking()
             return None
 

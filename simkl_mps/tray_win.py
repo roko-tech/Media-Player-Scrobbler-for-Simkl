@@ -13,6 +13,7 @@ import subprocess # Added for running updater script
 import queue
 from pathlib import Path
 from PIL import Image # Keep PIL.Image for loading
+from PIL import ImageTk
 import pystray
 from plyer import notification
 import ctypes # Added for native Windows dialogs
@@ -145,6 +146,7 @@ class TrayAppWin(TrayAppBase):
                 root = tk.Tk()
                 root.withdraw()
                 root.attributes("-topmost", True)
+                self._apply_tk_icon(root)
                 self._tk_root = root
                 ready_event.set()
 
@@ -173,6 +175,30 @@ class TrayAppWin(TrayAppBase):
         self._tk_thread = threading.Thread(target=_tk_mainloop, daemon=True)
         self._tk_thread.start()
         ready_event.wait(timeout=5)
+
+    def _apply_tk_icon(self, root: tk.Tk) -> None:
+        """Apply the simkl icon to Tk dialogs so they don't show the default Tk name/icon."""
+        try:
+            icon_path = self._get_icon_path(status=self.status)
+            if not icon_path:
+                return
+
+            icon_path_lower = str(icon_path).lower()
+            if icon_path_lower.endswith(".ico"):
+                root.iconbitmap(icon_path)
+                return
+
+            try:
+                image = Image.open(icon_path)
+                image.load()
+                tk_image = ImageTk.PhotoImage(image)
+                root.iconphoto(True, tk_image)
+                # Keep a reference to prevent garbage collection
+                self._tk_icon_image = tk_image
+            except Exception as img_err:
+                logger.debug(f"Failed to set Tk icon from {icon_path}: {img_err}")
+        except Exception as e:
+            logger.debug(f"Unable to apply Tk icon: {e}")
 
     def _run_on_tk_thread(self, func, default=None):
         """Execute a callable on the Tk thread and return its result."""
@@ -496,6 +522,24 @@ Tips:
                 minvalue=1,
                 maxvalue=100,
                 initialvalue=current_threshold
+            )
+
+        return self._run_on_tk_thread(_dialog, default=None)
+
+    def _ask_directory_filter_dialog(self, title: str, current_value: str, help_text: str) -> str | None:
+        """Windows implementation to ask for allow/deny directory filters."""
+        def _dialog():
+            parent = self._tk_root
+            if parent:
+                parent.lift()
+                parent.focus_force()
+            initial_value = current_value.replace("\n", "; ") if current_value else ""
+            prompt = f"{help_text}\n\nSeparate entries with commas or semicolons."
+            return simpledialog.askstring(
+                str(title),
+                prompt,
+                parent=parent,
+                initialvalue=initial_value
             )
 
         return self._run_on_tk_thread(_dialog, default=None)

@@ -28,6 +28,10 @@ pipx install "simkl-mps[macos]"
 - **Critical:** Configure your media players for accurate tracking.
 - See the [Media Players Guide](media-players.md) for setup steps for VLC, MPV, and others.
 
+## 📁 Directory Filtering (Optional)
+
+To restrict tracking to specific folders, set `allow_dirs` / `deny_dirs` in `settings.json` inside your app data folder. See the [Advanced & Developer Guide](configuration.md) for details.
+
 ## 🛠️ Tray Usage
 - Use the tray icon in the menu bar for status and controls.
 - After setup, daily usage is tray-first (CLI is optional).

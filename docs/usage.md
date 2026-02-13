@@ -108,6 +108,8 @@ Right-click the tray icon to access the app menu with the following sections:
 ## 📝 Tips
 - Always configure your media players for best results ([Media Players Guide](media-players.md)).
 - Use clear filenames: `Movie Title (Year).ext`.
+- Use `allow_dirs` / `deny_dirs` in `settings.json` to whitelist or blacklist folders (see [Advanced & Developer Guide](configuration.md)).
+- Glob patterns like `**/*.mkv` are supported in allow/deny lists.
 - For troubleshooting, see the [Troubleshooting Guide](troubleshooting.md).
 - For advanced options, see [Advanced & Developer Guide](configuration.md).
 - For planned features, see the [Todo List](todo.md).

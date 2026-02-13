@@ -471,6 +471,30 @@ class TrayAppMac(TrayAppBase):
             self.show_notification("Error", f"Could not get custom threshold: {e}")
             return None
 
+    def _ask_directory_filter_dialog(self, title: str, current_value: str, help_text: str) -> str | None:
+        """macOS-specific directory filter input using AppleScript dialog."""
+        try:
+            initial_value = current_value.replace("\n", "; ") if current_value else ""
+            escaped_help = help_text.replace('"', '\\"')
+            escaped_title = title.replace('"', '\\"')
+            escaped_value = initial_value.replace('"', '\\"')
+            cmd = f'''osascript -e '
+                set answer to text returned of (display dialog "{escaped_help} (comma or semicolon separated)" \
+                default answer "{escaped_value}" \
+                with title "{escaped_title}" \
+                buttons {{"Cancel", "OK"}} default button "OK")
+                return answer
+            ' '''
+
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+            return None
+        except Exception as e:
+            logger.error(f"Error showing directory filter dialog: {e}", exc_info=True)
+            self.show_notification("Error", f"Could not edit directory filters: {e}")
+            return None
+
 def run_tray_app():
     """Run the application in tray mode"""
     try:

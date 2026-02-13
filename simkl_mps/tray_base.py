@@ -88,6 +88,16 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             The new threshold value (int) entered by the user, or None if cancelled.
          """       
         pass
+
+    @abc.abstractmethod
+    def _ask_directory_filter_dialog(self, title: str, current_value: str, help_text: str) -> str | None:
+        """
+        Platform-specific dialog for editing directory filters.
+
+        Returns:
+            Updated string (comma/newline separated) or None if cancelled.
+        """
+        pass
             
     def _show_confirmation_dialog(self, title, message):
         """
@@ -249,6 +259,77 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             return int(value)
         except (TypeError, ValueError):
             return DEFAULT_THRESHOLD
+
+    def _format_dir_list_for_dialog(self, values: Any) -> str:
+        """Format directory lists for dialog input."""
+        if not values:
+            return ""
+        if isinstance(values, str):
+            return values
+        try:
+            return "\n".join([str(value) for value in values if value])
+        except Exception:
+            return ""
+
+    def _parse_dir_list_input(self, input_text: str | None) -> list[str]:
+        """Parse dialog input into a normalized list of paths or patterns."""
+        if not input_text:
+            return []
+        parts: list[str] = []
+        for line in input_text.splitlines():
+            for token in re.split(r"[;,]", line):
+                cleaned = token.strip()
+                if cleaned:
+                    parts.append(cleaned)
+        return parts
+
+    def _apply_dir_filter_change(self, key: str, entries: list[str]) -> None:
+        """Persist filter settings and update the running scrobbler if available."""
+        try:
+            set_setting(key, entries)
+            media_scrobbler = self._get_media_scrobbler()
+            if media_scrobbler is not None:
+                if key == "allow_dirs":
+                    media_scrobbler._allow_dirs = entries
+                elif key == "deny_dirs":
+                    media_scrobbler._deny_dirs = entries
+                if hasattr(media_scrobbler, "_dir_filter_last_refresh"):
+                    media_scrobbler._dir_filter_last_refresh = 0
+            label = "Allow" if key == "allow_dirs" else "Deny"
+            self.show_notification("Settings Updated", f"{label} directories updated.")
+        except Exception as exc:
+            logger.error(f"Failed to update {key}: {exc}", exc_info=True)
+            self.show_notification("Error", f"Failed to update directory filters: {exc}")
+
+    def set_allow_dirs(self, _=None):
+        current_value = self._format_dir_list_for_dialog(get_setting("allow_dirs", []))
+        help_text = "Enter one path or glob pattern per line (comma/semicolon also supported)."
+        updated_text = self._ask_directory_filter_dialog("Set Allow Directories", current_value, help_text)
+        if updated_text is not None:
+            entries = self._parse_dir_list_input(updated_text)
+            self._apply_dir_filter_change("allow_dirs", entries)
+        self.update_icon()
+        return 0
+
+    def set_deny_dirs(self, _=None):
+        current_value = self._format_dir_list_for_dialog(get_setting("deny_dirs", []))
+        help_text = "Enter one path or glob pattern per line (comma/semicolon also supported)."
+        updated_text = self._ask_directory_filter_dialog("Set Deny Directories", current_value, help_text)
+        if updated_text is not None:
+            entries = self._parse_dir_list_input(updated_text)
+            self._apply_dir_filter_change("deny_dirs", entries)
+        self.update_icon()
+        return 0
+
+    def clear_allow_dirs(self, _=None):
+        self._apply_dir_filter_change("allow_dirs", [])
+        self.update_icon()
+        return 0
+
+    def clear_deny_dirs(self, _=None):
+        self._apply_dir_filter_change("deny_dirs", [])
+        self.update_icon()
+        return 0
 
     def _get_app_version(self) -> str:
         """Resolve application version from installed metadata or local package source."""
@@ -1131,6 +1212,13 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         menu_items.append(pystray.MenuItem("Maintenance", pystray.Menu(
             pystray.MenuItem("Open Logs", self.open_logs),
             pystray.MenuItem("Open Data Folder", self.open_config_dir),
+            pystray.MenuItem("Directory Filters", pystray.Menu(
+                pystray.MenuItem("Edit Allow List", self.set_allow_dirs),
+                pystray.MenuItem("Edit Deny List", self.set_deny_dirs),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Clear Allow List", self.clear_allow_dirs),
+                pystray.MenuItem("Clear Deny List", self.clear_deny_dirs),
+            )),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Clear Backlog", self.clear_backlog),
             pystray.MenuItem("Clear Cache", self.clear_cache),

@@ -22,11 +22,11 @@ Tracks completed features and planned improvements for MPS for SIMKL.
 - [x] 🕒 Local Watch History page (HTML/CSS/JS) [#49] (https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/pull/49)
 - [x] 📺 TV shows and anime scrobbling [#50](https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/pull/50)
 - [x] 🔍 Advanced search and filtering of watched content in Local History [#51](https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/pull/51)
+- [x] 📁 Directory whitelisting/blacklisting
 
 ## 🚧 In Progress
 
 - [ ] Disable Notifications
-- [ ] Directory whitelisting/blacklisting
 
 ## 📝 Planned Features
 
