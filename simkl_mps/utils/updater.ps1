@@ -8,7 +8,7 @@ param (
 )
 
 $AppName = "Media Player Scrobbler for SIMKL"
-$Publisher = "kavin"
+$Publishers = @("ByteTrix", "kavin")
 $ApiURL = "https://api.github.com/repos/ByteTrix/Media-Player-Scrobbler-for-Simkl/releases/latest"
 $UserAgent = "MPSS-Updater/2.1"
 $LogFile = Join-Path $env:LOCALAPPDATA "SIMKL-MPS\updater.log"
@@ -25,6 +25,106 @@ function Write-Log {
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $LogMessage = "[$Timestamp] $Message"
     Add-Content -Path $LogFile -Value $LogMessage
+}
+
+function Normalize-VersionString {
+    param([string]$Version)
+
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        return $null
+    }
+
+    $Clean = ($Version -replace '^v', '').Trim()
+    $Match = [regex]::Match($Clean, '(\d+(?:\.\d+){0,3})')
+    if (-not $Match.Success) {
+        return $null
+    }
+
+    $Parts = $Match.Value.Split('.')
+    if ($Parts.Length -eq 1) {
+        return "$($Parts[0]).0.0"
+    }
+    if ($Parts.Length -eq 2) {
+        return "$($Parts[0]).$($Parts[1]).0"
+    }
+
+    return [string]::Join('.', $Parts)
+}
+
+function Test-UsableVersion {
+    param([string]$Version)
+
+    $Normalized = Normalize-VersionString $Version
+    if ([string]::IsNullOrWhiteSpace($Normalized)) {
+        return $false
+    }
+
+    return ($Normalized -notin @("0", "0.0", "0.0.0", "0.0.0.0"))
+}
+
+function Get-VersionFromVersionFile {
+    param([string]$InstallPath)
+
+    if ([string]::IsNullOrWhiteSpace($InstallPath) -or -not (Test-Path $InstallPath)) {
+        return $null
+    }
+
+    $VersionFile = Join-Path $InstallPath "version.txt"
+    if (-not (Test-Path $VersionFile)) {
+        return $null
+    }
+
+    try {
+        $RawVersion = Get-Content -LiteralPath $VersionFile -ErrorAction Stop | Select-Object -First 1
+        $Normalized = Normalize-VersionString $RawVersion
+        if (Test-UsableVersion $Normalized) {
+            Write-Log "Detected installed version '$Normalized' from version file: $VersionFile"
+            return $Normalized
+        }
+    }
+    catch {
+        Write-Log "Failed reading version file '$VersionFile': $_"
+    }
+
+    return $null
+}
+
+function Get-VersionFromExecutable {
+    param([string]$InstallPath)
+
+    if ([string]::IsNullOrWhiteSpace($InstallPath) -or -not (Test-Path $InstallPath)) {
+        return $null
+    }
+
+    $ExecutableCandidates = @(
+        (Join-Path $InstallPath "MPSS.exe"),
+        (Join-Path $InstallPath "MPS for Simkl.exe")
+    )
+
+    foreach ($ExePath in $ExecutableCandidates) {
+        if (-not (Test-Path $ExePath)) {
+            continue
+        }
+
+        try {
+            $File = Get-Item -LiteralPath $ExePath -ErrorAction Stop
+            $Info = $File.VersionInfo
+            $VersionCandidates = @($Info.ProductVersion, $Info.FileVersion)
+
+            foreach ($Candidate in $VersionCandidates) {
+                $Normalized = Normalize-VersionString $Candidate
+                if (Test-UsableVersion $Normalized) {
+                    Write-Log "Detected installed version '$Normalized' from executable: $ExePath"
+                    return $Normalized
+                }
+            }
+        }
+        catch {
+            Write-Log "Failed reading executable version from '$ExePath': $_"
+        }
+    }
+
+    return $null
 }
 
 # Display a Windows notification
@@ -84,33 +184,84 @@ function Show-Notification {
 
 # Get current version from registry
 function Get-CurrentVersion {
-    $RegPath = "HKCU:\Software\$Publisher\$AppName"
-    
-    if (Test-Path $RegPath) {
-        $Version = (Get-ItemProperty -Path $RegPath -Name "Version" -ErrorAction SilentlyContinue).Version
-        if ($Version) {
-            return $Version
+    $InstallPathCandidates = New-Object System.Collections.Generic.List[string]
+
+    # 1) App registry keys (support current + legacy publisher names)
+    foreach ($PublisherName in $Publishers) {
+        foreach ($RootKey in @("HKCU", "HKLM")) {
+            $RegPath = "${RootKey}:\Software\$PublisherName\$AppName"
+            if (-not (Test-Path $RegPath)) {
+                continue
+            }
+
+            $RegItem = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
+            if ($RegItem) {
+                $Version = Normalize-VersionString $RegItem.Version
+                if (Test-UsableVersion $Version) {
+                    Write-Log "Detected installed version '$Version' from app registry: $RegPath"
+                    return $Version
+                }
+
+                if ($RegItem.InstallPath) {
+                    [void]$InstallPathCandidates.Add($RegItem.InstallPath)
+                }
+            }
         }
     }
-    
-    # Try to get version from uninstall registry
-    $UninstallPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{3FF84A4E-B9C2-4F49-A8DE-5F7EA15F5D88}_is1"
-    if (Test-Path $UninstallPath) {
-        $Version = (Get-ItemProperty -Path $UninstallPath -Name "DisplayVersion" -ErrorAction SilentlyContinue).DisplayVersion
-        if ($Version) {
-            return $Version
+
+    # 2) Uninstall registry keys (user/admin + 32-bit redirection)
+    $UninstallKeyName = "{3FF84A4E-B9C2-4F49-A8DE-5F7EA15F5D88}_is1"
+    $UninstallPaths = @(
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$UninstallKeyName",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$UninstallKeyName",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$UninstallKeyName"
+    )
+
+    foreach ($UninstallPath in $UninstallPaths) {
+        if (-not (Test-Path $UninstallPath)) {
+            continue
+        }
+
+        $RegItem = Get-ItemProperty -Path $UninstallPath -ErrorAction SilentlyContinue
+        if (-not $RegItem) {
+            continue
+        }
+
+        $DisplayVersion = Normalize-VersionString $RegItem.DisplayVersion
+        if (Test-UsableVersion $DisplayVersion) {
+            Write-Log "Detected installed version '$DisplayVersion' from uninstall registry: $UninstallPath"
+            return $DisplayVersion
+        }
+
+        if ($RegItem.InstallLocation) {
+            [void]$InstallPathCandidates.Add($RegItem.InstallLocation)
         }
     }
-    
-    # Admin installation check
-    $AdminUninstallPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{3FF84A4E-B9C2-4F49-A8DE-5F7EA15F5D88}_is1"
-    if (Test-Path $AdminUninstallPath) {
-        $Version = (Get-ItemProperty -Path $AdminUninstallPath -Name "DisplayVersion" -ErrorAction SilentlyContinue).DisplayVersion
-        if ($Version) {
-            return $Version
+
+    # 3) Fallback to install paths and file metadata
+    if ($PSScriptRoot) {
+        [void]$InstallPathCandidates.Add($PSScriptRoot)
+    }
+    [void]$InstallPathCandidates.Add("$env:ProgramFiles\$AppName")
+    [void]$InstallPathCandidates.Add("$env:LOCALAPPDATA\Programs\$AppName")
+
+    $UniqueInstallPaths = $InstallPathCandidates |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique
+
+    foreach ($CandidatePath in $UniqueInstallPaths) {
+        $VersionFromFile = Get-VersionFromVersionFile -InstallPath $CandidatePath
+        if (Test-UsableVersion $VersionFromFile) {
+            return $VersionFromFile
+        }
+
+        $VersionFromExe = Get-VersionFromExecutable -InstallPath $CandidatePath
+        if (Test-UsableVersion $VersionFromExe) {
+            return $VersionFromExe
         }
     }
-    
+
+    Write-Log "Could not detect installed version from registry or installed files."
     return "0.0.0"
 }
 
@@ -289,7 +440,7 @@ try {
     # Compare versions
     $CompareResult = Compare-Versions -Version1 $LatestRelease.Version -Version2 $CurrentVersion
     if ($CurrentVersion -eq "0.0.0" -or [string]::IsNullOrWhiteSpace($CurrentVersion)) {
-        $CompareResult = 1 # Treat as update needed if current version unknown
+        Write-Log "Current version is unknown (0.0.0). Update decision will rely on comparison result only."
     }
 
     if ($CompareResult -gt 0) {
