@@ -28,6 +28,38 @@ CLIENT_SECRET_PLACEHOLDER = "SIMKL_CLIENT_SECRET_PLACEHOLDER"
 SIMKL_CLIENT_ID = CLIENT_ID_PLACEHOLDER
 SIMKL_CLIENT_SECRET = CLIENT_SECRET_PLACEHOLDER
 
+
+def _is_placeholder_credential(value: str, placeholder: str = None) -> bool:
+    """
+    Return True when a credential is missing or still a build/runtime placeholder.
+    
+    Checks for:
+    - Empty/None values
+    - Exact placeholder matches (if placeholder provided)
+    """
+    if not value:
+        return True
+    
+    normalized = str(value).strip().strip('"').strip("'")
+    
+    # Check exact placeholder if provided (for build-injected constants)
+    if placeholder and normalized == placeholder:
+        return True
+    
+    # Check for common placeholder patterns from env/config
+    placeholder_patterns = [
+        "placeholder",
+        "id",
+        "change_me",
+    ]
+    
+    normalized_lower = normalized.lower()
+    for pattern in placeholder_patterns:
+        if pattern in normalized_lower:
+            return True
+    
+    return False
+
 APP_NAME_FOR_PATH = "simkl-mps"
 USER_SUBDIR_FOR_PATH = "kavin"  # Updated from kavinthangavel
 try:
@@ -70,20 +102,56 @@ def get_credentials():
               or if the build/init process failed.
     """
 
-    client_id = SIMKL_CLIENT_ID
-    client_secret = SIMKL_CLIENT_SECRET
-    
-    if not client_id or not client_secret:
-        logger.debug("Build-injected credentials not found, trying development sources...")
+    client_id = None
+    client_secret = None
+
+    if not _is_placeholder_credential(SIMKL_CLIENT_ID, CLIENT_ID_PLACEHOLDER):
+        client_id = SIMKL_CLIENT_ID
+    if not _is_placeholder_credential(SIMKL_CLIENT_SECRET, CLIENT_SECRET_PLACEHOLDER):
+        client_secret = SIMKL_CLIENT_SECRET
+
+    if client_id and client_secret:
+        logger.debug("Using build-injected SIMKL client credentials.")
+    else:
+        logger.debug("Build-injected credentials missing/placeholder, trying runtime sources...")
+
+        # Check environment variables with placeholder validation
+        env_client_id = os.environ.get("SIMKL_CLIENT_ID")
+        env_client_secret = os.environ.get("SIMKL_CLIENT_SECRET")
         
-        client_id = os.environ.get("SIMKL_CLIENT_ID")
-        client_secret = os.environ.get("SIMKL_CLIENT_SECRET")
-        
+        if env_client_id and not _is_placeholder_credential(env_client_id):
+            client_id = env_client_id
+        if env_client_secret and not _is_placeholder_credential(env_client_secret):
+            client_secret = env_client_secret
+
+        # Fall back to app env file used by end users (.simkl_mps.env)
+        env_file_path = get_env_file_path()
+        if (not client_id or not client_secret) and env_file_path.exists():
+            logger.debug(f"Loading runtime credentials from {env_file_path}")
+            runtime_config = dotenv_values(env_file_path)
+            
+            # Validate credentials from runtime config file against placeholders
+            runtime_client_id = runtime_config.get("SIMKL_CLIENT_ID")
+            runtime_client_secret = runtime_config.get("SIMKL_CLIENT_SECRET")
+            
+            if runtime_client_id and not _is_placeholder_credential(runtime_client_id):
+                client_id = client_id or runtime_client_id
+            if runtime_client_secret and not _is_placeholder_credential(runtime_client_secret):
+                client_secret = client_secret or runtime_client_secret
+
+        # Final fallback for local development
         if (not client_id or not client_secret) and DEV_CREDS_PATH.exists():
             logger.debug(f"Loading development credentials from {DEV_CREDS_PATH}")
             dev_config = dotenv_values(DEV_CREDS_PATH)
-            client_id = client_id or dev_config.get("SIMKL_CLIENT_ID")
-            client_secret = client_secret or dev_config.get("SIMKL_CLIENT_SECRET")
+            
+            # Validate credentials from dev config against placeholders
+            dev_client_id = dev_config.get("SIMKL_CLIENT_ID")
+            dev_client_secret = dev_config.get("SIMKL_CLIENT_SECRET")
+            
+            if dev_client_id and not _is_placeholder_credential(dev_client_id):
+                client_id = client_id or dev_client_id
+            if dev_client_secret and not _is_placeholder_credential(dev_client_secret):
+                client_secret = client_secret or dev_client_secret
 
  
     access_token = None
@@ -92,16 +160,24 @@ def get_credentials():
     if env_file_path.exists():
         logger.debug(f"Reading credentials from {env_file_path} inside get_credentials()")
         config = dotenv_values(env_file_path)
-        access_token = config.get("SIMKL_ACCESS_TOKEN")
-        user_id = config.get("SIMKL_USER_ID")
+        
+        # Validate access token against placeholders
+        raw_access_token = config.get("SIMKL_ACCESS_TOKEN")
+        if raw_access_token and not _is_placeholder_credential(raw_access_token):
+            access_token = raw_access_token
+        
+        # Validate user ID against placeholders
+        raw_user_id = config.get("SIMKL_USER_ID")
+        if raw_user_id and not _is_placeholder_credential(raw_user_id):
+            user_id = raw_user_id
         
         if user_id:
             logger.debug(f"Found user ID in env file: {user_id}")
         else:
-            logger.debug("User ID not found in env file")
+            logger.debug("User ID not found in env file or value is a placeholder")
             
         if not access_token:
-             logger.warning(f"Found env file at {env_file_path}, but SIMKL_ACCESS_TOKEN key is missing or empty.")
+             logger.warning(f"Found env file at {env_file_path}, but SIMKL_ACCESS_TOKEN key is missing, empty, or contains a placeholder value.")
     else:
          logger.debug(f"Env file not found at {env_file_path} inside get_credentials()")
 

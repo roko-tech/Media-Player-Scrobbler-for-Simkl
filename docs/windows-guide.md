@@ -45,6 +45,13 @@ flowchart LR
 - **Auto-update system**: Checks for updates weekly
 - **Clean uninstallation**: Properly removes all components
 
+### Silent & Automated Deployment
+
+- The installer now honors common enterprise parameters: use `/quiet`, `/silent`, `/s`, `/qn`, or `/passive` when automating deployments
+- Each alias maps internally to Inno Setup's `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART` flags, ensuring the Microsoft Store silent install check succeeds
+- Combine additional switches such as `/LOG="C:\\temp\\mpss-install.log"` as needed; they will be preserved when silent aliases are used
+- When running interactively, the traditional `/SILENT` or `/VERYSILENT` options continue to function unchanged
+
 ### Post-Installation
 
 After installation completes:
@@ -70,12 +77,28 @@ flowchart TD
     A[System Tray Icon] -->|Right-click| B[Context Menu]
     B --> C[Status Information]
     B --> D[Start/Pause Tracking]
-    B --> E[Tools Submenu]
-    E --> E1[Open Logs]
-    E --> E2[Config Directory]
-    E --> E3[Process Backlog]
-    B --> F[Check for Updates]
-    B --> G[Help/About]
+    B --> E[Scrobbling]
+    E --> E1[Retry Last Scrobble]
+    E --> E2[Sync Backlog Now]
+    E --> E3[Completion Threshold]
+    E --> E4[Open Local Watch History]
+    B --> E5[SIMKL]
+    E5 --> E5A[Authenticate/Re-auth]
+    E5 --> E5B[Open Website]
+    E5 --> E5C[Open Watch History]
+    B --> F[Maintenance]
+    F --> F1[Open Logs]
+    F --> F2[Open Data Folder]
+    F --> F3[Clear Backlog]
+    F --> F4[Clear Cache]
+    F --> F5[Clear Watch History]
+    F --> F6[Clear Logs]
+    F --> F7[Reset App Data]
+    B --> G[More]
+    G --> G1[Donate ❤️]
+    G --> G2[Check for Updates]
+    G --> G3[Help]
+    G --> G4[About]
     B --> H[Exit]
     style A fill:#4285f4,stroke:#333,stroke-width:2px,color:#fff
     style D fill:#34a853,stroke:#333,stroke-width:2px,color:#fff
@@ -83,9 +106,29 @@ flowchart TD
 ```
 
 - **Status information**: Current monitoring state and connection status
-- **Start/Pause Tracking**: Toggle monitoring
-- **Tools**: Access to logs, configuration, and backlog management
-- **Check for Updates**: Manually check for and install updates
+- **Start/Pause Tracking**: Pause or resume tracking on demand
+- **Scrobbling**: Recovery and threshold controls
+  - **Retry Last Scrobble**: Clears cache for the active file and attempts to re-identify and scrobble it. Use when the wrong title/episode appears.
+  - **Sync Backlog Now**: Immediately processes any offline scrobbles waiting in backlog.
+  - **Completion Threshold**: Quickly switch between preset watch thresholds (65%, 80%, 90%) or define a custom percentage.
+  - **Open Local Watch History**: Open the local watch history viewer in your web browser.
+- **SIMKL**: Account and service management
+  - **Authenticate / Re-authenticate**: Launch the Simkl login flow if you are signing in for the first time or need to refresh an expired token.
+  - **Open Website**: Visit the SIMKL website.
+  - **Open Watch History**: View your watch history on SIMKL.
+- **Maintenance**: Logs, data, and cache management
+  - **Open Logs**: Jump straight to app diagnostics from the tray.
+  - **Open Data Folder**: Open the application data directory.
+  - **Clear Backlog**: Deletes pending offline scrobbles to stop repeated sync prompts.
+  - **Clear Cache**: Removes local media cache data while keeping logs and settings intact.
+  - **Clear Watch History**: Removes the local `watch_history.json` file and viewer data without touching your SIMKL account.
+  - **Clear Logs**: Truncates application and playback logs so you can capture a fresh session before debugging.
+  - **Reset App Data (Danger)**: Performs a full reset—use only when you want a clean re-authentication; the app exits afterward.
+- **More**: Additional utilities
+  - **Donate ❤️**: Support the project.
+  - **Check for Updates**: Check if a newer version is available.
+  - **Help**: Open help documentation.
+  - **About**: View application information.
 - **Exit**: Close the application
 
 ### Windows Auto-Start
@@ -151,7 +194,7 @@ The Windows installer version includes an automatic update system:
 ### Checking Logs on Windows
 
 1. Right-click the system tray icon
-2. Select **Tools → Open Logs**
+2. Select **Maintenance → Open Logs**
 3. The log file opens in your default text editor
 
 ### Running with Debug Logging
@@ -159,7 +202,7 @@ The Windows installer version includes an automatic update system:
 For advanced troubleshooting:
 1. Open Command Prompt or PowerShell
 2. Navigate to the installation directory
-3. Run: `simkl-mps.exe --debug`
+3. Run: `simkl-mps tray --debug`
 
 ## 📲 Uninstallation
 

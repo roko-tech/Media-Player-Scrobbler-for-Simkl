@@ -60,27 +60,39 @@ MPS for SIMKL uses the system tray/notification area to show its current status 
 | ![Stopped](../simkl_mps/assets/simkl-mps-stopped.png) | **Stopped** | App is inactive and not tracking (but still running in tray) |
 | ![Error](../simkl_mps/assets/simkl-mps-error.png) | **Error** | There's an issue with the app (authentication, API, etc.) |
 
-Right-click the tray icon to access the app menu with options to:
-- Start/stop/pause monitoring
-- View currently detected media
-- Access settings
-- **Tools:**
-    - **Try Scrobble Again:** If media is misidentified or fails to scrobble, use this option. It clears the cache for the currently playing item and attempts to re-identify and scrobble it. You'll see a notification like `Attempting to re-identify 'Your Media Title'...` when triggered, followed by the usual scrobbling notifications if successful.
-    - **Clear Cache:** Removes all cached media identification data and backlog entries. This option:
-        - Clears all stored media cache files
-        - Removes all backlog data (pending scrobbles)
-        - Resets currently tracked media
-        - Shows a confirmation dialog before proceeding
-        - Helpful when experiencing persistent identification issues or after major updates
-    - **Clear All Data:** Completely resets the application by removing:
-        - All cached media data
-        - All log files
-        - Backlog and playback history
-        - Watch history
-        - All settings and credentials
-        - Environment configuration
-        - **Note:** This is a drastic action that will exit the application after completion and require re-authentication
-- Exit the application
+Right-click the tray icon to access the app menu with the following sections:
+
+**Main Actions:**
+- **Start/Pause Tracking:** Toggle tracking on demand
+- **Status:** View current monitoring and connection state
+
+**Scrobbling** - Recovery and threshold controls:
+- **Retry Last Scrobble:** Clears cache for the active file and attempts to re-identify and scrobble it. Use when the wrong title/episode appears.
+- **Sync Backlog Now:** Immediately processes any offline scrobbles waiting in backlog.
+- **Completion Threshold:** Quickly switch between preset watch thresholds (65%, 80%, 90%) or define a custom percentage.
+- **Open Local Watch History:** Browse your tracked movies, shows, and anime in the local viewer.
+
+**SIMKL** - Account and service management:
+- **Authenticate / Re-authenticate:** Sign in to SIMKL or refresh an expired token.
+- **Open Website:** Visit the SIMKL website.
+- **Open Watch History:** View your watch history on SIMKL.
+
+**Maintenance** - Logs, data, and cache management:
+- **Open Logs:** View application and playback logs.
+- **Open Data Folder:** Access the application data directory.
+- **Clear Backlog:** Delete pending offline scrobbles.
+- **Clear Cache:** Remove media identification cache while preserving logs and settings.
+- **Clear Watch History:** Remove the local `watch_history.json` file and viewer data without affecting your SIMKL account.
+- **Clear Logs:** Reset application and playback logs to capture a fresh session for debugging.
+- **Reset App Data (Danger):** Perform a full reset. Use only when you need a clean re-authentication; the app will exit afterward.
+
+**More** - Additional utilities:
+- **Donate ❤️:** Support the project.
+- **Check for Updates:** Check if a newer version is available.
+- **Help:** Open help documentation.
+- **About:** View application information.
+
+**Exit:** Close the application
 
 ## 🚦 Real-World Performance Timings
 

@@ -11,13 +11,19 @@ import threading
 import logging
 import webbrowser
 import subprocess
+import re
 from pathlib import Path
 from PIL import Image
 
-from typing import Optional # For type hinting
+from typing import Any, Optional, cast
 
 from simkl_mps.tray_base import TrayAppBase, get_simkl_scrobbler, logger
 from simkl_mps.config_manager import get_setting, DEFAULT_THRESHOLD # Import for menu state and dialog
+
+Gtk: Any = None
+AppIndicator3: Any = None
+GLib: Any = None
+pystray: Any = cast(Any, None)
 
 # Enhance detection for Ubuntu GNOME environment
 def detect_environment():
@@ -59,7 +65,7 @@ def detect_environment():
 USE_APP_INDICATOR = False
 env_info = detect_environment()
 try:
-    import gi
+    import gi  # type: ignore[import]
     gi.require_version('Gtk', '3.0')
     
     # First check if we have the extension enabled for GNOME
@@ -70,14 +76,17 @@ try:
     
     # Try to load AppIndicator3
     gi.require_version('AppIndicator3', '0.1')
-    from gi.repository import Gtk, AppIndicator3, GLib
+    from gi.repository import Gtk as GtkModule, AppIndicator3 as AppIndicatorModule, GLib as GLibModule  # type: ignore[import]
+    Gtk = cast(Any, GtkModule)
+    AppIndicator3 = cast(Any, AppIndicatorModule)
+    GLib = cast(Any, GLibModule)
     USE_APP_INDICATOR = True
     logger.info(f"Using AppIndicator for Linux system tray ({env_info['desktop']})")
 except (ImportError, ValueError) as e:
     logger.warning(f"AppIndicator not available: {e}, falling back to pystray")
     try:
-        import pystray
-        from plyer import notification
+        import pystray as pystray_module
+        pystray = cast(Any, pystray_module)
         logger.info("Successfully loaded pystray as fallback")
     except ImportError as e2:
         logger.error(f"Failed to load pystray: {e2}. System tray functionality may be limited.")
@@ -95,8 +104,8 @@ class AppIndicatorTray:
     
     def __init__(self, app):
         self.app = app
-        self.indicator = None
-        self.menu = None
+        self.indicator: Any = cast(Any, None)
+        self.menu: Any = cast(Any, None)
         self.setup_indicator()
         
     def setup_indicator(self):
@@ -107,12 +116,14 @@ class AppIndicatorTray:
                 # Use a system icon as fallback
                 icon_path = "dialog-information"
                 
-            self.indicator = AppIndicator3.Indicator.new(
+            indicator_class = cast(Any, AppIndicator3)
+            self.indicator = indicator_class.Indicator.new(
                 "simkl-mps",
                 icon_path,
-                AppIndicator3.IndicatorCategory.APPLICATION_STATUS
+                indicator_class.IndicatorCategory.APPLICATION_STATUS
             )
-            self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+            indicator_obj = cast(Any, self.indicator)
+            indicator_obj.set_status(indicator_class.IndicatorStatus.ACTIVE)
             
             # Create the initial menu
             self.update_menu()
@@ -125,47 +136,61 @@ class AppIndicatorTray:
     def update_menu(self):
         """Update the AppIndicator menu"""
         try:
-            menu = Gtk.Menu()
+            gtk_module = cast(Any, Gtk)
+            menu = gtk_module.Menu()
+            self.app._refresh_auth_state()
             
             # Add title item (non-clickable)
-            title_item = Gtk.MenuItem(label="^_^ MPS for SIMKL")
+            title_item = gtk_module.MenuItem(label="^_^ MPS for SIMKL")
             title_item.set_sensitive(False)
             menu.append(title_item)
             
             # Add separator
-            menu.append(Gtk.SeparatorMenuItem())
+            menu.append(gtk_module.SeparatorMenuItem())
             
             # Add status item
             status_text = self.app.get_status_text()
-            status_item = Gtk.MenuItem(label=f"Status: {status_text}")
+            status_item = gtk_module.MenuItem(label=f"Status: {status_text}")
             status_item.set_sensitive(False)
             menu.append(status_item)
             
             # Add separator
-            menu.append(Gtk.SeparatorMenuItem())
+            menu.append(gtk_module.SeparatorMenuItem())
             
             # Add Start/Stop monitoring item
             if self.app.status == "running":
-                stop_item = Gtk.MenuItem(label="Stop Monitoring")
+                stop_item = gtk_module.MenuItem(label="Stop Monitoring")
                 stop_item.connect("activate", self._wrap_callback(self.app.stop_monitoring))
                 menu.append(stop_item)
             else:
-                start_item = Gtk.MenuItem(label="Start Monitoring")
+                start_item = gtk_module.MenuItem(label="Start Monitoring")
                 start_item.connect("activate", self._wrap_callback(self.app.start_monitoring))
                 menu.append(start_item)
             
             # Add separator
-            menu.append(Gtk.SeparatorMenuItem())
+            menu.append(gtk_module.SeparatorMenuItem())
             
-            # --- Threshold Submenu (AppIndicator) ---
-            threshold_item = Gtk.MenuItem(label="Watch Threshold (%)")
-            threshold_submenu = Gtk.Menu()
+            # --- Scrobbling submenu ---
+            scrobbling_item = gtk_module.MenuItem(label="Scrobbling")
+            scrobbling_submenu = gtk_module.Menu()
+            
+            retry_item = gtk_module.MenuItem(label="Retry Last Scrobble")
+            retry_item.connect("activate", self._wrap_callback(self.app.try_scrobble_again))
+            scrobbling_submenu.append(retry_item)
+            
+            sync_item = gtk_module.MenuItem(label="Sync Backlog Now")
+            sync_item.connect("activate", self._wrap_callback(self.app.process_backlog))
+            scrobbling_submenu.append(sync_item)
+            
+            # --- Threshold Submenu (nested under Scrobbling) ---
+            threshold_item = gtk_module.MenuItem(label="Completion Threshold")
+            threshold_submenu = gtk_module.Menu()
             threshold_group = [] # For radio buttons
 
             current_threshold = get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
 
             def create_preset_item(value, label):
-                item = Gtk.CheckMenuItem(label=label, group=threshold_group)
+                item = gtk_module.CheckMenuItem(label=label, group=threshold_group)
                 threshold_group.append(item) # Add to group for radio behavior
                 item.set_active(current_threshold == value)
                 item.connect("activate", lambda w, v=value: self._wrap_callback(lambda: self.app._set_preset_threshold(v))())
@@ -174,76 +199,122 @@ class AppIndicatorTray:
             threshold_submenu.append(create_preset_item(65, "65%"))
             threshold_submenu.append(create_preset_item(80, "80% (Default)"))
             threshold_submenu.append(create_preset_item(90, "90%"))
-            threshold_submenu.append(Gtk.SeparatorMenuItem())
+            threshold_submenu.append(gtk_module.SeparatorMenuItem())
 
-            custom_item = Gtk.MenuItem(label="Custom...")
+            custom_item = gtk_module.MenuItem(label="Custom...")
             custom_item.connect("activate", self._wrap_callback(self.app.set_custom_watch_threshold))
             threshold_submenu.append(custom_item)
 
             threshold_item.set_submenu(threshold_submenu)
-            # --- End Threshold Submenu ---
-
-            # Tools submenu
-            tools_item = Gtk.MenuItem(label="Tools")
-            tools_submenu = Gtk.Menu()
-
-            tools_submenu.append(threshold_item) # Add threshold submenu to Tools
-
-            logs_item = Gtk.MenuItem(label="Open Logs")
+            scrobbling_submenu.append(threshold_item)
+            
+            watch_history_item = gtk_module.MenuItem(label="Open Local Watch History")
+            watch_history_item.connect("activate", self._wrap_callback(self.app.open_watch_history))
+            scrobbling_submenu.append(watch_history_item)
+            
+            scrobbling_item.set_submenu(scrobbling_submenu)
+            menu.append(scrobbling_item)
+            
+            # --- SIMKL submenu ---
+            simkl_item = gtk_module.MenuItem(label="SIMKL")
+            simkl_submenu = gtk_module.Menu()
+            
+            auth_label = "Authenticate" if not self.app.is_authenticated else "Re-authenticate"
+            if self.app._auth_in_progress:
+                auth_label = "Authenticating..."
+            auth_item = gtk_module.MenuItem(label=auth_label)
+            auth_item.set_sensitive(not self.app._auth_in_progress)
+            auth_item.connect("activate", self._wrap_callback(self.app.trigger_auth_flow))
+            simkl_submenu.append(auth_item)
+            
+            simkl_submenu.append(gtk_module.SeparatorMenuItem())
+            
+            website_item = gtk_module.MenuItem(label="Open Website")
+            website_item.connect("activate", self._wrap_callback(self.app.open_simkl))
+            simkl_submenu.append(website_item)
+            
+            simkl_history_item = gtk_module.MenuItem(label="Open Watch History")
+            simkl_history_item.connect("activate", self._wrap_callback(self.app.open_simkl_history))
+            simkl_submenu.append(simkl_history_item)
+            
+            simkl_item.set_submenu(simkl_submenu)
+            menu.append(simkl_item)
+            
+            # --- Maintenance submenu ---
+            maintenance_item = gtk_module.MenuItem(label="Maintenance")
+            maintenance_submenu = gtk_module.Menu()
+            
+            logs_item = gtk_module.MenuItem(label="Open Logs")
             logs_item.connect("activate", self._wrap_callback(self.app.open_logs))
-            tools_submenu.append(logs_item)
+            maintenance_submenu.append(logs_item)
             
-            config_item = Gtk.MenuItem(label="Open Config Directory")
+            config_item = gtk_module.MenuItem(label="Open Data Folder")
             config_item.connect("activate", self._wrap_callback(self.app.open_config_dir))
-            tools_submenu.append(config_item)
+            maintenance_submenu.append(config_item)
             
-            backlog_item = Gtk.MenuItem(label="Process Backlog Now")
-            backlog_item.connect("activate", self._wrap_callback(self.app.process_backlog))
-            tools_submenu.append(backlog_item)
+            maintenance_submenu.append(gtk_module.SeparatorMenuItem())
             
-            tools_item.set_submenu(tools_submenu)
-            menu.append(tools_item)
+            clear_backlog_item = gtk_module.MenuItem(label="Clear Backlog")
+            clear_backlog_item.connect("activate", self._wrap_callback(self.app.clear_backlog))
+            maintenance_submenu.append(clear_backlog_item)
             
-            # Online Services submenu
-            services_item = Gtk.MenuItem(label="Online Services")
-            services_submenu = Gtk.Menu()
+            clear_cache_item = gtk_module.MenuItem(label="Clear Cache")
+            clear_cache_item.connect("activate", self._wrap_callback(self.app.clear_cache))
+            maintenance_submenu.append(clear_cache_item)
             
-            simkl_item = Gtk.MenuItem(label="SIMKL Website")
-            simkl_item.connect("activate", self._wrap_callback(self.app.open_simkl))
-            services_submenu.append(simkl_item)
+            clear_history_item = gtk_module.MenuItem(label="Clear Watch History")
+            clear_history_item.connect("activate", self._wrap_callback(self.app.clear_watch_history))
+            maintenance_submenu.append(clear_history_item)
             
-            history_item = Gtk.MenuItem(label="View Watch History")
-            history_item.connect("activate", self._wrap_callback(self.app.open_simkl_history))
-            services_submenu.append(history_item)
+            clear_logs_item = gtk_module.MenuItem(label="Clear Logs")
+            clear_logs_item.connect("activate", self._wrap_callback(self.app.clear_logs))
+            maintenance_submenu.append(clear_logs_item)
             
-            services_item.set_submenu(services_submenu)
-            menu.append(services_item)
+            maintenance_submenu.append(gtk_module.SeparatorMenuItem())
+            
+            reset_item = gtk_module.MenuItem(label="Reset App Data (Danger)")
+            reset_item.connect("activate", self._wrap_callback(self.app.clear_all_data))
+            maintenance_submenu.append(reset_item)
+            
+            maintenance_item.set_submenu(maintenance_submenu)
+            menu.append(maintenance_item)
+            
+            # --- More submenu ---
+            more_item = gtk_module.MenuItem(label="More")
+            more_submenu = gtk_module.Menu()
+            
+            donate_item = gtk_module.MenuItem(label="Donate ❤️")
+            donate_item.connect("activate", self._wrap_callback(self.app.open_donation_page))
+            more_submenu.append(donate_item)
+            
+            more_submenu.append(gtk_module.SeparatorMenuItem())
+            
+            update_item = gtk_module.MenuItem(label="Check for Updates")
+            update_item.connect("activate", self._wrap_callback(self.app.check_updates_thread))
+            more_submenu.append(update_item)
+            
+            help_item = gtk_module.MenuItem(label="Help")
+            help_item.connect("activate", self._wrap_callback(self.app.show_help))
+            more_submenu.append(help_item)
+            
+            about_item = gtk_module.MenuItem(label="About")
+            about_item.connect("activate", self._wrap_callback(self.app.show_about))
+            more_submenu.append(about_item)
+            
+            more_item.set_submenu(more_submenu)
+            menu.append(more_item)
             
             # Add separator
-            menu.append(Gtk.SeparatorMenuItem())
-            
-            # Check for updates
-            update_item = Gtk.MenuItem(label="Check for Updates")
-            update_item.connect("activate", self._wrap_callback(self.app.check_updates_thread))
-            menu.append(update_item)
-            
-            # About
-            about_item = Gtk.MenuItem(label="About")
-            about_item.connect("activate", self._wrap_callback(self.app.show_about))
-            menu.append(about_item)
-            
-            # Help
-            help_item = Gtk.MenuItem(label="Help")
-            help_item.connect("activate", self._wrap_callback(self.app.show_help))
-            menu.append(help_item)
+            menu.append(gtk_module.SeparatorMenuItem())
             
             # Exit
-            exit_item = Gtk.MenuItem(label="Exit")
+            exit_item = gtk_module.MenuItem(label="Exit")
             exit_item.connect("activate", self._wrap_callback(self.app.exit_app))
             menu.append(exit_item)
             
             menu.show_all()
-            self.indicator.set_menu(menu)
+            indicator_obj = cast(Any, self.indicator)
+            indicator_obj.set_menu(menu)
             self.menu = menu
             
         except Exception as e:
@@ -299,21 +370,25 @@ class TrayAppLinux(TrayAppBase):
         if (USE_APP_INDICATOR):
             self.indicator_tray = AppIndicatorTray(self)
             self.using_appindicator = True
-            self.tray_icon = None
+            self.tray_icon: Any = cast(Any, None)
         else:
             self.using_appindicator = False
-            self.tray_icon = None
+            self.tray_icon = cast(Any, None)
             self.setup_icon()
     
     def setup_icon(self):
         """Setup the system tray icon using pystray"""
         if self.using_appindicator:
             return
+
+        if pystray is None:
+            raise RuntimeError("pystray module not available")
             
         try:
             image = self.load_icon_for_status()
-            
-            self.tray_icon = pystray.Icon(
+
+            pystray_module = cast(Any, pystray)
+            self.tray_icon = pystray_module.Icon(
                 "simkl-mps",
                 image,
                 "MPS for SIMKL",
@@ -436,7 +511,7 @@ class TrayAppLinux(TrayAppBase):
             # If AppIndicator is available, try using GTK notification
             if self.using_appindicator:
                 try:
-                    from gi.repository import Notify
+                    from gi.repository import Notify  # type: ignore[import]
                     if not Notify.is_initted():
                         Notify.init("simkl-mps")
                     
@@ -449,8 +524,9 @@ class TrayAppLinux(TrayAppBase):
             
             # Try plyer as a fallback
             try:
-                from plyer import notification as plyer_notification
-                plyer_notification.notify(
+                from plyer import notification as plyer_notification_module
+                notifier = cast(Any, plyer_notification_module)
+                notifier.notify(
                     title=title,
                     message=message,
                     app_name="MPS for SIMKL",
@@ -495,14 +571,14 @@ Automatically track and scrobble your media to SIMKL."""
                     '--title=About MPS for SIMKL', 
                     f'--text={about_text}'
                 ])
-                return 0
+                return None
             except:
                 pass
                 
             # Try using GTK if AppIndicator is available
             if self.using_appindicator:
                 try:
-                    from gi.repository import Gtk
+                    from gi.repository import Gtk  # type: ignore[import]
                     
                     dialog = Gtk.MessageDialog(
                         None, 0, Gtk.MessageType.INFO, Gtk.ButtonsType.OK,
@@ -512,7 +588,7 @@ Automatically track and scrobble your media to SIMKL."""
                     dialog.set_title("About")
                     dialog.run()
                     dialog.destroy()
-                    return 0
+                    return None
                 except:
                     pass
                     
@@ -522,7 +598,7 @@ Automatically track and scrobble your media to SIMKL."""
         except Exception as e:
             logger.error(f"Error showing about dialog: {e}")
             self.show_notification("About", "Media Player Scrobbler for SIMKL")
-        return 0
+        return None
 
     def show_help(self, _=None):
         """Show help information with Linux-specific implementation"""
@@ -533,7 +609,7 @@ Automatically track and scrobble your media to SIMKL."""
         except Exception as e:
             logger.error(f"Error showing help: {e}")
             self.show_notification("Help", "Visit https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl#readme for help")
-        return 0
+        return None
 
     def exit_app(self, _=None):
         """Exit the application"""
@@ -542,10 +618,13 @@ Automatically track and scrobble your media to SIMKL."""
             self.stop_monitoring()
             
         if self.using_appindicator:
-            self.indicator_tray.stop()
+            if self.indicator_tray:
+                self.indicator_tray.stop()
         else:
-            self.tray_icon.stop()
-        return 0
+            tray_icon = cast(Any, self.tray_icon)
+            if tray_icon:
+                tray_icon.stop()
+        return None
 
     def run(self):
         """Run the tray application"""
@@ -570,7 +649,11 @@ Automatically track and scrobble your media to SIMKL."""
                 self.indicator_tray.run()
             else:
                 logger.info("Running with standard system tray (pystray)")
-                self.tray_icon.run()
+                tray_icon = cast(Any, self.tray_icon)
+                if tray_icon:
+                    tray_icon.run()
+                else:
+                    raise RuntimeError("Tray icon not initialized")
         except Exception as e:
             logger.error(f"Error running tray icon: {e}")
             self.show_notification("Tray Error", f"Error with system tray: {e}")
@@ -653,7 +736,6 @@ Automatically track and scrobble your media to SIMKL."""
                 # Look for specific output patterns from the new script
                 if "UPDATE_AVAILABLE:" in stdout:
                     # Extract version and URL using regex to be more robust
-                    import re
                     version_match = re.search(r"UPDATE_AVAILABLE: ([0-9.]+) (https?://[^\s]+)", stdout)
                     if version_match:
                         version = version_match.group(1)

@@ -95,7 +95,8 @@ class MediaCache:
         allowed_other_fields_must_have_value = [
             'source', 'duration_seconds', 
             'original_input', 'original_filepath',
-            'season', 'episode' 
+            'season', 'episode',
+            'season_display', 'episode_display'
         ]
         for field in allowed_other_fields_can_be_null:
             if field in raw_info:

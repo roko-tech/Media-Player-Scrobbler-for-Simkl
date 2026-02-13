@@ -4,6 +4,7 @@ Provides functionality to interact with PotPlayer using Windows messaging API.
 """
 
 import logging
+import os
 import platform
 import re
 
@@ -11,16 +12,26 @@ import re
 # Setup module logger
 logger = logging.getLogger(__name__)
 
+VIDEO_EXTENSIONS = {
+    '.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.m2ts', '.mpg', '.mpeg'
+}
+
 # Only import Windows-specific modules on Windows
 PLATFORM = platform.system().lower()
+win32gui = None
+win32con = None
+win32process = None
+psutil = None
 if PLATFORM == 'windows':
     try:
         import win32gui
         import win32con
+        import win32process
         import psutil
     except ImportError:
         win32gui = None
         win32con = None
+        win32process = None
         psutil = None
         logger.warning("PotPlayer integration requires pywin32 and psutil on Windows")
 
@@ -31,6 +42,8 @@ PPM_GET_PLAYBACK_TIME_MS = 0x5004
 
 def find_potplayer_hwnd():
     """Find PotPlayer window handle."""
+    if not win32gui:
+        return None
     try:
         hwnd = win32gui.FindWindow("PotPlayer64", None)
         if hwnd:
@@ -42,6 +55,8 @@ def find_potplayer_hwnd():
 
 def get_playback_ms(hwnd):
     """Get current playback position in milliseconds."""
+    if not win32gui or not win32con:
+        return None
     try:
         return win32gui.SendMessage(hwnd, win32con.WM_USER, PPM_GET_PLAYBACK_TIME_MS, 0)
     except Exception as e:
@@ -50,6 +65,8 @@ def get_playback_ms(hwnd):
 
 def get_total_ms(hwnd):
     """Get total duration in milliseconds."""
+    if not win32gui or not win32con:
+        return None
     try:
         return win32gui.SendMessage(hwnd, win32con.WM_USER, PPM_GET_TOTAL_TIME_MS, 0)
     except Exception:
@@ -74,10 +91,12 @@ class PotPlayerIntegration:
         self.name = 'potplayer'
         self.platform = platform.system().lower()
         self.last_hwnd = None
+        self.last_window_title = None
         self.cached_filename = None
+        self.cached_filepath = None
         self._connection_logged = False
-        
-        if self.platform == 'windows' and not all([win32gui, win32con, psutil]):
+
+        if self.platform == 'windows' and not all([win32gui, win32con, win32process, psutil]):
             logger.error("PotPlayer integration requires pywin32 and psutil libraries on Windows")
 
     def get_position_duration(self, process_name=None):
@@ -96,7 +115,9 @@ class PotPlayerIntegration:
         hwnd = find_potplayer_hwnd()
         if not hwnd:
             self.last_hwnd = None
+            self.last_window_title = None
             self.cached_filename = None
+            self.cached_filepath = None
             return None, None
         
         try:
@@ -133,7 +154,7 @@ class PotPlayerIntegration:
         Returns:
             bool: True if paused, False if playing, None if unknown
         """
-        if self.platform != 'windows' or not win32gui:
+        if self.platform != 'windows' or not win32gui or not win32con:
             return None
             
         hwnd = find_potplayer_hwnd()
@@ -158,36 +179,124 @@ class PotPlayerIntegration:
             str: Filepath of the current media, or None if unavailable
         """
         if self.platform != 'windows' or not win32gui:
-            return self.cached_filename
+            return self.cached_filepath or self.cached_filename
             
         hwnd = find_potplayer_hwnd()
         if not hwnd:
-            return self.cached_filename
+            return self.cached_filepath or self.cached_filename
             
         try:
             window_title = win32gui.GetWindowText(hwnd)
             if not window_title or window_title == "PotPlayer":
-                return self.cached_filename
+                return self.cached_filepath or self.cached_filename
+
+            if self.last_window_title == window_title:
+                return self.cached_filepath or self.cached_filename
+
+            self.last_window_title = window_title
             
             clean_title = window_title
             if " - PotPlayer" in clean_title:
                 clean_title = clean_title.replace(" - PotPlayer", "").strip()
             
             if self._is_menu_state(clean_title):
-                logger.debug(f"Detected menu state: '{clean_title}', using cached filename")
-                return self.cached_filename
+                logger.debug(f"Detected menu state: '{clean_title}', attempting process handle fallback")
+                resolved_from_process = self._resolve_full_path(None, hwnd)
+                if resolved_from_process:
+                    if self.cached_filepath != resolved_from_process:
+                        logger.debug(f"Resolved PotPlayer media via handle fallback: '{resolved_from_process}'")
+                    self.cached_filepath = resolved_from_process
+                    self.cached_filename = os.path.basename(resolved_from_process)
+                    return resolved_from_process
+
+                return self.cached_filepath or self.cached_filename
             
             cleaned_filename = self._clean_filename(clean_title)
             if cleaned_filename:
+                resolved_path = self._resolve_full_path(cleaned_filename, hwnd)
+                if resolved_path:
+                    if self.cached_filepath != resolved_path:
+                        logger.debug(f"Resolved PotPlayer media to full path: '{resolved_path}'")
+                    self.cached_filepath = resolved_path
+                    self.cached_filename = os.path.basename(resolved_path)
+                    return resolved_path
+
+                # Fallback: return cleaned filename if full path not available
+                if self.cached_filename != cleaned_filename:
+                    logger.debug(f"Cached PotPlayer filename: '{cleaned_filename}'")
                 self.cached_filename = cleaned_filename
-                logger.debug(f"Cached valid filename from PotPlayer: '{cleaned_filename}'")
+                self.cached_filepath = cleaned_filename
                 return cleaned_filename
-                
-            return self.cached_filename
+
+            return self.cached_filepath or self.cached_filename
                 
         except Exception as e:
             logger.debug(f"Error getting filepath from PotPlayer: {e}")
-            return self.cached_filename
+            return self.cached_filepath or self.cached_filename
+
+    def _get_process_from_hwnd(self, hwnd):
+        """Return psutil.Process for the PotPlayer window handle."""
+        if not hwnd or not psutil or not win32process:
+            return None
+
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid:
+                return psutil.Process(pid)
+        except (psutil.Error, ValueError, RuntimeError) as exc:
+            logger.debug(f"Unable to resolve PotPlayer process: {exc}")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"Unexpected error resolving PotPlayer process: {exc}")
+        return None
+
+    def _resolve_full_path(self, filename, hwnd):
+        """Attempt to resolve the full path for the provided filename using process handles."""
+        process = self._get_process_from_hwnd(hwnd)
+        if not process:
+            return None
+
+        target_basename = os.path.basename(filename).lower() if filename else None
+
+        # Try open file handles first
+        try:
+            for open_file in process.open_files():
+                candidate_path = open_file.path
+                if not candidate_path:
+                    continue
+                candidate_basename = os.path.basename(candidate_path).lower()
+                if target_basename:
+                    if candidate_basename == target_basename:
+                        return candidate_path
+                else:
+                    if os.path.splitext(candidate_basename)[1].lower() in VIDEO_EXTENSIONS:
+                        return candidate_path
+        except Exception as exc:  # pragma: no cover - defensive
+            if psutil and isinstance(exc, (psutil.AccessDenied, psutil.NoSuchProcess)):
+                logger.debug(f"Access denied enumerating PotPlayer open files: {exc}")
+            else:
+                logger.debug(f"Unexpected error inspecting PotPlayer open files: {exc}")
+
+        # Fallback: check command-line arguments (works when file opened via CLI)
+        try:
+            for arg in process.cmdline()[1:]:
+                if not arg:
+                    continue
+                arg_basename = os.path.basename(arg).lower()
+                if target_basename:
+                    if arg_basename == target_basename and os.path.exists(arg):
+                        return arg
+                else:
+                    if os.path.exists(arg) and os.path.splitext(arg_basename)[1].lower() in VIDEO_EXTENSIONS:
+                        return arg
+        except Exception as exc:  # pragma: no cover - defensive
+            if psutil and isinstance(exc, (psutil.AccessDenied, psutil.NoSuchProcess)):
+                logger.debug(f"Unable to resolve PotPlayer media via cmdline due to access restrictions: {exc}")
+            elif isinstance(exc, (FileNotFoundError, OSError)):
+                logger.debug(f"Unable to resolve PotPlayer media via cmdline: {exc}")
+            else:
+                logger.debug(f"Unexpected error inspecting PotPlayer cmdline: {exc}")
+
+        return None
 
     def _is_menu_state(self, title):
         """Check if the title represents a menu/UI state rather than a filename."""
@@ -217,6 +326,13 @@ class PotPlayerIntegration:
         
         cleaned = filename
         
+        # Remove leading release-group style tags (e.g., [SubsPlease], [1/4])
+        while True:
+            updated = re.sub(r'^\[[^\]]+\]\s*', '', cleaned, flags=re.IGNORECASE)
+            if updated == cleaned:
+                break
+            cleaned = updated
+
         cleaned = re.sub(r'\s*\(With subtitles\)$', '', cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r'\s*\[Subtitles.*?\]$', '', cleaned, flags=re.IGNORECASE)
         cleaned = cleaned.strip()

@@ -10,6 +10,7 @@ import signal
 import threading
 import pathlib
 import logging
+from logging.handlers import TimedRotatingFileHandler
 from simkl_mps.monitor import Monitor
 from simkl_mps.credentials import get_credentials
 from simkl_mps.config_manager import get_app_data_dir, initialize_paths, get_setting, APP_NAME
@@ -49,7 +50,13 @@ stream_formatter = logging.Formatter('%(levelname)s: %(message)s')
 stream_handler.setFormatter(stream_formatter)
 
 try:
-    file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+    file_handler = TimedRotatingFileHandler(
+        log_file_path,
+        when='W0',  # Rotate weekly (Monday 00:00)
+        interval=1,
+        backupCount=6,
+        encoding='utf-8'
+    )
     file_handler.setLevel(logging.INFO)
     file_formatter = logging.Formatter('%(asctime)s [%(levelname)-8s] %(name)s: %(message)s')
     file_handler.setFormatter(file_formatter)

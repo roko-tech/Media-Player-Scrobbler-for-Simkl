@@ -58,7 +58,7 @@ from simkl_mps.main import SimklScrobbler, APP_DATA_DIR, get_tray_app # Import A
 colorama.init()
 logger = logging.getLogger(__name__)
 
-def _setup_logging():
+def _setup_logging(debug=False):
     """Configure logging for the application."""
     log_file = APP_DATA_DIR / "simkl_mps.log"
     APP_DATA_DIR.mkdir(parents=True, exist_ok=True) # Ensure directory exists
@@ -72,9 +72,9 @@ def _setup_logging():
         filemode='a' # Append to log file
     )
     
-    # Configure console logging (only for INFO level and above)
+    # Configure console logging (INFO by default, DEBUG when requested)
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.DEBUG if debug else logging.INFO)
     formatter = logging.Formatter('%(message)s') # Simple format for console
     console_handler.setFormatter(formatter)
     
@@ -531,6 +531,8 @@ def create_parser():
 
     parser.add_argument("--version", "-v", action="store_true", 
                        help="Display version information and exit")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug logging in console output.")
                        
     subparsers = parser.add_subparsers(dest="command", help="Available commands", required=True) # Make command required
 
@@ -551,6 +553,8 @@ def create_parser():
         aliases=['t'],
         help="Run ONLY tray icon attached to the terminal (shows logs)."
     )
+    tray_parser.add_argument("--debug", action="store_true",
+                             help="Enable debug logging in console output.")
 
     version_parser = subparsers.add_parser(
         "version",
@@ -575,8 +579,11 @@ def main():
     Returns:
         int: Exit code (0 for success, 1 for errors).
     """
-    # Check for common Linux dependency issues before setting up logging
-    if sys.platform == 'linux':
+    parser = create_parser()
+    args = parser.parse_args()
+
+    # Check Linux GUI dependencies only for commands that need tray/GTK runtime.
+    if sys.platform == 'linux' and args.command in {'tray', 'start'}:
         try:
             # Try to import PyGObject - this will fail if system dependencies are missing
             import gi
@@ -594,12 +601,9 @@ def main():
                 print("\nThen reinstall with: pip install --no-binary=:all: \"simkl-mps[linux]\"")
                 print("Or with pipx: pipx install --system-site-packages \"simkl-mps[linux]\"")
                 return 1
-    
-    # Setup logging AFTER the dependency check
-    _setup_logging()
-    
-    parser = create_parser()
-    args = parser.parse_args()
+
+    # Setup logging AFTER argument parsing so --debug can affect console verbosity.
+    _setup_logging(debug=getattr(args, 'debug', False))
 
     # If no command was provided (e.g., just 'simkl-mps'), print help.
     # Note: 'required=True' in add_subparsers makes this less likely, but good practice.

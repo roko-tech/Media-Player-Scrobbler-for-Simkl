@@ -212,12 +212,24 @@ class Monitor:
         self.access_token = access_token
         self.scrobbler.set_credentials(client_id, access_token)
 
-    def cache_media_info(self, title, simkl_id, display_name, media_type='movie', season=None, episode=None, year=None, runtime=None):
+    def cache_media_info(self, title, simkl_id, display_name, media_type='movie', season=None, episode=None,
+                         year=None, runtime=None, season_display=None, episode_display=None):
         """Cache media info to avoid repeated searches for any media type"""
         logger.info(f"Caching media info for '{title}': ID={simkl_id}, Display='{display_name}', Type={media_type}" +
                    (f", Season={season}" if season is not None else "") +
                    (f", Episode={episode}" if episode is not None else ""))
-        self.scrobbler.cache_media_info(title, simkl_id, display_name, media_type, season, episode, year, runtime)
+        self.scrobbler.cache_media_info(
+            title,
+            simkl_id,
+            display_name,
+            media_type,
+            season,
+            episode,
+            year,
+            runtime,
+            season_display=season_display,
+            episode_display=episode_display
+        )
         
     def cache_movie_info(self, title, simkl_id, movie_name, runtime=None):
         """Legacy method for backward compatibility, delegates to cache_media_info"""

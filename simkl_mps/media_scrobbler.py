@@ -11,10 +11,10 @@ import os
 import re
 import requests
 import pathlib
-from difflib import SequenceMatcher
 from datetime import datetime, timezone
 import threading
 from collections import deque
+from typing import Any, Dict
 from requests.exceptions import RequestException
 
 # Import necessary functions and libraries
@@ -93,6 +93,10 @@ class MediaScrobbler:
         self.media_type = None # 'movie', 'episode' (from guessit), 'show', 'anime' (from simkl)
         self.season = None # Season number for episodes
         self.episode = None # Episode number for episodes
+        self._season_guess_from_filename = None
+        self._episode_guess_from_filename = None
+        self.display_season = None
+        self.display_episode = None
         self.last_backlog_attempt_time = {} # Track last offline sync attempt per item {cache_key: timestamp}
         self._last_connection_error_log = {} # Tracks last log time for player connection errors
         self._backlog_notification_throttle = {} # Track last notification time per item {item_key: timestamp}
@@ -399,6 +403,16 @@ class MediaScrobbler:
                 self.stop_tracking()
             return None
 
+        # Detect media switches even when guessit returns identical titles (e.g., sequential episodes)
+        if self.currently_tracking and self.current_filepath and filepath:
+            if self._has_media_file_changed(self.current_filepath, filepath):
+                logger.info(
+                    "Media change detected via filepath switch: '%s' -> '%s'. Resetting tracking for new item.",
+                    self.current_filepath,
+                    filepath
+                )
+                self.stop_tracking()
+
         detected_title = parse_filename_from_path(filepath)
         detection_source = "filename"
         detection_details = os.path.basename(filepath)
@@ -438,6 +452,16 @@ class MediaScrobbler:
             "detection_details": detection_details
         }
 
+    @staticmethod
+    def _has_media_file_changed(previous_filepath, current_filepath):
+        """Case-insensitive comparison of media filenames to detect switches within the same player."""
+        if not previous_filepath or not current_filepath:
+            return False
+
+        prev_name = os.path.basename(previous_filepath).lower()
+        curr_name = os.path.basename(current_filepath).lower()
+        return prev_name != curr_name
+
     def _start_new_media_item(self, raw_title, filepath, initial_media_type_guess, guessit_info=None):
         """Starts tracking a new media item, sets initial state, and attempts identification."""
         if not raw_title or raw_title.lower() in ["audio", "video", "media", "no file"]:
@@ -463,6 +487,18 @@ class MediaScrobbler:
         self.media_type = initial_media_type_guess # Initial guess, will be refined by Simkl
         self.season = None
         self.episode = None
+        self._season_guess_from_filename = None
+        self._episode_guess_from_filename = None
+        self.display_season = None
+        self.display_episode = None
+
+        if guessit_info and isinstance(guessit_info, dict):
+            self._season_guess_from_filename = guessit_info.get('season')
+            self._episode_guess_from_filename = guessit_info.get('episode')
+            self.display_season = self._season_guess_from_filename
+            self.display_episode = self._episode_guess_from_filename
+
+        self._derive_display_season_episode()
 
         self._send_notification("Tracking Started", f"Tracking: '{raw_title}'", offline_only=True)
 
@@ -487,6 +523,51 @@ class MediaScrobbler:
                 self._cache_initial_offline_info(raw_title, filepath, initial_media_type_guess, guessit_info)
             else:
                 logger.info("Offline: Cannot cache basic info - filepath not available.")
+
+
+    def _derive_display_season_episode(self):
+        """Determine display season/episode values using filename guesses when API returns generic numbering."""
+        season_display = self.display_season if self.display_season is not None else self.season
+        episode_display = self.display_episode if self.display_episode is not None else self.episode
+
+        if self._season_guess_from_filename is not None:
+            guess = self._season_guess_from_filename
+            if isinstance(guess, int):
+                if season_display is None or (isinstance(season_display, int) and season_display in (0, 1) and guess > 1):
+                    season_display = guess
+            else:
+                if season_display is None:
+                    season_display = guess
+
+        if self._episode_guess_from_filename is not None:
+            if episode_display is None or episode_display == self.episode:
+                episode_display = self._episode_guess_from_filename
+
+        self.display_season = season_display
+        self.display_episode = episode_display
+
+    def _build_episode_display_suffix(self):
+        """Return a formatted suffix (e.g., ' S03E05') for display purposes."""
+        if self.media_type in ['show', 'anime']:
+            season_val = self.display_season if self.display_season is not None else self.season
+            episode_val = self.display_episode if self.display_episode is not None else self.episode
+            parts = []
+
+            if season_val is not None:
+                if isinstance(season_val, int):
+                    parts.append(f"S{season_val:02d}")
+                else:
+                    parts.append(f"S{season_val}")
+
+            if episode_val is not None:
+                if isinstance(episode_val, int):
+                    parts.append(f"E{episode_val:02d}")
+                else:
+                    parts.append(f"E{episode_val}")
+
+            if parts:
+                return " " + "".join(parts)
+        return ""
 
 
     def _cache_initial_offline_info(self, raw_title, filepath, media_type_guess, guessit_info):
@@ -540,6 +621,12 @@ class MediaScrobbler:
         self.media_type = cached_info.get('type') # Simkl type: 'movie', 'show', 'anime'
         self.season = cached_info.get('season')
         self.episode = cached_info.get('episode')
+        if 'season_display' in cached_info:
+            self.display_season = cached_info.get('season_display')
+        if 'episode_display' in cached_info:
+            self.display_episode = cached_info.get('episode_display')
+
+        self._derive_display_season_episode()
         
         if 'duration_seconds' in cached_info and self.total_duration_seconds is None:
             self.total_duration_seconds = cached_info['duration_seconds']
@@ -550,15 +637,15 @@ class MediaScrobbler:
         if self.currently_tracking and self.movie_name and self.simkl_id:
             display_text = f"Playing: '{self.movie_name}'"
             if self.media_type in ['show', 'anime']:
-                if self.season is not None and self.episode is not None:
-                    display_text += f" S{self.season}E{self.episode}"
-                elif self.media_type == 'anime' and self.episode is not None: # Anime might only have episode
-                    display_text += f" E{self.episode}"
+                suffix = self._build_episode_display_suffix()
+                if suffix:
+                    display_text += suffix
             elif self.media_type == 'movie' and cached_info.get('year'):
                 display_text += f" ({cached_info.get('year')})"
             
+            media_label = (self.media_type or 'media').capitalize()
             self._send_notification(
-                f"{self.media_type.capitalize()} Identified (Cache)",
+                f"{media_label} Identified (Cache)",
                 display_text,
                 online_only=True # Notifications for confirmed IDs are online-only
             )
@@ -594,9 +681,9 @@ class MediaScrobbler:
 
         # Get position and duration from player
         pos, dur = None, None
+        position_updated_from_player = False
         if process_name:
-            pos, dur = self.get_player_position_duration(process_name)        
-            position_updated_from_player = False
+            pos, dur = self.get_player_position_duration(process_name)
         if pos is not None and dur is not None and dur > 0:
             if self.total_duration_seconds is None or abs(self.total_duration_seconds - dur) > 2:
                 logger.info(f"Updating total duration for '{self.movie_name or self.currently_tracking}' from {self.total_duration_seconds}s to {dur}s via player.")
@@ -655,7 +742,8 @@ class MediaScrobbler:
             # self.last_scrobble_time = current_time # Update this only when returning scrobble data below        # Check completion threshold
         if not self.completed and (current_time - self.last_progress_check > 5): # Check every 5s
             completion_pct = self._calculate_percentage(use_position=position_updated_from_player)
-            if completion_pct and completion_pct >= self.completion_threshold:
+            threshold = self.completion_threshold
+            if completion_pct is not None and threshold is not None and float(completion_pct) >= float(threshold):
                 display_title_for_log = self.movie_name or self.currently_tracking
                 logger.info(f"Completion threshold ({self.completion_threshold}%) met for '{display_title_for_log}' at {completion_pct:.2f}%.")
                 self._log_playback_event("completion_threshold_reached")
@@ -733,7 +821,8 @@ class MediaScrobbler:
         # Use a stricter check if it wasn't already marked complete by _update_tracking
         if not self.completed:
             final_completion_pct = self._calculate_percentage(use_position=True) # Prefer position at stop
-            if final_completion_pct and final_completion_pct >= self.completion_threshold:
+            threshold = self.completion_threshold
+            if final_completion_pct is not None and threshold is not None and float(final_completion_pct) >= float(threshold):
                 logger.info(f"'{final_movie_name or final_raw_title}' met completion threshold upon stopping.")
                 # Attempt to add to history if not already done
                 self._attempt_add_to_history() # This might set self.completed
@@ -1049,6 +1138,8 @@ class MediaScrobbler:
             if 'episode' in episode_details_from_api:
                 self.episode = episode_details_from_api['episode']
         
+        self._derive_display_season_episode()
+
         year = media_item.get('year')
         runtime_minutes = media_item.get('runtime') or episode_details_from_api.get('runtime')
         
@@ -1139,6 +1230,8 @@ class MediaScrobbler:
             poster_url=final_poster_url_for_cache,
             source_description=source_description,
             original_filepath_if_any=original_filepath_for_cache,
+            season_display=self.display_season,
+            episode_display=self.display_episode,
             _api_full_details=final_api_full_details_for_cache # This now passes the richer details
         )
         
@@ -1147,11 +1240,14 @@ class MediaScrobbler:
         # For now, let's keep it to ensure a notification is sent.
         display_text = f"Playing: '{self.movie_name}'" # self.movie_name might have been updated by cache_media_info
         if self.media_type in ['show', 'anime']: # self.media_type might have been updated
-            if self.season is not None and self.episode is not None: display_text += f" S{self.season}E{self.episode}"
-            elif self.media_type == 'anime' and self.episode is not None: display_text += f" E{self.episode}"
-        elif self.media_type == 'movie' and final_year_for_cache: display_text += f" ({final_year_for_cache})" # Use potentially updated year
-        
-        self._send_notification(f"{self.media_type.capitalize()} Identified", display_text, online_only=True)
+            suffix = self._build_episode_display_suffix()
+            if suffix:
+                display_text += suffix
+        elif self.media_type == 'movie' and final_year_for_cache:
+            display_text += f" ({final_year_for_cache})" # Use potentially updated year
+
+        media_label = (self.media_type or 'media').capitalize()
+        self._send_notification(f"{media_label} Identified", display_text, online_only=True)
         self._clear_backlog_entry_if_temp_identified()
 
     def _identify_movie(self, title_to_search):
@@ -1246,7 +1342,11 @@ class MediaScrobbler:
         """
         display_title = self.movie_name or self.currently_tracking # Use official name if known
         # Cache key for cooldown tracking: prefer filepath, fallback to raw title
-        cache_key_for_cooldown = os.path.basename(self.current_filepath).lower() if self.current_filepath else self.currently_tracking.lower()
+        cache_key_for_cooldown = (
+            os.path.basename(self.current_filepath).lower()
+            if self.current_filepath
+            else (self.currently_tracking or "").lower()
+        )
         current_time = time.time()
         cooldown_period = 300 # 5 minutes
 
@@ -1355,7 +1455,8 @@ class MediaScrobbler:
                     media_type=self.media_type, season=self.season, episode=self.episode,
                     original_filepath=self.current_filepath
                 )
-                self._send_notification(f"{self.media_type.capitalize()} Synced", f"'{display_title}' added to Simkl.", online_only=True)
+                media_label = (self.media_type or 'media').capitalize()
+                self._send_notification(f"{media_label} Synced", f"'{display_title}' added to Simkl.", online_only=True)
                 if cache_key_for_cooldown in self.last_backlog_attempt_time:
                     del self.last_backlog_attempt_time[cache_key_for_cooldown]
                 return True
@@ -1400,7 +1501,11 @@ class MediaScrobbler:
         self.backlog_cleaner.add(item_key_for_backlog, title_for_backlog, additional_data=backlog_data_payload)
         
         # Use a consistent cache key for cooldown, based on current filepath or raw title
-        cooldown_key = os.path.basename(self.current_filepath).lower() if self.current_filepath else self.currently_tracking.lower()
+        cooldown_key = (
+            os.path.basename(self.current_filepath).lower()
+            if self.current_filepath
+            else (self.currently_tracking or "").lower()
+        )
         self.last_backlog_attempt_time[cooldown_key] = time.time()
         
         self.completed = True # Mark as "handled" for this playback session
@@ -1494,7 +1599,7 @@ class MediaScrobbler:
             if self.episode is not None:
                 try:
                     anime_episode_payload = [{"number": int(self.episode), "watched_at": watched_at}]
-                    show_item = {"ids": item_ids}
+                    show_item: Dict[str, Any] = {"ids": item_ids}
                     if self.season is not None: # If season is known, nest episode under it
                          show_item["seasons"] = [{"number": int(self.season), "episodes": anime_episode_payload}]
                     else: # Otherwise, episodes directly under show (common for OVAs or movies treated as anime episodes)
@@ -2076,8 +2181,8 @@ class MediaScrobbler:
     def cache_media_info(self, original_title_key, simkl_id, display_name, media_type='movie',
                          season=None, episode=None, year=None, runtime_minutes=None,
                          api_ids=None, overview=None, poster_url=None, # Changed from poster_url
-                         source_description=None, original_filepath_if_any=None,
-                         _api_full_details=None):
+                         source_description=None, season_display=None, episode_display=None,
+                         original_filepath_if_any=None, _api_full_details=None):
         """
         Caches detailed media info, consolidating by Simkl ID and merging data.
         `original_title_key` is the key for this specific caching attempt (e.g., filename or raw title).
@@ -2128,7 +2233,7 @@ class MediaScrobbler:
                         break # Found the matching episode
         
         # Prepare the new data, adding fields only if they have a meaningful value
-        new_data_to_cache = {"simkl_id": simkl_id}
+        new_data_to_cache: Dict[str, Any] = {"simkl_id": simkl_id}
         if display_name: new_data_to_cache["movie_name"] = display_name
         if media_type: new_data_to_cache["type"] = media_type
         if year is not None: new_data_to_cache["year"] = year
@@ -2149,6 +2254,8 @@ class MediaScrobbler:
         if media_type in ['show', 'anime']:
             if season is not None: new_data_to_cache["season"] = season
             if episode is not None: new_data_to_cache["episode"] = episode
+            if season_display is not None: new_data_to_cache["season_display"] = season_display
+            if episode_display is not None: new_data_to_cache["episode_display"] = episode_display
         
         duration_seconds_to_cache = None
         if runtime_minutes_for_cache: # Use the potentially episode-specific runtime
@@ -2243,6 +2350,10 @@ class MediaScrobbler:
             if media_type: self.media_type = media_type
             if season is not None: self.season = season
             if episode is not None: self.episode = episode
+            if season_display is not None: self.display_season = season_display
+            if episode_display is not None: self.display_episode = episode_display
+
+            self._derive_display_season_episode()
             
             current_total_duration = new_data_to_cache.get("duration_seconds")
             if current_total_duration is not None and \
@@ -2255,13 +2366,14 @@ class MediaScrobbler:
             if is_new_id_for_instance or (display_name and self.movie_name != display_name):
                 notify_text = f"Playing: '{self.movie_name}'"
                 if self.media_type in ['show', 'anime']:
-                    # Use the parameters passed to this function, not the instance variables (which may be stale)
-                    if season is not None and episode is not None: notify_text += f" S{season}E{episode}"
-                    elif episode is not None : notify_text += f" E{episode}" # Anime
+                    suffix = self._build_episode_display_suffix()
+                    if suffix:
+                        notify_text += suffix
                 elif year is not None: notify_text += f" ({year})" # Use year from params if available
                 elif new_data_to_cache.get('year') is not None: notify_text += f" ({new_data_to_cache.get('year')})"
 
-                self._send_notification(f"{self.media_type.capitalize()} Identified", notify_text, online_only=True)
+                media_label = (self.media_type or 'media').capitalize()
+                self._send_notification(f"{media_label} Identified", notify_text, online_only=True)
 
 
     def is_complete(self, threshold_override=None):
@@ -2276,9 +2388,10 @@ class MediaScrobbler:
         if percentage is None: # Fallback to accumulated watch time
             percentage = self._calculate_percentage(use_accumulated=True)
 
-        if percentage is None: return False # Cannot determine completion
+        if percentage is None or threshold_to_use is None:
+            return False # Cannot determine completion
 
-        is_now_complete = percentage >= threshold_to_use
+        is_now_complete = float(percentage) >= float(threshold_to_use)
         
         # Log first time completion detection for this item
         if is_now_complete and not hasattr(self, '_logged_completion_for_this_item'):

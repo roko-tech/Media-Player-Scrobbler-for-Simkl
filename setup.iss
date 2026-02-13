@@ -1,10 +1,10 @@
 #define MyAppName "Media Player Scrobbler for SIMKL"
 #define MyAppShortName "MPS for SIMKL"
-#define MyAppPublisher "kavin"
+#define MyAppPublisher "ByteTrix"
 #define MyAppURL "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl"
 #define MyAppExeName "MPSS"
 #define MyAppTrayName "MPS for Simkl"
-#define MyAppVersion "2.2.0"
+#define MyAppVersion "2.2.1"
 #define MyAppDescription "Automatically track and scrobble media you watch to SIMKL"
 #define MyAppCopyright "Copyright (C) 2025 kavin"
 #define MyAppUpdateURL "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/releases"
@@ -140,6 +140,137 @@ const
   MyAppIdGuid = '{3FF84A4E-B9C2-4F49-A8DE-5F7EA15F5D88}'; // Define the AppId GUID as a script constant
   CONFIG_FOLDER = 'simkl-mps';
   TASK_NAME = 'kavin.MediaPlayerScrobblerForSIMKL.UpdateCheck';
+  SILENT_ALIAS_MARKER = '/_mpss_silent_alias_applied';
+
+type
+  TStringArray = array of String;
+
+function NormalizeSwitchToken(const Token: String): String;
+var
+  Work: String;
+begin
+  Work := Token;
+  if (Length(Work) > 1) and (Work[1] = '"') and (Work[Length(Work)] = '"') then
+    Work := Copy(Work, 2, Length(Work) - 2);
+  while (Length(Work) > 0) and ((Work[1] = '/') or (Work[1] = '-')) do
+    Delete(Work, 1, 1);
+  Result := LowerCase(Work);
+end;
+
+function IsSilentAliasToken(const Token: String): Boolean;
+var
+  Normalized: String;
+begin
+  Normalized := NormalizeSwitchToken(Token);
+  Result := (Normalized = 'quiet') or
+            (Normalized = 'silent') or
+            (Normalized = 's') or
+            (Normalized = 'qn') or
+            (Normalized = 'qb') or
+            (Normalized = 'passive');
+end;
+
+procedure SplitCmdLineTokens(const CmdLine: String; var Tokens: TStringArray);
+var
+  i, Count: Integer;
+  InQuote: Boolean;
+  Current: String;
+  c: Char;
+begin
+  SetArrayLength(Tokens, 0);
+  Count := 0;
+  InQuote := False;
+  Current := '';
+  for i := 1 to Length(CmdLine) do
+  begin
+    c := CmdLine[i];
+    if c = '"' then
+    begin
+      InQuote := not InQuote;
+      Current := Current + c;
+    end
+    else if (c = ' ') and (not InQuote) then
+    begin
+      if Current <> '' then
+      begin
+        SetArrayLength(Tokens, Count + 1);
+        Tokens[Count] := Current;
+        Count := Count + 1;
+        Current := '';
+      end;
+    end
+    else
+      Current := Current + c;
+  end;
+  if Current <> '' then
+  begin
+    SetArrayLength(Tokens, Count + 1);
+    Tokens[Count] := Current;
+  end;
+end;
+
+function JoinTokens(const Tokens: TStringArray): String;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to GetArrayLength(Tokens) - 1 do
+  begin
+    if Tokens[i] <> '' then
+    begin
+      if Result <> '' then
+        Result := Result + ' ';
+      Result := Result + Tokens[i];
+    end;
+  end;
+end;
+
+function HandleSilentAliasLaunch: Boolean;
+var
+  RawTokens, CleanTokens: TStringArray;
+  Token: String;
+  CleanTail: String;
+  i, CleanCount, ResultCode: Integer;
+  AliasDetected, AlreadyHandled: Boolean;
+begin
+  Result := False;
+  AliasDetected := False;
+  AlreadyHandled := False;
+  SplitCmdLineTokens(GetCmdTail, RawTokens);
+  CleanCount := 0;
+  SetArrayLength(CleanTokens, 0);
+
+  for i := 0 to GetArrayLength(RawTokens) - 1 do
+  begin
+    Token := RawTokens[i];
+    if CompareText(Token, SILENT_ALIAS_MARKER) = 0 then
+      AlreadyHandled := True
+    else if IsSilentAliasToken(Token) then
+      AliasDetected := True
+    else
+    begin
+      SetArrayLength(CleanTokens, CleanCount + 1);
+      CleanTokens[CleanCount] := Token;
+      CleanCount := CleanCount + 1;
+    end;
+  end;
+
+  if (not AliasDetected) or AlreadyHandled then
+    exit;
+
+  CleanTail := Trim(JoinTokens(CleanTokens));
+  if CleanTail <> '' then
+    CleanTail := CleanTail + ' ' + SILENT_ALIAS_MARKER
+  else
+    CleanTail := SILENT_ALIAS_MARKER;
+
+  ResultCode := 0;
+  if Exec(ExpandConstant('{srcexe}'), '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART ' + CleanTail,
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Result := True
+  else
+    Log('Failed to relaunch installer for silent alias. ResultCode=' + IntToStr(ResultCode));
+end;
 
 // Check if the app is currently running
 function IsAppRunning: Boolean;
@@ -207,6 +338,12 @@ end;
 // Initialization function for setup
 function InitializeSetup: Boolean;
 begin
+  if HandleSilentAliasLaunch then
+  begin
+    Result := False;
+    exit;
+  end;
+
   // Check if app is running and terminate it before setup begins
   IsAppRunning();
   Result := True;

@@ -12,14 +12,20 @@ import logging
 import webbrowser
 import subprocess
 from pathlib import Path
+from typing import Any, Optional, TYPE_CHECKING
 from PIL import Image, ImageDraw, ImageFont
 import abc
 import pystray
 import tkinter as tk
 from tkinter import messagebox
 
+if TYPE_CHECKING:
+    from simkl_mps.main import SimklScrobbler
+    from simkl_mps.media_scrobbler import MediaScrobbler
+    from simkl_mps.watch_history_manager import WatchHistoryManager
+
 # Import API and credential functions
-from simkl_mps.simkl_api import get_user_settings
+from simkl_mps.simkl_api import get_user_settings, pin_auth_flow
 from simkl_mps.credentials import get_credentials
 # Import constants only, not the whole module
 from simkl_mps.main import APP_DATA_DIR, APP_NAME
@@ -27,6 +33,8 @@ from simkl_mps.main import APP_DATA_DIR, APP_NAME
 from simkl_mps.config_manager import get_setting, set_setting, DEFAULT_THRESHOLD
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_DONATION_URL = "https://github.com/sponsors/itskavin"
 
 def get_simkl_scrobbler():
     """Lazy import for SimklScrobbler to avoid circular imports"""
@@ -121,8 +129,31 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             return False
             
 
+    def _show_info_dialog(self, title, message):
+        """Display an informational dialog and wait for the user to dismiss it."""
+        try:
+
+            def show_dialog():
+                try:
+                    root = tk.Tk()
+                    root.withdraw()
+                    root.attributes('-topmost', True)
+                    root.lift()
+                    root.focus_force()
+                    messagebox.showinfo(title, message, parent=root)
+                    root.destroy()
+                except Exception as dialog_err:
+                    logger.error(f"Error showing info dialog: {dialog_err}")
+
+            thread = threading.Thread(target=show_dialog)
+            thread.start()
+            thread.join()
+        except Exception as e:
+            logger.error(f"Error launching info dialog: {e}")
+
+
     def __init__(self):
-        self.scrobbler = None
+        self.scrobbler: Optional["SimklScrobbler"] = None
         self.monitoring_active = False
         self.status = "stopped"
         self.status_details = ""
@@ -134,10 +165,18 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         self.is_first_run = False
         self.check_first_run()
 
+        # Track authentication state for menu labeling and actions
+        self._auth_in_progress = False
+        self.is_authenticated = False
+        self._last_known_access_token = None
+        self._last_known_client_id = None
+        self._refresh_auth_state(initial=True)
+
         # Improved asset path resolution for frozen applications
         if getattr(sys, 'frozen', False):
             # When frozen, look for assets in multiple locations
-            base_dir = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path(sys.executable).parent
+            meipass_dir = getattr(sys, "_MEIPASS", None)
+            base_dir = Path(meipass_dir) if meipass_dir else Path(sys.executable).parent
             possible_asset_paths = [
                 base_dir / "simkl_mps" / "assets",  # Standard location in the frozen app
                 base_dir / "assets",                # Alternative location
@@ -160,6 +199,134 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             module_dir = Path(__file__).parent
             self.assets_dir = module_dir / "assets"
             logger.info(f"Using assets directory from source: {self.assets_dir}")
+
+    def _check_auth_state(self):
+        """Return the current authentication state and cached credentials."""
+        try:
+            creds = get_credentials()
+            token = creds.get("access_token")
+            client_id = creds.get("client_id")
+            return bool(token), token, client_id
+        except Exception as e:
+            logger.error(f"Failed to read authentication state: {e}", exc_info=True)
+            return False, None, None
+
+    def _refresh_auth_state(self, initial: bool = False):
+        """Refresh cached authentication state; return True if anything changed."""
+        authenticated, token, client_id = self._check_auth_state()
+        changed = (
+            authenticated != self.is_authenticated or
+            token != self._last_known_access_token or
+            client_id != self._last_known_client_id
+        )
+        self.is_authenticated = authenticated
+        self._last_known_access_token = token
+        self._last_known_client_id = client_id
+        if changed and not initial:
+            logger.info("Authentication state changed: %s", "authenticated" if authenticated else "not authenticated")
+        return changed
+
+    def _get_media_scrobbler(self) -> Any:
+        """Return the active MediaScrobbler instance if available."""
+        scrobbler_instance = self.scrobbler
+        if not scrobbler_instance:
+            return None
+        monitor = getattr(scrobbler_instance, "monitor", None)
+        return getattr(monitor, "scrobbler", None)
+
+    def _get_watch_history_manager(self) -> Any:
+        """Return the active WatchHistoryManager instance if available."""
+        scrobbler_instance = self.scrobbler
+        if scrobbler_instance and hasattr(scrobbler_instance, "watch_history_manager"):
+            return scrobbler_instance.watch_history_manager
+        return None
+
+    def _ensure_threshold_value(self, value: Any) -> int:
+        """Convert stored threshold value to an int with a safe fallback."""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_THRESHOLD
+
+    def check_updates_thread(self):
+        """Optional hook for subclasses that implement update checks."""
+        logger.debug("Update check not implemented for this platform.")
+
+    def _get_auth_menu_label(self):
+        if self._auth_in_progress:
+            return "Authenticating..."
+        return "Authenticate" if not self.is_authenticated else "Re-authenticate"
+
+    def trigger_auth_flow(self, _=None):
+        """Start the Simkl authentication flow from the tray menu."""
+        if self._auth_in_progress:
+            self.show_notification("SIMKL Authentication", "Authentication is already in progress.")
+            return 0
+
+        authenticated, _, client_id = self._check_auth_state()
+        if not client_id or "PLACEHOLDER" in str(client_id):
+            logger.error("Client ID missing; cannot start authentication flow.")
+            self.show_notification("Authentication Error", "Client ID is not configured. Reinstall or check your build configuration.")
+            return 0
+
+        self._auth_in_progress = True
+        if not authenticated:
+            logger.info("Starting initial authentication flow from tray.")
+        else:
+            logger.info("Starting re-authentication flow from tray.")
+
+        # Refresh menu immediately to show in-progress state
+        try:
+            self.update_icon()
+        except Exception:
+            logger.debug("Unable to refresh icon before authentication starts", exc_info=True)
+
+        threading.Thread(target=self._run_auth_flow, args=(client_id,), daemon=True).start()
+        return 0
+
+    def _run_auth_flow(self, client_id: str):
+        """Execute the Simkl PIN authentication flow in a background thread."""
+        try:
+            self._show_info_dialog(
+                "Simkl Authentication",
+                "A browser window will open so you can authorize Media Player Scrobbler for SIMKL."
+                " Sign in to Simkl and approve the request, then return here once it is complete."
+            )
+            self.show_notification(
+                "Simkl Authentication",
+                "Opening your browser for Simkl authorization. Complete the steps and return to the tray."
+            )
+
+            new_token = pin_auth_flow(client_id)
+
+            if new_token:
+                logger.info("Authentication flow completed successfully from tray.")
+                self.show_notification("Simkl Authentication", "Authentication completed successfully.")
+
+                try:
+                    # Ensure the latest credentials are cached
+                    self._refresh_auth_state()
+                    if self.scrobbler:
+                        self.scrobbler.access_token = new_token
+                        self.scrobbler.client_id = client_id
+                        if hasattr(self.scrobbler, 'monitor') and self.scrobbler.monitor:
+                            self.scrobbler.monitor.set_credentials(client_id, new_token)
+                except Exception as update_err:
+                    logger.error(f"Failed to propagate new credentials to running components: {update_err}", exc_info=True)
+            else:
+                logger.warning("Authentication flow did not return a token (cancelled or timed out).")
+                self.show_notification("Simkl Authentication", "Authentication was not completed. You can try again anytime.")
+
+        except Exception as e:
+            logger.error(f"Authentication flow failed: {e}", exc_info=True)
+            self.show_notification("Authentication Error", f"Authentication failed: {e}")
+        finally:
+            self._refresh_auth_state()
+            self._auth_in_progress = False
+            try:
+                self.update_icon()
+            except Exception:
+                logger.debug("Unable to refresh icon after authentication", exc_info=True)
         
     def get_status_text(self):
         """Generate status text for the menu item"""
@@ -304,6 +471,12 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
     def open_simkl(self, _=None):
         """Open the SIMKL website"""
         webbrowser.open("https://simkl.com")
+        return 0
+
+    def open_donation_page(self, _=None):
+        """Open the donation/support page."""
+        donation_url = DEFAULT_DONATION_URL
+        webbrowser.open(donation_url)
         return 0
 
     def open_simkl_history(self, _=None):
@@ -522,9 +695,18 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
 
     def process_backlog(self, _=None):
         """Process the backlog from the tray menu"""
+        media_scrobbler = self._get_media_scrobbler()
+        if not media_scrobbler or not hasattr(media_scrobbler, "process_backlog"):
+            logger.warning("Cannot process backlog: media scrobbler is unavailable.")
+            self.show_notification(
+                "simkl-mps Error",
+                "Backlog processing is unavailable because monitoring is not running."
+            )
+            return 0
+
         def _process():
             try:
-                result = self.scrobbler.monitor.scrobbler.process_backlog()
+                result = media_scrobbler.process_backlog()
                 
                 # Handle both the old integer return type and new dictionary return type
                 if isinstance(result, dict):
@@ -571,6 +753,106 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         threading.Thread(target=_process, daemon=True).start()
         return 0
 
+    def clear_logs(self, _=None):
+        """Clear application and playback log files."""
+        logger.info("Clear logs requested from tray menu...")
+
+        if not self._show_confirmation_dialog(
+            "Clear Logs",
+            "This will erase the application log and playback logs.\n\n"
+            "Use this when you need a clean slate before reproducing an issue.\n\n"
+            "Continue?"
+        ):
+            logger.info("Clear logs cancelled by user")
+            return 0
+
+        log_targets: list[tuple[str, Path, str]] = [
+            ("application log", self.log_path, "truncate"),
+            ("app data playback log", APP_DATA_DIR / "playback_log.jsonl", "truncate"),
+            ("workspace playback log", Path("playback_log.jsonl"), "delete"),
+        ]
+
+        cleared: list[str] = []
+        failures: list[str] = []
+
+        for label, target_path, mode in log_targets:
+            try:
+                if not target_path.exists():
+                    logger.debug(f"Log target '{label}' not found at {target_path}. Skipping.")
+                    continue
+
+                if mode == "truncate":
+                    with open(target_path, "w", encoding="utf-8"):
+                        pass
+                else:
+                    target_path.unlink()
+
+                cleared.append(label)
+                logger.info(f"Cleared {label} at {target_path}")
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error(f"Failed to clear {label} at {target_path}: {exc}", exc_info=True)
+                failures.append(label)
+
+        if cleared and not failures:
+            self.show_notification("simkl-mps", f"Cleared logs: {', '.join(cleared)}")
+        elif cleared:
+            self.show_notification(
+                "simkl-mps",
+                f"Cleared logs: {', '.join(cleared)}. Failed: {', '.join(failures)}"
+            )
+        else:
+            self.show_notification("simkl-mps Error", "No log files could be cleared.")
+
+        return 0
+
+    def clear_watch_history(self, _=None):
+        """Clear the local watch history cache and viewer data."""
+        logger.info("Clear watch history requested from tray menu...")
+
+        if not self._show_confirmation_dialog(
+            "Clear Watch History",
+            "This removes the locally stored watch_history.json and viewer data.\n\n"
+            "Simkl's online history is unaffected.\n\n"
+            "Continue?"
+        ):
+            logger.info("Clear watch history cancelled by user")
+            return 0
+
+        try:
+            history_manager = None
+            if self.scrobbler and getattr(self.scrobbler, 'watch_history_manager', None):
+                history_manager = self.scrobbler.watch_history_manager
+
+            if history_manager is None:
+                from simkl_mps.watch_history_manager import WatchHistoryManager
+                history_manager = WatchHistoryManager(APP_DATA_DIR)
+                if self.scrobbler and hasattr(self.scrobbler, 'watch_history_manager'):
+                    self.scrobbler.watch_history_manager = history_manager
+
+            if history_manager is None:
+                raise RuntimeError("Watch history manager unavailable")
+
+            history_manager.clear()
+            if hasattr(history_manager, "history"):
+                history_manager.history = []
+
+            history_file = APP_DATA_DIR / "watch_history.json"
+            if history_file.exists():
+                history_file.unlink()
+
+            viewer_dir = APP_DATA_DIR / "watch-history-viewer"
+            data_js = viewer_dir / "data.js"
+            if data_js.exists():
+                data_js.unlink()
+
+            self.show_notification("simkl-mps", "Local watch history cleared.")
+            logger.info("Local watch history cleared via tray menu")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error(f"Failed to clear watch history: {exc}", exc_info=True)
+            self.show_notification("simkl-mps Error", f"Failed to clear watch history: {exc}")
+
+        return 0
+
     def clear_backlog(self, _=None):
         """Clear the backlog and restart application state to prevent repeated sync notifications"""
         logger.info("Clear backlog requested from tray menu...")
@@ -598,7 +880,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             # Reset scrobbler state if running
             if self.scrobbler:
                 if hasattr(self.scrobbler, 'monitor') and hasattr(self.scrobbler.monitor, 'scrobbler'):
-                    scrobbler = self.scrobbler.monitor.scrobbler
+                    scrobbler: Any = self.scrobbler.monitor.scrobbler
                     
                     # Use the new reset method for comprehensive state clearing
                     if hasattr(scrobbler, 'reset_tracking_state'):
@@ -643,7 +925,9 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
     def _apply_threshold_change(self, new_threshold: int | None):
         """Applies the threshold change: saves, updates scrobbler, notifies, updates UI."""
         logger.debug(f"TrayBase: _apply_threshold_change called with new_threshold='{new_threshold}' (type: {type(new_threshold)})")
-        current_threshold = get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
+        current_threshold = self._ensure_threshold_value(
+            get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
+        )
         logger.debug(f"TrayBase: Current threshold from settings: {current_threshold}")
 
         if new_threshold is not None and new_threshold != current_threshold:
@@ -654,11 +938,9 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                 self.show_notification("Settings Updated", f"Watch threshold set to {new_threshold}%")
 
                 # Attempt to update the running scrobbler instance
-                if self.scrobbler and hasattr(self.scrobbler, 'monitor') and \
-                   hasattr(self.scrobbler.monitor, 'scrobbler') and \
-                   hasattr(self.scrobbler.monitor.scrobbler, 'completion_threshold'):
-
-                    self.scrobbler.monitor.scrobbler.completion_threshold = new_threshold # Store as percentage
+                media_scrobbler = self._get_media_scrobbler()
+                if media_scrobbler and hasattr(media_scrobbler, 'completion_threshold'):
+                    media_scrobbler.completion_threshold = new_threshold # Store as percentage
                     logger.debug(f"Updated running scrobbler instance threshold to {new_threshold}%")
                 else:
                     logger.warning("Could not update running scrobbler instance threshold (not found or not running).")
@@ -689,9 +971,11 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
     def set_custom_watch_threshold(self, _=None):
         """Handles prompting the user for a custom threshold via platform-specific dialog."""
         logger.debug("TrayBase: set_custom_watch_threshold called.")
-        current_threshold = get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
+        current_threshold = self._ensure_threshold_value(
+            get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
+        )
         logger.debug(f"TrayBase: Current threshold for custom dialog: {current_threshold}%")
-        result_queue = queue.Queue()
+        result_queue: "queue.Queue[int | None]" = queue.Queue()
 
         def _ask_in_thread():
             """Runs the platform-specific dialog in a separate thread."""
@@ -756,7 +1040,10 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
     def _build_pystray_menu_items(self):
         """Builds the list of pystray menu items common to multiple platforms."""
         # Get current threshold for radio button state
-        current_threshold = get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
+        self._refresh_auth_state()
+        current_threshold = self._ensure_threshold_value(
+            get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
+        )
         is_preset = lambda val: current_threshold == val
 
         menu_items = [
@@ -766,15 +1053,14 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             pystray.Menu.SEPARATOR,
         ]
 
-        # Monitoring controls (unchanged)
+        # Tracking controls
         if self.status == "running":
-            menu_items.append(pystray.MenuItem("Pause Monitoring", self.stop_monitoring))
+            menu_items.append(pystray.MenuItem("Pause Tracking", self.stop_monitoring))
         else:
-            menu_items.append(pystray.MenuItem("Start Monitoring", self.start_monitoring))
+            menu_items.append(pystray.MenuItem("Start Tracking", self.start_monitoring))
         menu_items.append(pystray.Menu.SEPARATOR)
-        menu_items.append(pystray.MenuItem("Watch History", self.open_watch_history))
 
-        # --- Tools submenu ---
+        # --- Scrobbling submenu ---
         threshold_submenu = pystray.Menu(
             pystray.MenuItem('65%', lambda: self._set_preset_threshold(65), checked=lambda item: is_preset(65), radio=True),
             pystray.MenuItem('80% (Default)', lambda: self._set_preset_threshold(80), checked=lambda item: is_preset(80), radio=True),
@@ -782,29 +1068,44 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('Custom...', self.set_custom_watch_threshold)
         )
-        menu_items.append(pystray.MenuItem("Tools", pystray.Menu(
+        menu_items.append(pystray.MenuItem("Scrobbling", pystray.Menu(
+            pystray.MenuItem("Retry Last Scrobble", self.try_scrobble_again),
+            pystray.MenuItem("Sync Backlog Now", self.process_backlog),
+            pystray.MenuItem("Completion Threshold", threshold_submenu),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Try Scrobble Again", self.try_scrobble_again),
-            pystray.MenuItem("Process Backlog Now", self.process_backlog),
-            pystray.MenuItem("Watch Threshold (%)", threshold_submenu),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Open Logs", self.open_logs),
-            pystray.MenuItem("Open Config Directory", self.open_config_dir),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Clear Backlog", self.clear_backlog),
-            pystray.MenuItem("Clear Cache", self.clear_cache),
-            pystray.MenuItem("Clear All Data and Logs", self.clear_all_data),
+            pystray.MenuItem("Open Local Watch History", self.open_watch_history),
         )))
-
+        menu_items.append(pystray.Menu.SEPARATOR)
 
         # --- SIMKL submenu ---
         menu_items.append(pystray.MenuItem("SIMKL", pystray.Menu(
-            pystray.MenuItem("SIMKL Website", self.open_simkl),
-            pystray.MenuItem("SIMKL Watch History", self.open_simkl_history),
+            pystray.MenuItem(
+                lambda item: self._get_auth_menu_label(),
+                self.trigger_auth_flow,
+                enabled=not self._auth_in_progress
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Open Website", self.open_simkl),
+            pystray.MenuItem("Open Watch History", self.open_simkl_history),
         )))
 
-        # --- Support submenu ---
-        menu_items.append(pystray.MenuItem("Support", pystray.Menu(
+        # --- Maintenance submenu ---
+        menu_items.append(pystray.MenuItem("Maintenance", pystray.Menu(
+            pystray.MenuItem("Open Logs", self.open_logs),
+            pystray.MenuItem("Open Data Folder", self.open_config_dir),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Clear Backlog", self.clear_backlog),
+            pystray.MenuItem("Clear Cache", self.clear_cache),
+            pystray.MenuItem("Clear Watch History", self.clear_watch_history),
+            pystray.MenuItem("Clear Logs", self.clear_logs),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Reset App Data (Danger)", self.clear_all_data),
+        )))
+
+        # --- More submenu ---
+        menu_items.append(pystray.MenuItem("More", pystray.Menu(
+            pystray.MenuItem("Donate ❤️", self.open_donation_page),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Check for Updates", lambda: self.check_updates_thread() if hasattr(self, 'check_updates_thread') else None),
             pystray.MenuItem("Help", self.show_help),
             pystray.MenuItem("About", self.show_about),
@@ -964,15 +1265,17 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                         failed_items.append(f"environment file ({env_path.name})")
             
             # Clear watch history (via scrobbler if available)
-            if self.scrobbler and hasattr(self.scrobbler, 'watch_history_manager'):
-                whm = self.scrobbler.watch_history_manager
-                if hasattr(whm, 'clear_history'):
-                    try:
-                        whm.clear_history()
-                        cleared_items.append("watch history")
-                    except Exception as e:
-                        logger.warning(f"Could not clear watch history: {e}")
-                        failed_items.append("watch history")
+            watch_history_manager = self._get_watch_history_manager()
+            if watch_history_manager:
+                try:
+                    if hasattr(watch_history_manager, 'clear'):
+                        watch_history_manager.clear()
+                    elif hasattr(watch_history_manager, 'clear_history'):
+                        watch_history_manager.clear_history()
+                    cleared_items.append("watch history")
+                except Exception as e:
+                    logger.warning(f"Could not clear watch history: {e}")
+                    failed_items.append("watch history")
             
             # Clear settings file
             settings_file = APP_DATA_DIR / "settings.json"
@@ -999,6 +1302,9 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                     if hasattr(self.scrobbler, attr):
                         setattr(self.scrobbler, attr, None)
                 cleared_items.append("in-memory cache")
+
+            # Reset authentication state after credential files are removed
+            self._refresh_auth_state()
             
             # Prepare notification message
             if cleared_items and not failed_items:
@@ -1029,23 +1335,20 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         # Show initial notification that the process is starting
         
         try:
-            # Check if we have a scrobbler and it's currently tracking something
-            if not self.scrobbler:
-                self.show_notification("simkl-mps", "No scrobbler instance available.")
+            media_scrobbler = self._get_media_scrobbler()
+            if not media_scrobbler:
+                self.show_notification("simkl-mps", "Monitoring is not active.")
                 return 0
-            
-            # Get the actual scrobbler instance (might be nested in monitor)
-            actual_scrobbler = self.scrobbler
-            if hasattr(self.scrobbler, 'monitor') and hasattr(self.scrobbler.monitor, 'scrobbler'):
-                actual_scrobbler = self.scrobbler.monitor.scrobbler
-            
+
+            actual_scrobbler: Any = media_scrobbler
+
             # Check if something is currently being tracked
-            if not actual_scrobbler.currently_tracking:
+            if not getattr(actual_scrobbler, "currently_tracking", None):
                 self.show_notification("simkl-mps", "No media is currently being tracked.")
                 return 0
             
             current_title = actual_scrobbler.currently_tracking
-            current_filepath = actual_scrobbler.current_filepath
+            current_filepath = getattr(actual_scrobbler, "current_filepath", None)
             
             logger.info(f"Re-identifying currently playing media: '{current_title}' (filepath: '{current_filepath}')")
             self.show_notification("simkl-mps", f"Attempting to re-identify '{current_title}'...")
@@ -1078,12 +1381,12 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             
             # Store current tracking state
             was_tracking = actual_scrobbler.currently_tracking
-            was_filepath = actual_scrobbler.current_filepath
-            was_start_time = actual_scrobbler.start_time
-            was_watch_time = actual_scrobbler.watch_time
-            was_state = actual_scrobbler.state
-            was_position = actual_scrobbler.current_position_seconds
-            was_duration = actual_scrobbler.total_duration_seconds
+            was_filepath = getattr(actual_scrobbler, "current_filepath", None)
+            was_start_time = getattr(actual_scrobbler, "start_time", None)
+            was_watch_time = getattr(actual_scrobbler, "watch_time", 0)
+            was_state = getattr(actual_scrobbler, "state", None)
+            was_position = getattr(actual_scrobbler, "current_position_seconds", 0)
+            was_duration = getattr(actual_scrobbler, "total_duration_seconds", None)
             
             # Clear identification-related state (but preserve tracking progress)
             actual_scrobbler.simkl_id = None
