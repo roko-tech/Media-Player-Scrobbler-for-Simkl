@@ -149,11 +149,24 @@ class MediaScrobbler:
             else:
                 logger.debug("Backlog processing state and notification throttles were already empty")
 
-    def _send_notification(self, title, message, online_only=False, offline_only=False):
+    def _send_notification(self, title, message, online_only=False, offline_only=False, critical=False):
         """
         Safely sends a notification if the callback is set, respecting online/offline constraints.
+        
+        Args:
+            title: Notification title
+            message: Notification message
+            online_only: Only send when internet is connected
+            offline_only: Only send when offline
+            critical: If True, always send regardless of user's disable_notifications setting
         """
         if self.notification_callback:
+            # Check if notifications are disabled for non-critical notifications
+            from simkl_mps.config_manager import get_setting
+            if not critical and get_setting('disable_notifications', False):
+                logger.debug(f"Notification '{title}' suppressed (disable_notifications setting is True).")
+                return
+            
             connected = is_internet_connected()
             if (online_only and not connected) or \
                (offline_only and connected):
@@ -328,7 +341,8 @@ class MediaScrobbler:
                             self._send_notification(
                                 f"{player_type} Connection Error",
                                 f"Could not connect to {player_type}. {config_instructions}",
-                                online_only=False
+                                online_only=False,
+                                critical=True
                             )
             except Exception as e:
                 logger.error(f"Error getting pos/dur from {process_name} ({getattr(integration, '__class__', type(integration)).__name__}): {e}", exc_info=True)
@@ -365,7 +379,8 @@ class MediaScrobbler:
                         self._send_notification(
                             f"{player_type} Connection Error",
                             f"Could not connect to {player_type} web interface. {config_instructions}",
-                            online_only=False
+                            online_only=False,
+                            critical=True
                         )
             except Exception as e:
                 logger.error(f"Error getting filepath from {process_name} ({integration.__class__.__name__}): {e}", exc_info=True)
@@ -1367,7 +1382,7 @@ class MediaScrobbler:
                     self.simkl_id, display_title, "missing_credentials",
                     {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode}
                 )
-                self._send_notification("Auth Error", f"'{display_title}' needs sync (missing creds). Added to backlog.")
+                self._send_notification("Auth Error", f"'{display_title}' needs sync (missing creds). Added to backlog.", critical=True)
             return False
 
         # --- Identification Check ---

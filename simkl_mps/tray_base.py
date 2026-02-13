@@ -684,7 +684,9 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                     # Only show notification if:
                     # 1. This is the first run of the app after installation
                     # 2. User manually started the app from the menu
-                    if self.is_first_run or is_manual_start:
+                    # 3. Notifications are not disabled
+                    from simkl_mps.config_manager import get_setting
+                    if (self.is_first_run or is_manual_start) and not get_setting('disable_notifications', False):
                         self.show_notification(
                             "simkl-mps",
                             "Media monitoring started"
@@ -1070,6 +1072,38 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
 
     # --- End Watch Threshold Logic --- 
     
+    def toggle_notifications_disabled(self, _=None):
+        """Toggle the disable_notifications setting and show confirmation."""
+        try:
+            current_value = get_setting('disable_notifications', False)
+            new_value = not current_value
+            set_setting('disable_notifications', new_value)
+            
+            status = "disabled" if new_value else "enabled"
+            logger.info(f"Notifications {status} via tray menu")
+            
+            # Show confirmation (always show this one, it's critical)
+            from simkl_mps.media_scrobbler import MediaScrobbler
+            # Access the scrobbler to send critical notification
+            media_scrobbler = self._get_media_scrobbler()
+            if media_scrobbler:
+                media_scrobbler._send_notification(
+                    "Settings Updated",
+                    f"Notifications {status}. Critical alerts will still appear.",
+                    critical=True
+                )
+            else:
+                # Fallback if scrobbler not available
+                self.show_notification("Settings Updated", f"Notifications {status}. Critical alerts will still appear.")
+            
+            self.update_icon()  # Refresh menu to show new checkmark state
+            
+        except Exception as e:
+            logger.error(f"Error toggling notifications: {e}", exc_info=True)
+            self.show_notification("Error", f"Failed to toggle notifications: {e}")
+        
+        return 0
+    
     def check_first_run(self):
         """Check if this is the first time the app is being run"""
         # Platform-specific implementation required
@@ -1110,6 +1144,12 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             pystray.MenuItem("Retry Last Scrobble", self.try_scrobble_again),
             pystray.MenuItem("Sync Backlog Now", self.process_backlog),
             pystray.MenuItem("Completion Threshold", threshold_submenu),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Disable Notifications",
+                self.toggle_notifications_disabled,
+                checked=lambda item: get_setting('disable_notifications', False)
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open Local Watch History", self.open_watch_history),
         )))

@@ -208,6 +208,17 @@ class AppIndicatorTray:
             threshold_item.set_submenu(threshold_submenu)
             scrobbling_submenu.append(threshold_item)
             
+            scrobbling_submenu.append(gtk_module.SeparatorMenuItem())
+            
+            # Disable Notifications toggle
+            notifications_disabled = get_setting('disable_notifications', False)
+            notifications_item = gtk_module.CheckMenuItem(label="Disable Notifications")
+            notifications_item.set_active(notifications_disabled)
+            notifications_item.connect("activate", self._wrap_callback(self.app.toggle_notifications_disabled))
+            scrobbling_submenu.append(notifications_item)
+            
+            scrobbling_submenu.append(gtk_module.SeparatorMenuItem())
+            
             watch_history_item = gtk_module.MenuItem(label="Open Local Watch History")
             watch_history_item.connect("activate", self._wrap_callback(self.app.open_watch_history))
             scrobbling_submenu.append(watch_history_item)
