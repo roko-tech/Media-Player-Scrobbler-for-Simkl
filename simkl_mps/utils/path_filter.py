@@ -80,10 +80,6 @@ def _match_rule(file_path: str, rule: str, case_sensitive: bool) -> bool:
     normalized_file = _normalize_for_match(file_path)
     normalized_rule = _normalize_for_match(rule)
 
-    if not case_sensitive:
-        normalized_file = normalized_file.lower()
-        normalized_rule = normalized_rule.lower()
-
     if _contains_glob(normalized_rule) or not os.path.isabs(normalized_rule):
         # Treat relative patterns as match-anywhere
         if not os.path.isabs(normalized_rule) and not normalized_rule.startswith("**"):
@@ -117,16 +113,17 @@ def is_path_allowed(
     case_sensitive = _is_case_sensitive_filesystem()
     normalized_file = _normalize_path(file_path, case_sensitive)
 
-    allowed = True if not allow_dirs_list else False
+    # A path is allowed if it's not in the deny list, AND
+    # (the allow list is empty OR it's in the allow list).
+    is_denied = any(
+        _match_rule(normalized_file, _normalize_pattern(d, case_sensitive), case_sensitive)
+        for d in deny_dirs_list
+    )
+    if is_denied:
+        return False
 
-    for directory in allow_dirs_list:
-        normalized_dir = _normalize_pattern(directory, case_sensitive)
-        if _match_rule(normalized_file, normalized_dir, case_sensitive):
-            allowed = True
-
-    for directory in deny_dirs_list:
-        normalized_dir = _normalize_pattern(directory, case_sensitive)
-        if _match_rule(normalized_file, normalized_dir, case_sensitive):
-            allowed = False
-
-    return allowed
+    is_allowed = (not allow_dirs_list) or any(
+        _match_rule(normalized_file, _normalize_pattern(d, case_sensitive), case_sensitive)
+        for d in allow_dirs_list
+    )
+    return is_allowed

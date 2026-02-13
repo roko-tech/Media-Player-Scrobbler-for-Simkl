@@ -49,7 +49,7 @@ def _sanitize_dir_list(value):
     if isinstance(value, str):
         return [value]
     if isinstance(value, (list, tuple)):
-        return [item for item in value if isinstance(item, str) and item.strip()]
+        return [str(item) for item in value if isinstance(item, str) and item.strip()]
     return []
 
 def load_settings():

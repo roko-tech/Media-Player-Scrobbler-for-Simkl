@@ -37,7 +37,7 @@ Directory filters live in `settings.json` inside your app data folder. You can a
 
 You can edit these lists from the tray menu: **Maintenance → Directory Filters**.
 
-**Rules (last-match wins):**
+**Rules (Deny rules override allow rules):**
 - If `allow_dirs` is empty, all paths are allowed by default.
 - If `allow_dirs` has entries, only those paths are allowed by default.
 - After allow rules are evaluated, `deny_dirs` rules are applied and can override them.

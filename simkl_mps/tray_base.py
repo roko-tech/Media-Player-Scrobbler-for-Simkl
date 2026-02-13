@@ -284,15 +284,17 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         return parts
 
     def _apply_dir_filter_change(self, key: str, entries: list[str]) -> None:
-        """Persist filter settings and update the running scrobbler if available."""
+        """
+        Persist filter settings and signal the running scrobbler to refresh its configuration.
+        
+        This respects encapsulation by only triggering a refresh of the scrobbler's
+        internal configuration rather than directly modifying its private attributes.
+        The scrobbler will naturally reload from settings on the next filter check.
+        """
         try:
             set_setting(key, entries)
             media_scrobbler = self._get_media_scrobbler()
             if media_scrobbler is not None:
-                if key == "allow_dirs":
-                    media_scrobbler._allow_dirs = entries
-                elif key == "deny_dirs":
-                    media_scrobbler._deny_dirs = entries
                 if hasattr(media_scrobbler, "_dir_filter_last_refresh"):
                     media_scrobbler._dir_filter_last_refresh = 0
             label = "Allow" if key == "allow_dirs" else "Deny"
@@ -303,7 +305,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
 
     def set_allow_dirs(self, _=None):
         current_value = self._format_dir_list_for_dialog(get_setting("allow_dirs", []))
-        help_text = "Enter one path or glob pattern per line (comma/semicolon also supported)."
+        help_text = "Enter paths or glob patterns, separated by commas or semicolons."
         updated_text = self._ask_directory_filter_dialog("Set Allow Directories", current_value, help_text)
         if updated_text is not None:
             entries = self._parse_dir_list_input(updated_text)
@@ -313,7 +315,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
 
     def set_deny_dirs(self, _=None):
         current_value = self._format_dir_list_for_dialog(get_setting("deny_dirs", []))
-        help_text = "Enter one path or glob pattern per line (comma/semicolon also supported)."
+        help_text = "Enter paths or glob patterns, separated by commas or semicolons."
         updated_text = self._ask_directory_filter_dialog("Set Deny Directories", current_value, help_text)
         if updated_text is not None:
             entries = self._parse_dir_list_input(updated_text)
