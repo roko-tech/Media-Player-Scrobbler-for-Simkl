@@ -579,8 +579,11 @@ def main():
     Returns:
         int: Exit code (0 for success, 1 for errors).
     """
-    # Check for common Linux dependency issues before setting up logging
-    if sys.platform == 'linux':
+    parser = create_parser()
+    args = parser.parse_args()
+
+    # Check Linux GUI dependencies only for commands that need tray/GTK runtime.
+    if sys.platform == 'linux' and args.command in {'tray', 'start'}:
         try:
             # Try to import PyGObject - this will fail if system dependencies are missing
             import gi
@@ -598,9 +601,6 @@ def main():
                 print("\nThen reinstall with: pip install --no-binary=:all: \"simkl-mps[linux]\"")
                 print("Or with pipx: pipx install --system-site-packages \"simkl-mps[linux]\"")
                 return 1
-    
-    parser = create_parser()
-    args = parser.parse_args()
 
     # Setup logging AFTER argument parsing so --debug can affect console verbosity.
     _setup_logging(debug=getattr(args, 'debug', False))
