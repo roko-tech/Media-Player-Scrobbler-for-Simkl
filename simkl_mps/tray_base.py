@@ -12,7 +12,7 @@ import logging
 import webbrowser
 import subprocess
 from pathlib import Path
-from typing import Any, Optional, TYPE_CHECKING, cast
+from typing import Any, Optional, TYPE_CHECKING
 from PIL import Image, ImageDraw, ImageFont
 import abc
 import pystray
