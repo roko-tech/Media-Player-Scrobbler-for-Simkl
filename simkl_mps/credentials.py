@@ -28,6 +28,14 @@ CLIENT_SECRET_PLACEHOLDER = "SIMKL_CLIENT_SECRET_PLACEHOLDER"
 SIMKL_CLIENT_ID = CLIENT_ID_PLACEHOLDER
 SIMKL_CLIENT_SECRET = CLIENT_SECRET_PLACEHOLDER
 
+
+def _is_placeholder_credential(value: str, placeholder: str) -> bool:
+    """Return True when a credential is missing or still a build placeholder."""
+    if not value:
+        return True
+    normalized = str(value).strip().strip('"').strip("'")
+    return normalized == placeholder
+
 APP_NAME_FOR_PATH = "simkl-mps"
 USER_SUBDIR_FOR_PATH = "kavin"  # Updated from kavinthangavel
 try:
@@ -70,15 +78,35 @@ def get_credentials():
               or if the build/init process failed.
     """
 
-    client_id = SIMKL_CLIENT_ID
-    client_secret = SIMKL_CLIENT_SECRET
-    
-    if not client_id or not client_secret:
-        logger.debug("Build-injected credentials not found, trying development sources...")
-        
-        client_id = os.environ.get("SIMKL_CLIENT_ID")
-        client_secret = os.environ.get("SIMKL_CLIENT_SECRET")
-        
+    client_id = None
+    client_secret = None
+
+    if not _is_placeholder_credential(SIMKL_CLIENT_ID, CLIENT_ID_PLACEHOLDER):
+        client_id = SIMKL_CLIENT_ID
+    if not _is_placeholder_credential(SIMKL_CLIENT_SECRET, CLIENT_SECRET_PLACEHOLDER):
+        client_secret = SIMKL_CLIENT_SECRET
+
+    if client_id and client_secret:
+        logger.debug("Using build-injected SIMKL client credentials.")
+    else:
+        logger.debug("Build-injected credentials missing/placeholder, trying runtime sources...")
+
+        env_client_id = os.environ.get("SIMKL_CLIENT_ID")
+        env_client_secret = os.environ.get("SIMKL_CLIENT_SECRET")
+        if env_client_id:
+            client_id = env_client_id
+        if env_client_secret:
+            client_secret = env_client_secret
+
+        # Fall back to app env file used by end users (.simkl_mps.env)
+        env_file_path = get_env_file_path()
+        if (not client_id or not client_secret) and env_file_path.exists():
+            logger.debug(f"Loading runtime credentials from {env_file_path}")
+            runtime_config = dotenv_values(env_file_path)
+            client_id = client_id or runtime_config.get("SIMKL_CLIENT_ID")
+            client_secret = client_secret or runtime_config.get("SIMKL_CLIENT_SECRET")
+
+        # Final fallback for local development
         if (not client_id or not client_secret) and DEV_CREDS_PATH.exists():
             logger.debug(f"Loading development credentials from {DEV_CREDS_PATH}")
             dev_config = dotenv_values(DEV_CREDS_PATH)
