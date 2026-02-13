@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 from PIL import Image
 
-from typing import Any, Optional, TYPE_CHECKING, cast
+from typing import Any, Optional, cast
 
 from simkl_mps.tray_base import TrayAppBase, get_simkl_scrobbler, logger
 from simkl_mps.config_manager import get_setting, DEFAULT_THRESHOLD # Import for menu state and dialog
