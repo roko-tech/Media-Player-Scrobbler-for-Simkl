@@ -86,7 +86,6 @@ except (ImportError, ValueError) as e:
     logger.warning(f"AppIndicator not available: {e}, falling back to pystray")
     try:
         import pystray as pystray_module
-        from plyer import notification as plyer_notification_module
         pystray = cast(Any, pystray_module)
         logger.info("Successfully loaded pystray as fallback")
     except ImportError as e2:
