@@ -34,6 +34,8 @@ from simkl_mps.config_manager import get_setting, set_setting, DEFAULT_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_DONATION_URL = "https://github.com/sponsors/itskavin"
+
 def get_simkl_scrobbler():
     """Lazy import for SimklScrobbler to avoid circular imports"""
     from simkl_mps.main import SimklScrobbler
@@ -469,6 +471,12 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
     def open_simkl(self, _=None):
         """Open the SIMKL website"""
         webbrowser.open("https://simkl.com")
+        return 0
+
+    def open_donation_page(self, _=None):
+        """Open the donation/support page."""
+        donation_url = DEFAULT_DONATION_URL
+        webbrowser.open(donation_url)
         return 0
 
     def open_simkl_history(self, _=None):
@@ -1045,22 +1053,14 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             pystray.Menu.SEPARATOR,
         ]
 
-        # Monitoring controls (unchanged)
+        # Tracking controls
         if self.status == "running":
-            menu_items.append(pystray.MenuItem("Pause Monitoring", self.stop_monitoring))
+            menu_items.append(pystray.MenuItem("Pause Tracking", self.stop_monitoring))
         else:
-            menu_items.append(pystray.MenuItem("Start Monitoring", self.start_monitoring))
-        menu_items.append(pystray.Menu.SEPARATOR)
-        menu_items.append(pystray.MenuItem("Watch History", self.open_watch_history))
-
-        menu_items.append(pystray.MenuItem(
-            lambda item: self._get_auth_menu_label(),
-            self.trigger_auth_flow,
-            enabled=not self._auth_in_progress
-        ))
+            menu_items.append(pystray.MenuItem("Start Tracking", self.start_monitoring))
         menu_items.append(pystray.Menu.SEPARATOR)
 
-        # --- Tools submenu ---
+        # --- Scrobbling submenu ---
         threshold_submenu = pystray.Menu(
             pystray.MenuItem('65%', lambda: self._set_preset_threshold(65), checked=lambda item: is_preset(65), radio=True),
             pystray.MenuItem('80% (Default)', lambda: self._set_preset_threshold(80), checked=lambda item: is_preset(80), radio=True),
@@ -1068,34 +1068,44 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('Custom...', self.set_custom_watch_threshold)
         )
-        menu_items.append(pystray.MenuItem("Tools", pystray.Menu(
+        menu_items.append(pystray.MenuItem("Scrobbling", pystray.Menu(
+            pystray.MenuItem("Retry Last Scrobble", self.try_scrobble_again),
+            pystray.MenuItem("Sync Backlog Now", self.process_backlog),
+            pystray.MenuItem("Completion Threshold", threshold_submenu),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Try Scrobble Again", self.try_scrobble_again),
-            pystray.MenuItem("Process Backlog Now", self.process_backlog),
-            pystray.MenuItem("Watch Threshold (%)", threshold_submenu),
+            pystray.MenuItem("Open Local Watch History", self.open_watch_history),
         )))
-
-        menu_items.append(pystray.MenuItem("Developer Controls", pystray.Menu(
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Open Logs", self.open_logs),
-            pystray.MenuItem("Open Config Directory", self.open_config_dir),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Clear Logs", self.clear_logs),
-            pystray.MenuItem("Clear Watch History", self.clear_watch_history),
-            pystray.MenuItem("Clear Backlog", self.clear_backlog),
-            pystray.MenuItem("Clear Cache", self.clear_cache),
-            pystray.MenuItem("Clear All Data and Logs", self.clear_all_data),
-        )))
-
+        menu_items.append(pystray.Menu.SEPARATOR)
 
         # --- SIMKL submenu ---
         menu_items.append(pystray.MenuItem("SIMKL", pystray.Menu(
-            pystray.MenuItem("SIMKL Website", self.open_simkl),
-            pystray.MenuItem("SIMKL Watch History", self.open_simkl_history),
+            pystray.MenuItem(
+                lambda item: self._get_auth_menu_label(),
+                self.trigger_auth_flow,
+                enabled=not self._auth_in_progress
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Open Website", self.open_simkl),
+            pystray.MenuItem("Open Watch History", self.open_simkl_history),
         )))
 
-        # --- Support submenu ---
-        menu_items.append(pystray.MenuItem("Support", pystray.Menu(
+        # --- Maintenance submenu ---
+        menu_items.append(pystray.MenuItem("Maintenance", pystray.Menu(
+            pystray.MenuItem("Open Logs", self.open_logs),
+            pystray.MenuItem("Open Data Folder", self.open_config_dir),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Clear Backlog", self.clear_backlog),
+            pystray.MenuItem("Clear Cache", self.clear_cache),
+            pystray.MenuItem("Clear Watch History", self.clear_watch_history),
+            pystray.MenuItem("Clear Logs", self.clear_logs),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Reset App Data (Danger)", self.clear_all_data),
+        )))
+
+        # --- More submenu ---
+        menu_items.append(pystray.MenuItem("More", pystray.Menu(
+            pystray.MenuItem("Donate ❤️", self.open_donation_page),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Check for Updates", lambda: self.check_updates_thread() if hasattr(self, 'check_updates_thread') else None),
             pystray.MenuItem("Help", self.show_help),
             pystray.MenuItem("About", self.show_about),

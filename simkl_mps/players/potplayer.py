@@ -91,6 +91,7 @@ class PotPlayerIntegration:
         self.name = 'potplayer'
         self.platform = platform.system().lower()
         self.last_hwnd = None
+        self.last_window_title = None
         self.cached_filename = None
         self.cached_filepath = None
         self._connection_logged = False
@@ -114,6 +115,7 @@ class PotPlayerIntegration:
         hwnd = find_potplayer_hwnd()
         if not hwnd:
             self.last_hwnd = None
+            self.last_window_title = None
             self.cached_filename = None
             self.cached_filepath = None
             return None, None
@@ -187,6 +189,11 @@ class PotPlayerIntegration:
             window_title = win32gui.GetWindowText(hwnd)
             if not window_title or window_title == "PotPlayer":
                 return self.cached_filepath or self.cached_filename
+
+            if self.last_window_title == window_title:
+                return self.cached_filepath or self.cached_filename
+
+            self.last_window_title = window_title
             
             clean_title = window_title
             if " - PotPlayer" in clean_title:
