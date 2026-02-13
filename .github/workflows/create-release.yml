@@ -84,9 +84,11 @@ jobs:
         run: |
           INSTALLER_PATH="${{ steps.prep_paths.outputs.installer_path }}"
           echo "Signing $INSTALLER_PATH..."
-          cosign sign-blob --yes "$INSTALLER_PATH" --output-signature "${INSTALLER_PATH}.sig"
+          cosign sign-blob --yes "$INSTALLER_PATH" --output-signature "${INSTALLER_PATH}.sig" --bundle "${INSTALLER_PATH}.sigstore.bundle"
           echo "Signature created at ${INSTALLER_PATH}.sig"
+          echo "Bundle created at ${INSTALLER_PATH}.sigstore.bundle"
           echo "signature_path=${INSTALLER_PATH}.sig" >> $GITHUB_OUTPUT
+          echo "bundle_path=${INSTALLER_PATH}.sigstore.bundle" >> $GITHUB_OUTPUT
 
       - name: Prepare Verification Instructions (docs/verify.md)
         run: |
@@ -95,6 +97,7 @@ jobs:
           # Define variables for clarity
           INSTALLER_FILENAME="${{ steps.prep_paths.outputs.installer_filename }}"
           INSTALLER_SIG_FILENAME="${INSTALLER_FILENAME}.sig"
+          INSTALLER_BUNDLE_FILENAME="${INSTALLER_FILENAME}.sigstore.bundle"
           RELEASE_TAG="v${{ inputs.version }}"
           REPO_URL="https://github.com/${{ github.repository }}"
           RELEASE_URL="$REPO_URL/releases/tag/$RELEASE_TAG"
@@ -123,6 +126,7 @@ jobs:
           From the [GitHub Releases page]($RELEASE_URL), download the following files into the same directory:
           *   The Windows installer: \`$INSTALLER_FILENAME\`
           *   The installer's signature: \`$INSTALLER_SIG_FILENAME\`
+          *   The installer's Sigstore bundle: \`$INSTALLER_BUNDLE_FILENAME\`
 
           ## 3. Verify Signatures with Cosign
 
@@ -131,7 +135,12 @@ jobs:
           Run the following command in your terminal (in the directory where you downloaded the files):
 
           \`\`\`bash
-          # Verify the Windows Installer signature
+          # Verify the Windows Installer signature (preferred, using bundle)
+          cosign verify-blob \\
+            --bundle "$INSTALLER_BUNDLE_FILENAME" \\
+            "$INSTALLER_FILENAME"
+
+          # Alternative verification (signature + certificate identity)
           cosign verify-blob \\
             --certificate-identity "$CERT_IDENTITY" \\
             --certificate-oidc-issuer "$CERT_ISSUER" \\
@@ -189,6 +198,7 @@ jobs:
           INSTALLER_PATH="${{ steps.prep_paths.outputs.installer_path }}"
           INSTALLER_FILENAME="${{ steps.prep_paths.outputs.installer_filename }}"
           INSTALLER_SIG_PATH="${{ steps.sign_installer.outputs.signature_path }}"
+          INSTALLER_BUNDLE_PATH="${{ steps.sign_installer.outputs.bundle_path }}"
           BUILD_INFO_FILENAME="${{ steps.prep_paths.outputs.build_info_filename }}"
           VERIFY_DOC_PATH="docs/verify.md"
           WORKFLOW_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -196,6 +206,7 @@ jobs:
           echo "Release Tag: $TAG_NAME"
           echo "Installer: $INSTALLER_PATH"
           echo "Installer Sig: $INSTALLER_SIG_PATH"
+          echo "Installer Bundle: $INSTALLER_BUNDLE_PATH"
           echo "Build Info Filename: $BUILD_INFO_FILENAME"
           echo "Verification Doc: $VERIFY_DOC_PATH"
 
@@ -255,6 +266,7 @@ jobs:
           echo "Uploading artifacts..."
           gh release upload "$TAG_NAME" "$INSTALLER_PATH" --clobber
           gh release upload "$TAG_NAME" "$INSTALLER_SIG_PATH" --clobber
+          gh release upload "$TAG_NAME" "$INSTALLER_BUNDLE_PATH" --clobber
           gh release upload "$TAG_NAME" "$VERIFY_DOC_PATH" --clobber
           # Note: Not uploading the build_info.json file as requested
 
