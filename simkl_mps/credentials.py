@@ -73,9 +73,9 @@ def get_credentials():
     client_id = None
     client_secret = None
 
-    if SIMKL_CLIENT_ID and SIMKL_CLIENT_ID != CLIENT_ID_PLACEHOLDER:
+    if SIMKL_CLIENT_ID:
         client_id = SIMKL_CLIENT_ID
-    if SIMKL_CLIENT_SECRET and SIMKL_CLIENT_SECRET != CLIENT_SECRET_PLACEHOLDER:
+    if SIMKL_CLIENT_SECRET:
         client_secret = SIMKL_CLIENT_SECRET
 
     if client_id and client_secret:
