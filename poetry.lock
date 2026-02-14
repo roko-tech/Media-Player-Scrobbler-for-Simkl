@@ -4548,4 +4548,4 @@ macos = ["pyobjc"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<4.0"
-content-hash = "434153b5b9a0b3ace147fb1c6d573b2d846c41610ac33be2a315d472665ab045"
+content-hash = "2108f1d6526fb36d426ecd4e2b585fc5ad4d62debbf0525b70a9bf0369d1e7e6"

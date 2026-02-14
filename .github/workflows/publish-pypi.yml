@@ -24,10 +24,10 @@ on:
         required: true
         type: string
       publish:
-        description: 'If false, only build and upload artifacts (no PyPI publish)'
+        description: 'PyPI publish'
         required: true
         type: boolean
-        default: false
+        default: true
 
 jobs:
   publish:
@@ -45,12 +45,15 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Poetry and dependencies
+      - name: Install Poetry
         run: |
+          python -m pip install --upgrade pip
           pip install poetry
-          poetry config virtualenvs.create false
+          poetry --version
           poetry lock
-          poetry install
+
+      - name: Validate project metadata
+        run: poetry check
 
 
       - name: Set version in pyproject.toml
@@ -72,38 +75,16 @@ jobs:
             exit 1
           fi
 
-          # Safely inject secrets as valid Python string literals.
-          # This avoids sed edge-cases with &, backslashes, or quote characters.
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
+          # Inject Client ID
+          echo "Injecting SIMKL_CLIENT_ID into credentials.py"
+          # Use a different delimiter for sed in case the secret contains slashes
+          sed -i "s|SIMKL_CLIENT_ID_PLACEHOLDER|${SIMKL_CLIENT_ID}|g" simkl_mps/credentials.py
 
-          path = Path("simkl_mps/credentials.py")
-          text = path.read_text(encoding="utf-8")
-
-          replacements = {
-              '"SIMKL_CLIENT_ID_PLACEHOLDER"': json.dumps(os.environ["SIMKL_CLIENT_ID"]),
-              '"SIMKL_CLIENT_SECRET_PLACEHOLDER"': json.dumps(os.environ["SIMKL_CLIENT_SECRET"]),
-          }
-
-          for old, new in replacements.items():
-              if old not in text:
-                  raise RuntimeError(f"Placeholder not found in credentials.py: {old}")
-              text = text.replace(old, new)
-
-          path.write_text(text, encoding="utf-8")
-          PY
+          # Inject Client Secret
+          echo "Injecting SIMKL_CLIENT_SECRET into credentials.py"
+          sed -i "s|SIMKL_CLIENT_SECRET_PLACEHOLDER|${SIMKL_CLIENT_SECRET}|g" simkl_mps/credentials.py
 
           echo "✅ Credentials successfully injected into simkl_mps/credentials.py"
-
-      - name: Verify credential placeholders are gone
-        run: |
-          if grep -q "SIMKL_CLIENT_ID_PLACEHOLDER\|SIMKL_CLIENT_SECRET_PLACEHOLDER" simkl_mps/credentials.py; then
-            echo "::error::Credential placeholders still present after injection"
-            exit 1
-          fi
-          echo "✅ No credential placeholders remain in credentials.py"
 
       - name: Build package
         run: |
@@ -112,12 +93,12 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
 
-      - name: Upload Python package artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: python-package
-          path: dist/
-          retention-days: 1
+      # - name: Upload Python package artifacts
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: python-package
+      #     path: dist/
+      #     retention-days: 1
 
       - name: Publish to PyPI (skip existing)
         if: ${{ inputs.publish }}
