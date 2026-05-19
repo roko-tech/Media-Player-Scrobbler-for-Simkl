@@ -394,16 +394,17 @@ class MediaScrobbler:
                 if now - last_log_time > 300:  # Notify at most once per 5 minutes per player
                     logger.warning(f"Persistent connection issue with {process_name} web interface. {str(e)[:100]}")
                     self._last_connection_error_log[process_name] = now
-                    # Send notification about web interface connection error
-                    player_type = self._get_player_type(process_name_lower)
-                    if player_type:
-                        config_instructions = self._get_player_config_instructions(player_type)
-                        self._send_notification(
-                            f"{player_type} Connection Error",
-                            f"Could not connect to {player_type} web interface. {config_instructions}",
-                            online_only=False,
-                            critical=True
-                        )
+                    # Only notify when actively tracking media to avoid repeated background-player spam.
+                    if self.currently_tracking:
+                        player_type = self._get_player_type(process_name_lower)
+                        if player_type:
+                            config_instructions = self._get_player_config_instructions(player_type)
+                            self._send_notification(
+                                f"{player_type} Connection Error",
+                                f"Could not connect to {player_type} web interface. {config_instructions}",
+                                online_only=False,
+                                critical=True
+                            )
             except Exception as e:
                 logger.error(f"Error getting filepath from {process_name} ({integration.__class__.__name__}): {e}", exc_info=True)
         return None
