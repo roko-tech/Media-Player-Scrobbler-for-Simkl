@@ -1155,7 +1155,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
     # --- End Watch Threshold Logic --- 
     
     def toggle_notifications_disabled(self, _=None):
-        """Toggle the disable_notifications setting and show confirmation."""
+        """Toggle notifications on/off from the tray menu."""
         try:
             current_value = get_setting('disable_notifications', False)
             new_value = not current_value
@@ -1163,20 +1163,6 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             
             status = "disabled" if new_value else "enabled"
             logger.info(f"Notifications {status} via tray menu")
-            
-            # Show confirmation (always show this one, it's critical)
-            # Access the scrobbler to send critical notification
-            media_scrobbler = self._get_media_scrobbler()
-            if media_scrobbler:
-                media_scrobbler._send_notification(
-                    "Settings Updated",
-                    f"Notifications {status}. Critical alerts will still appear.",
-                    critical=True
-                )
-            else:
-                # Fallback if scrobbler not available
-                self.show_notification("Settings Updated", f"Notifications {status}. Critical alerts will still appear.")
-            
             self.update_icon()  # Refresh menu to show new checkmark state
             
         except Exception as e:
@@ -1227,7 +1213,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             pystray.MenuItem("Completion Threshold", threshold_submenu),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "Disable Notifications",
+                "Turn Notifications Off/On",
                 self.toggle_notifications_disabled,
                 checked=lambda item: get_setting('disable_notifications', False)
             ),
