@@ -16,6 +16,7 @@ if "simkl_mps" not in sys.modules:
     sys.modules["simkl_mps"] = package
 
 media_scrobbler_module = importlib.import_module("simkl_mps.media_scrobbler")
+config_manager_module = importlib.import_module("simkl_mps.config_manager")
 MediaScrobbler = media_scrobbler_module.MediaScrobbler
 
 
@@ -88,3 +89,7 @@ def test_get_player_position_duration_suppresses_connection_issue_when_tracking(
 
     assert scrobbler.get_player_position_duration("vlc.exe") == (None, None)
     assert notifications == []
+
+
+def test_notifications_are_enabled_by_default():
+    assert config_manager_module.DEFAULT_SETTINGS["disable_notifications"] is False
