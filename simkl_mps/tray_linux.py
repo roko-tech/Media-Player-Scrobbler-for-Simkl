@@ -218,9 +218,9 @@ class AppIndicatorTray:
             
             scrobbling_submenu.append(gtk_module.SeparatorMenuItem())
             
-            # Disable Notifications toggle
+            # Notifications toggle
             notifications_disabled = get_setting('disable_notifications', False)
-            notifications_item = gtk_module.CheckMenuItem(label="Disable Notifications")
+            notifications_item = gtk_module.CheckMenuItem(label="Turn Notifications Off/On")
             notifications_item.set_active(notifications_disabled)
             notifications_item.connect("activate", self._wrap_callback(self.app.toggle_notifications_disabled))
             scrobbling_submenu.append(notifications_item)
@@ -532,6 +532,10 @@ class TrayAppLinux(TrayAppBase):
 
     def show_notification(self, title, message):
         """Show a desktop notification with Linux-specific methods"""
+        if get_setting('disable_notifications', False):
+            logger.debug(f"Linux notification suppressed by user setting: {title}")
+            return
+
         logger.debug(f"Showing Linux notification: {title} - {message}")
         
         try:

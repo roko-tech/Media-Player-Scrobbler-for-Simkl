@@ -411,6 +411,10 @@ Tips:
 
     def show_notification(self, title, message):
         """Show a desktop notification using winotify (persistent) or plyer as fallback on Windows, with cross-platform support."""
+        if get_setting('disable_notifications', False):
+            logger.debug(f"Windows notification suppressed by user setting: {title}")
+            return 0
+
         logger.debug(f"Attempting to show notification: {title} - {message}")
         
         # Try winotify for persistent Action Center notifications

@@ -16,10 +16,14 @@ if "simkl_mps" not in sys.modules:
     sys.modules["simkl_mps"] = package
 
 media_scrobbler_module = importlib.import_module("simkl_mps.media_scrobbler")
+config_manager_module = importlib.import_module("simkl_mps.config_manager")
 MediaScrobbler = media_scrobbler_module.MediaScrobbler
 
 
 class _FailingIntegration:
+    def get_position_duration(self, _process_name):
+        raise requests.RequestException("connection refused")
+
     def get_current_filepath(self, _process_name):
         raise requests.RequestException("connection refused")
 
@@ -59,7 +63,7 @@ def test_suppresses_connection_notification_when_not_tracking(
     assert notifications == []
 
 
-def test_get_current_filepath_notifies_connection_issue_when_tracking(
+def test_get_current_filepath_suppresses_connection_issue_when_tracking(
     tmp_path, monkeypatch
 ):
     scrobbler = _prepare_scrobbler(tmp_path, monkeypatch)
@@ -70,6 +74,22 @@ def test_get_current_filepath_notifies_connection_issue_when_tracking(
     scrobbler.currently_tracking = "Example Movie"
 
     assert scrobbler.get_current_filepath("vlc.exe") is None
-    assert len(notifications) == 1
-    assert notifications[0][0] == "VLC Connection Error"
-    assert "Could not connect to VLC web interface" in notifications[0][1]
+    assert notifications == []
+
+
+def test_get_player_position_duration_suppresses_connection_issue_when_tracking(
+    tmp_path, monkeypatch
+):
+    scrobbler = _prepare_scrobbler(tmp_path, monkeypatch)
+    notifications = []
+    scrobbler.set_notification_callback(
+        lambda title, message: notifications.append((title, message))
+    )
+    scrobbler.currently_tracking = "Example Movie"
+
+    assert scrobbler.get_player_position_duration("vlc.exe") == (None, None)
+    assert notifications == []
+
+
+def test_notifications_are_enabled_by_default():
+    assert config_manager_module.DEFAULT_SETTINGS["disable_notifications"] is False
