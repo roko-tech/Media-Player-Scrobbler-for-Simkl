@@ -69,6 +69,7 @@ Right-click the tray icon to access the app menu with the following sections:
 - **Retry Last Scrobble:** Clears cache for the active file and attempts to re-identify and scrobble it. Use when the wrong title/episode appears.
 - **Sync Backlog Now:** Immediately processes any offline scrobbles waiting in backlog.
 - **Completion Threshold:** Quickly switch between preset watch thresholds (65%, 80%, 90%) or define a custom percentage.
+- **Turn Notifications Off:** Disable all desktop notifications from the app (checkmark means notifications are off).
 - **Open Local Watch History:** Browse your tracked movies, shows, and anime in the local viewer.
 
 **SIMKL** - Account and service management:

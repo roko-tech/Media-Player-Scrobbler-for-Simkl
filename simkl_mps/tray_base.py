@@ -1213,7 +1213,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             pystray.MenuItem("Completion Threshold", threshold_submenu),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "Turn Notifications Off/On",
+                "Turn Notifications Off",
                 self.toggle_notifications_disabled,
                 checked=lambda item: get_setting('disable_notifications', False)
             ),

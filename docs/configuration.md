@@ -50,6 +50,7 @@ Example `settings.json`:
 {
   "watch_completion_threshold": 80,
   "auto_sync_interval": 120,
+  "disable_notifications": false,
   "allow_dirs": [
     "D:\\Media\\Movies",
     "D:\\Media\\Shows"
@@ -59,6 +60,13 @@ Example `settings.json`:
   ]
 }
 ```
+
+### Notifications
+
+Notifications can be toggled from the tray menu or by editing `settings.json`.
+
+- `disable_notifications`: set to `true` to suppress desktop notifications.
+- Player web-interface connection errors are written to `simkl_mps.log` only and do not trigger notifications.
 
 See [Media Players Guide](media-players.md) for player-specific environment variables.
 
