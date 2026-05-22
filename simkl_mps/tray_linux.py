@@ -220,7 +220,7 @@ class AppIndicatorTray:
             
             # Notifications toggle
             notifications_disabled = get_setting('disable_notifications', False)
-            notifications_item = gtk_module.CheckMenuItem(label="Turn Notifications Off/On")
+            notifications_item = gtk_module.CheckMenuItem(label="Turn Notifications Off")
             notifications_item.set_active(notifications_disabled)
             notifications_item.connect("activate", self._wrap_callback(self.app.toggle_notifications_disabled))
             scrobbling_submenu.append(notifications_item)

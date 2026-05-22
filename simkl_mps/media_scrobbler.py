@@ -170,31 +170,39 @@ class MediaScrobbler:
     def _send_notification(self, title, message, online_only=False, offline_only=False, critical=False):
         """
         Safely sends a notification if the callback is set, respecting online/offline constraints.
-        
+
         Args:
             title: Notification title
             message: Notification message
             online_only: Only send when internet is connected
             offline_only: Only send when offline
             critical: If True, always send regardless of user's disable_notifications setting
-        """
-        if self.notification_callback:
-            # Check if notifications are disabled for non-critical notifications
-            if not critical and get_setting('disable_notifications', False):
-                logger.debug(f"Notification '{title}' suppressed (disable_notifications setting is True).")
-                return
-            
-            connected = is_internet_connected()
-            if (online_only and not connected) or \
-               (offline_only and connected):
-                logger.debug(f"Notification '{title}' suppressed (Online: {connected}, Constraint: online_only={online_only}, offline_only={offline_only}).")
-                return
 
-            try:
-                self.notification_callback(title, message)
-                logger.debug(f"Sent notification: '{title}'")
-            except Exception as e:
-                logger.error(f"Failed to send notification '{title}': {e}", exc_info=True)
+        Returns:
+            bool: True if the notification was dispatched to the callback.
+        """
+        if not self.notification_callback:
+            logger.debug(f"Notification '{title}' skipped (no callback set).")
+            return False
+
+        # Check if notifications are disabled for non-critical notifications
+        if not critical and get_setting('disable_notifications', False):
+            logger.debug(f"Notification '{title}' suppressed (disable_notifications setting is True).")
+            return False
+        
+        connected = is_internet_connected()
+        if (online_only and not connected) or \
+           (offline_only and connected):
+            logger.debug(f"Notification '{title}' suppressed (Online: {connected}, Constraint: online_only={online_only}, offline_only={offline_only}).")
+            return False
+
+        try:
+            self.notification_callback(title, message)
+            logger.debug(f"Sent notification: '{title}'")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send notification '{title}': {e}", exc_info=True)
+            return False
 
     def _send_throttled_notification(self, notification_key, title, message, throttle_minutes=30, _throttle_dict=None, **kwargs):
         """
@@ -215,9 +223,12 @@ class MediaScrobbler:
         throttle_seconds = throttle_minutes * 60
         
         if current_time - last_notification_time >= throttle_seconds:
-            self._send_notification(title, message, **kwargs)
-            throttle_dict[notification_key] = current_time
-            logger.debug(f"Sent throttled notification for key '{notification_key}'")
+            sent = self._send_notification(title, message, **kwargs)
+            if sent:
+                throttle_dict[notification_key] = current_time
+                logger.debug(f"Sent throttled notification for key '{notification_key}'")
+            else:
+                logger.debug(f"Throttled notification suppressed; throttle not updated for key '{notification_key}'")
         else:
             logger.debug(f"Notification throttled for key '{notification_key}' (last sent {(current_time - last_notification_time)/60:.1f} minutes ago)")
 
