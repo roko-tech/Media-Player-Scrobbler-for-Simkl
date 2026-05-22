@@ -90,6 +90,7 @@ class MediaScrobbler:
         self.completed = False
         self.current_position_seconds = 0
         self.total_duration_seconds = None
+        self.start_position_seconds = None # Track where the session started to prevent accidental rewatches
         self.current_filepath = None # Store the last known filepath
         self.media_type = None # 'movie', 'episode' (from guessit), 'show', 'anime' (from simkl)
         self.season = None # Season number for episodes
@@ -723,6 +724,12 @@ class MediaScrobbler:
                 logger.info(f"Updating total duration for '{self.movie_name or self.currently_tracking}' from {self.total_duration_seconds}s to {dur}s via player.")
                 self.total_duration_seconds = dur
                 self.estimated_duration = dur
+            
+            # Capture start position for the current session
+            if self.start_position_seconds is None:
+                self.start_position_seconds = pos
+                logger.debug(f"Session start position captured: {pos}s / {dur}s ({self._calculate_percentage(use_position=True)}%)")
+
             # Detect seeks
             if self.state == PLAYING and self.current_position_seconds is not None:
                 expected_pos_increase = elapsed_since_last_update
@@ -777,11 +784,38 @@ class MediaScrobbler:
         if not self.completed and (current_time - self.last_progress_check > 5): # Check every 5s
             completion_pct = self._calculate_percentage(use_position=position_updated_from_player)
             threshold = self.completion_threshold
-            if completion_pct is not None and threshold is not None and float(completion_pct) >= float(threshold):
-                display_title_for_log = self.movie_name or self.currently_tracking
-                logger.info(f"Completion threshold ({self.completion_threshold}%) met for '{display_title_for_log}' at {completion_pct:.2f}%.")
-                self._log_playback_event("completion_threshold_reached")
-                self._attempt_add_to_history() # This handles setting self.completed
+            
+            if completion_pct is not None and threshold is not None:
+                should_scrobble = False
+                
+                # Standard logic: if we are above threshold, we usually scrobble
+                if float(completion_pct) >= float(threshold):
+                    # Safeguard: If we started the session already above the threshold, 
+                    # we need extra proof that the user is actually watching.
+                    start_pct = None
+                    if self.start_position_seconds is not None and self.total_duration_seconds:
+                        start_pct = (self.start_position_seconds / self.total_duration_seconds) * 100
+                    
+                    if start_pct is not None and float(start_pct) >= float(threshold):
+                        # Session started above threshold. 
+                        # Scrobble only if:
+                        # 1. User has progressed by at least 1% in this session
+                        # 2. OR they reached absolute completion (>= 99%)
+                        if float(completion_pct) >= float(start_pct) + 1.0 or float(completion_pct) >= 99.0:
+                            should_scrobble = True
+                            logger.info(f"Session started above threshold ({start_pct:.2f}%), but validation met (progressed to {completion_pct:.2f}%)")
+                        else:
+                            logger.debug(f"Session started above threshold ({start_pct:.2f}%). Validation not yet met (current progress: {completion_pct:.2f}%)")
+                    else:
+                        # Session started below threshold and now crossed it
+                        should_scrobble = True
+                
+                if should_scrobble:
+                    display_title_for_log = self.movie_name or self.currently_tracking
+                    logger.info(f"Completion threshold ({self.completion_threshold}%) met for '{display_title_for_log}' at {completion_pct:.2f}%.")
+                    self._log_playback_event("completion_threshold_reached")
+                    self._attempt_add_to_history() # This handles setting self.completed
+            
             self.last_progress_check = current_time
 
         # Determine if a scrobble update should be returned (e.g., for UI)
@@ -1480,7 +1514,8 @@ class MediaScrobbler:
             log_item_desc += f" S{self.season}E{self.episode}" if self.media_type == 'show' and self.season else f" E{self.episode}"
 
         try:
-            result = add_to_history(payload, self.client_id, self.access_token)
+            # Always attempt rewatch; Simkl server handles account-level permissions (Pro/VIP)
+            result = add_to_history(payload, self.client_id, self.access_token, allow_rewatch=True)
             if result:
                 self.completed = True
                 self._log_playback_event("added_to_history_success", {"simkl_id": self.simkl_id, "type": self.media_type})
