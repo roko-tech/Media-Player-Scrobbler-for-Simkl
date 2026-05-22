@@ -121,6 +121,10 @@ class TrayAppMac(TrayAppBase):
 
     def show_notification(self, title, message):
         """Show a desktop notification on macOS"""
+        if get_setting('disable_notifications', False):
+            logger.debug(f"macOS notification suppressed by user setting: {title}")
+            return
+
         logger.debug(f"Showing macOS notification: {title} - {message}")
         
         try:
