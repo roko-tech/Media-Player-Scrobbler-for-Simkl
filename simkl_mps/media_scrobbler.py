@@ -1374,7 +1374,7 @@ class MediaScrobbler:
         if not simkl_id or not media_type:
             return False
 
-        if not hasattr(self, 'watch_history') or self.watch_history is None:
+        if self.watch_history is None:
             self.watch_history = WatchHistoryManager(self.app_data_dir)
 
         entry = self.watch_history.get_entry(simkl_id, media_type=media_type)
