@@ -287,7 +287,11 @@ def add_to_history(payload, client_id, access_token, allow_rewatch=False):
 
     logger.info(f"Simkl API: Adding {item_description} to history...")
     try:
-        params = {}
+        params = {
+            'client_id': client_id,
+            'app-name': APP_NAME,
+            'app-version': __version__
+        }
         if allow_rewatch:
             params['allow_rewatch'] = 'yes'
             logger.info("Simkl API: Rewatch support enabled for this request.")
