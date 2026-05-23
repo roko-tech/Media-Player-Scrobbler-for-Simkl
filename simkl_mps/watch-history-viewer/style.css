@@ -1580,3 +1580,35 @@ footer a:hover {
     .action-btn { font-size: 0.8rem; padding: 0.5rem 0.8rem; }
     .expanded-actions .action-btn { font-size: 0.8rem; padding: 0.5rem 0.8rem; } /* Ensure mobile action buttons are sized correctly */
 }
+
+/* Rewatch badge - small overlay showing number of times watched */
+.rewatch-badge {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: linear-gradient(135deg, var(--simkl-red) 0%, var(--simkl-red-dark) 100%);
+    color: white;
+    font-size: 0.75rem;
+    padding: 0.18rem 0.45rem;
+    border-radius: 999px;
+    font-weight: 700;
+    z-index: 3;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.25);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+
+body.dark-mode .rewatch-badge {
+    box-shadow: 0 4px 12px rgba(0,0,0,0.45);
+}
+
+/* Season summary badges inside expanded episode list */
+.season-badge {
+    background: var(--gray-100);
+    color: var(--text-primary);
+    padding: 0.2rem 0.5rem;
+    border-radius: 8px;
+    font-weight: 600;
+}
+body.dark-mode .season-badge { background: var(--gray-800); color: var(--text-primary); }

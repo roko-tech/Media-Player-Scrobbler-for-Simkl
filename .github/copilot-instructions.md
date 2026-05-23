@@ -1,5 +1,7 @@
 # Media Player Scrobbler for Simkl (MPS) - Copilot Instructions
 
+See [AGENTS.md](AGENTS.md) for concise agent-focused guidance and available agents.
+
 A cross-platform Python application that automatically tracks media playback from various media players and scrobbles to Simkl.
 
 ## Build, Test, and Lint Commands

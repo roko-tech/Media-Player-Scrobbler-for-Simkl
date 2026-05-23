@@ -51,6 +51,12 @@
                     <!-- Years populated by JS -->
                 </select>
 
+                <select id="filter-rewatch" title="Filter by Rewatch">
+                    <option value="all">All Watches</option>
+                    <option value="original">Original Watches Only</option>
+                    <option value="rewatch">Rewatches Only</option>
+                </select>
+
                 <select id="sort-by" title="Sort By">
                     <option value="watched_at">Recent First</option>
                     <option value="title">Title (A-Z)</option>
@@ -98,6 +104,13 @@
                     <div class="stat-content">
                         <span class="stat-value" id="anime-count">0</span>
                         <span class="stat-label">Anime</span>
+                    </div>
+                </div>
+                <div class="stat-card rewatch-count">
+                    <div class="stat-icon"><i class="ph-duotone ph-arrow-counter-clockwise"></i></div>
+                    <div class="stat-content">
+                        <span class="stat-value" id="rewatches-count">0</span>
+                        <span class="stat-label">Rewatches</span>
                     </div>
                 </div>
             </div>
@@ -167,6 +180,7 @@
                         <span data-field="release_year"><i class="ph-duotone ph-calendar"></i> <span>-</span></span>
                         <span data-field="runtime"><i class="ph-duotone ph-clock"></i> <span>-</span></span>
                         <span data-field="last_watched_at"><i class="ph-duotone ph-calendar-check"></i> <span>-</span></span> <!-- Changed from user_rating -->
+                        <span data-field="rewatch_count"><i class="ph-duotone ph-arrow-counter-clockwise"></i> <span>-</span></span>
                     </div>
                 </div>
             </div>

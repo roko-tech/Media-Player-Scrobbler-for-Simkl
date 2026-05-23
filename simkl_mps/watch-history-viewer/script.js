@@ -26,6 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // State
     let historyData = [];
+    let historyCountsMap = new Map(); // key -> count
     let activeMediaCard = null;
     let currentView = localStorage.getItem('simkl_history_view') || 'grid';
     let currentTheme = localStorage.getItem('simkl_history_theme') || 'dark'; // Default to dark
@@ -120,6 +121,15 @@ document.addEventListener('DOMContentLoaded', () => {
         updateStatistics();
     }
 
+    // Build a map of history counts keyed by simkl_id or title-year
+    function buildHistoryCountsMap() {
+        historyCountsMap = new Map();
+        historyData.forEach(h => {
+            const key = h.simkl_id ? String(h.simkl_id) : `${h.title || ''}::${h.year || ''}`;
+            historyCountsMap.set(key, (historyCountsMap.get(key) || 0) + 1);
+        });
+    }
+
     // Update statistics panel and chart
     function updateStatistics() {
         // Calculate basic statistics
@@ -132,6 +142,17 @@ document.addEventListener('DOMContentLoaded', () => {
         moviesCountEl.textContent = movieCount;
         showsCountEl.textContent = uniqueShowIds.size;
         animeCountEl.textContent = uniqueAnimeIds.size;
+
+        // Build counts map for rewatch calculations
+        buildHistoryCountsMap();
+
+        // Calculate rewatch metrics
+        const rewatchItems = Array.from(historyCountsMap.values()).filter(c => c > 1).length;
+        const rewatchEvents = Array.from(historyCountsMap.values()).reduce((sum, c) => sum + Math.max(0, c - 1), 0);
+
+        // Update rewatch stat display if present
+        const rewatchEl = document.getElementById('rewatches-count');
+        if (rewatchEl) rewatchEl.textContent = rewatchEvents;
 
         // Create statistics visualizations
         createWatchTrendChart();
@@ -706,6 +727,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function filterHistory() {
         const searchTerm = searchInput.value.toLowerCase().trim();
         const typeFilter = filterType.value;
+        const rewatchFilter = document.getElementById('filter-rewatch') ? document.getElementById('filter-rewatch').value : 'all';
         const yearFilter = filterYear.value;
         const sortOption = sortBy.value;
 
@@ -714,6 +736,13 @@ document.addEventListener('DOMContentLoaded', () => {
             if (typeFilter !== 'all' && item.type !== typeFilter) return false;
             // Year filter
             if (yearFilter !== 'all' && item.year !== parseInt(yearFilter)) return false;
+            // Rewatch filter
+            if (rewatchFilter !== 'all') {
+                const key = item.simkl_id ? String(item.simkl_id) : `${item.title || ''}::${item.year || ''}`;
+                const count = historyCountsMap.get(key) || 0;
+                if (rewatchFilter === 'original' && count > 1) return false;
+                if (rewatchFilter === 'rewatch' && count < 2) return false;
+            }
             // Search filter (title, year, overview)
             if (searchTerm) {
                 const titleMatch = item.title && item.title.toLowerCase().includes(searchTerm);
@@ -821,10 +850,23 @@ document.addEventListener('DOMContentLoaded', () => {
             case 'anime': mediaIcon = 'ph-duotone ph-star'; break;
             default: mediaIcon = 'ph-duotone ph-film-strip';
         }
+        // Calculate rewatch count (how many times this same item appears in history)
+        let rewatchCount = 0;
+        try {
+            rewatchCount = historyData.filter(h => {
+                if (item.simkl_id && h.simkl_id) return String(h.simkl_id) === String(item.simkl_id);
+                return h.title === item.title && h.year === item.year;
+            }).length;
+        } catch (e) {
+            rewatchCount = 0;
+        }
+
+        const rewatchBadgeHtml = rewatchCount > 1 ? `<span class="rewatch-badge" title="Watched ${rewatchCount} times">↻${rewatchCount}</span>` : '';
 
         card.innerHTML = `
             <div class="poster-container">
                 <img class="poster-img" src="${proxiedPosterUrl}" alt="${item.title || 'Poster'}" loading="lazy">
+                ${rewatchBadgeHtml}
                 <span class="media-type"><i class="${mediaIcon}"></i> ${mediaType}</span>
             </div>
             <div class="media-info">
@@ -1111,6 +1153,19 @@ document.addEventListener('DOMContentLoaded', () => {
         if (metaYear) metaYear.textContent = itemData.year || '-';
         if (metaRuntime) metaRuntime.textContent = itemData.runtime ? `${itemData.runtime} min` : '-';
         if (metaLastWatched) metaLastWatched.textContent = formatDate(itemData.watched_at);
+        // Populate rewatch count in expanded header
+        try {
+            const metaRewatchSpan = expandedHeader.querySelector('[data-field="rewatch_count"] span');
+            if (metaRewatchSpan) {
+                const expandedRewatchCount = historyData.filter(h => {
+                    if (itemData.simkl_id && h.simkl_id) return String(h.simkl_id) === String(itemData.simkl_id);
+                    return h.title === itemData.title && h.year === itemData.year;
+                }).length;
+                metaRewatchSpan.textContent = expandedRewatchCount > 1 ? `${expandedRewatchCount}×` : '-';
+            }
+        } catch (e) {
+            // ignore
+        }
 
         // Populate Content Details
         populateExpandedContentDetails(expandedContentWrapper, itemData);
@@ -1496,9 +1551,63 @@ document.addEventListener('DOMContentLoaded', () => {
                     const dateA = a.watched_at ? new Date(a.watched_at) : new Date(0);
                     const dateB = b.watched_at ? new Date(b.watched_at) : new Date(0);
                     
-                    // Sort by date descending (newest first)
-                    return dateB - dateA;
+                            // Sort by date descending (newest first)
+                            return dateB - dateA;
                 });
+
+                        // Compute unique episodes watched across seasons and episodes
+                        const uniqueEpisodeSet = new Set();
+                        // From item.episodes (source episodes array)
+                        if (Array.isArray(item.episodes) && item.episodes.length > 0) {
+                            item.episodes.forEach(ep => {
+                                const s = ep.season || 0;
+                                const n = ep.number || ep.episode || 0;
+                                if (n > 0) uniqueEpisodeSet.add(`${s}:${n}`);
+                            });
+                        }
+                        // From episodesHistory (history entries)
+                        episodesHistory.forEach(h => {
+                            const s = h.season || 0;
+                            const n = h.episode || 0;
+                            if (n > 0) uniqueEpisodeSet.add(`${s}:${n}`);
+                        });
+
+                        const totalWatchedUnique = uniqueEpisodeSet.size;
+                        updateField(tvDetailsSection, 'episodes_watched_count', totalWatchedUnique);
+
+                        // Optionally compute per-season counts and display as small badges at top of episode list
+                        const perSeasonCounts = {};
+                        uniqueEpisodeSet.forEach(key => {
+                            const [s, n] = key.split(':').map(x => parseInt(x, 10));
+                            if (!perSeasonCounts[s]) perSeasonCounts[s] = new Set();
+                            perSeasonCounts[s].add(n);
+                        });
+
+                        // Insert per-season summary at top of episodeList (if any seasons >0)
+                        const seasonSummaryContainer = document.createElement('div');
+                        seasonSummaryContainer.className = 'season-summary';
+                        seasonSummaryContainer.style.display = 'flex';
+                        seasonSummaryContainer.style.gap = '0.6rem';
+                        seasonSummaryContainer.style.flexWrap = 'wrap';
+                        Object.keys(perSeasonCounts).sort((a,b)=>a-b).forEach(seasonKey => {
+                            const count = perSeasonCounts[seasonKey].size;
+                            if (seasonKey === '0') return; // Skip unknown season
+                            const badge = document.createElement('div');
+                            badge.className = 'season-badge';
+                            badge.textContent = `S${String(seasonKey).padStart(2,'0')}: ${count}`;
+                            badge.style.padding = '0.25rem 0.5rem';
+                            badge.style.background = 'var(--gray-100)';
+                            badge.style.borderRadius = '8px';
+                            badge.style.fontSize = '0.8rem';
+                            seasonSummaryContainer.appendChild(badge);
+                        });
+
+                        if (episodeListContainer) {
+                            // Prepend season summary if it has children
+                            if (seasonSummaryContainer.children.length > 0) {
+                                episodeListContainer.insertAdjacentElement('afterbegin', seasonSummaryContainer);
+                            }
+                        }
 
                 episodesToDisplay.forEach(ep => {
                     const epElement = document.createElement('div');
