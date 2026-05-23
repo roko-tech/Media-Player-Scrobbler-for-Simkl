@@ -1233,6 +1233,44 @@ body.dark-mode .external-link-btn:hover {
     font-size: 0.9rem;
 }
 
+.season-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding: 0.1rem 0.1rem 0.65rem;
+    margin-bottom: 0.45rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.episode-season-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.55rem 0.75rem;
+    margin: 0.45rem 0 0.2rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius-sm);
+    background-color: var(--gray-100);
+}
+
+body.dark-mode .episode-season-header {
+    background-color: var(--gray-800);
+}
+
+.episode-season-title {
+    font-size: 0.9rem;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.episode-season-count {
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
 .episode-item {
     display: flex;
     flex-wrap: wrap;
@@ -1607,8 +1645,9 @@ body.dark-mode .rewatch-badge {
 .season-badge {
     background: var(--gray-100);
     color: var(--text-primary);
-    padding: 0.2rem 0.5rem;
+    padding: 0.25rem 0.55rem;
     border-radius: 8px;
+    font-size: 0.8rem;
     font-weight: 600;
 }
 body.dark-mode .season-badge { background: var(--gray-800); color: var(--text-primary); }

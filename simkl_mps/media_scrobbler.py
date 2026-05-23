@@ -1390,11 +1390,13 @@ class MediaScrobbler:
 
             entry_season = entry.get('season')
             entry_episode = entry.get('episode')
-            if entry_episode == episode and (season is None or entry_season in (None, season)):
+            if entry_episode == episode and (season is None or entry_season == season):
                 return True
 
             for watched_episode in entry.get('episodes', []):
-                if watched_episode.get('number') == episode:
+                if watched_episode.get('number') == episode and (
+                    season is None or watched_episode.get('season') == season
+                ):
                     return True
 
         return False

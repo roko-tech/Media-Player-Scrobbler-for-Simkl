@@ -281,8 +281,85 @@ class WatchHistoryManager:
         except Exception as e:
             logger.error(f"Error updating history data: {e}", exc_info=True)
     
+    @staticmethod
+    def _positive_int(value):
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        return count if count > 0 else None
+
+    def _build_watch_event(self, media_item, watched_at, media_file_path=None, watched_progress=100):
+        event = {"watched_at": watched_at}
+        if media_item.get("season") is not None:
+            event["season"] = media_item.get("season")
+        if media_item.get("episode") is not None:
+            event["episode"] = media_item.get("episode")
+        if watched_progress is not None:
+            event["progress"] = watched_progress
+        if media_file_path:
+            event["file_path"] = str(media_file_path)
+        return event
+
+    def _build_legacy_watch_event(self, history_entry):
+        event = {"watched_at": history_entry.get("watched_at") or datetime.now().isoformat()}
+        if history_entry.get("season") is not None:
+            event["season"] = history_entry.get("season")
+        if history_entry.get("episode") is not None:
+            event["episode"] = history_entry.get("episode")
+        file_path = history_entry.get("file_path") or history_entry.get("filepath_at_watch")
+        if file_path:
+            event["file_path"] = file_path
+        return event
+
+    def _ensure_watch_events(self, history_entry):
+        events = history_entry.get("watch_events")
+        if not isinstance(events, list):
+            events = []
+        if not events:
+            events.append(self._build_legacy_watch_event(history_entry))
+
+        history_entry["watch_events"] = events
+        existing_count = self._positive_int(history_entry.get("watch_count"))
+        history_entry["watch_count"] = max(existing_count or 0, len(events))
+        if "rewatch_count" not in history_entry:
+            history_entry["rewatch_count"] = 0
+        return events
+
+    def _append_watch_event(self, history_entry, media_item, watched_at, media_file_path=None,
+                            watched_progress=100, is_rewatch=False):
+        events = self._ensure_watch_events(history_entry)
+        previous_count = self._positive_int(history_entry.get("watch_count")) or len(events)
+        events.append(self._build_watch_event(media_item, watched_at, media_file_path, watched_progress))
+        history_entry["watch_count"] = max(previous_count + 1, len(events))
+
+        existing_rewatch_count = self._positive_int(history_entry.get("rewatch_count")) or 0
+        history_entry["rewatch_count"] = existing_rewatch_count + 1 if is_rewatch else existing_rewatch_count
+
+    def _append_episode_watch_event(self, episode_entry, media_item, watched_at, media_file_path=None,
+                                    watched_progress=100):
+        events = episode_entry.get("watch_events")
+        if not isinstance(events, list):
+            events = []
+        if not events:
+            legacy_event = {
+                "watched_at": episode_entry.get("watched_at") or watched_at,
+                "season": episode_entry.get("season"),
+                "episode": episode_entry.get("number")
+            }
+            if episode_entry.get("file_path"):
+                legacy_event["file_path"] = episode_entry.get("file_path")
+            events.append(legacy_event)
+
+        previous_count = self._positive_int(episode_entry.get("watch_count")) or len(events)
+        events.append(self._build_watch_event(media_item, watched_at, media_file_path, watched_progress))
+        episode_entry["watch_events"] = events
+        episode_entry["watch_count"] = max(previous_count + 1, len(events))
+        episode_entry["rewatch_count"] = (self._positive_int(episode_entry.get("rewatch_count")) or 0) + 1
+
     def add_entry(self, media_item, media_file_path=None, watched_progress=100):
         """Add a new entry to watch history, or update existing show entries with new episodes"""
+        watched_at = datetime.now().isoformat()
         
         # Check if we already have this item in the history
         existing_entry = None
@@ -298,7 +375,11 @@ class WatchHistoryManager:
 
         # --- Handle TV Shows/Anime ---
         if existing_entry and media_item.get("type") in ["tv", "show", "anime"] and "episode" in media_item:
+            previous_entry_season = existing_entry.get("season")
+            previous_entry_episode = existing_entry.get("episode")
+            season_number = media_item.get("season")
             episode_number = media_item.get("episode")
+            self._ensure_watch_events(existing_entry)
 
             # Always ensure season and episode are set at the top level with the latest watched
             if "season" in media_item:
@@ -326,12 +407,21 @@ class WatchHistoryManager:
             if "episodes" not in existing_entry:
                 existing_entry["episodes"] = []
 
+            # Older history entries did not store season per episode. Preserve the
+            # latest known S/E before merging another same-number episode.
+            if previous_entry_season is not None and previous_entry_episode is not None:
+                for ep in existing_entry.get("episodes", []):
+                    if ep.get("season") is None and ep.get("number") == previous_entry_episode:
+                        ep["season"] = previous_entry_season
+
             # Check if this specific episode already exists
             episode_exists = False
             for ep in existing_entry.get("episodes", []):
-                if ep.get("number") == episode_number:
+                if ep.get("number") == episode_number and ep.get("season") == season_number:
                     # Update existing episode's watched_at and file info
-                    ep["watched_at"] = datetime.now().isoformat()
+                    self._append_episode_watch_event(ep, media_item, watched_at, media_file_path, watched_progress)
+                    ep["season"] = season_number
+                    ep["watched_at"] = watched_at
                     if media_file_path:
                         ep["file_path"] = str(media_file_path)
                         ep.update(self._get_file_metadata(media_file_path))
@@ -341,9 +431,15 @@ class WatchHistoryManager:
             # Add new episode if it doesn't exist
             if not episode_exists:
                 episode_data = {
+                    "season": season_number,
                     "number": episode_number,
                     "title": media_item.get("episode_title", f"Episode {episode_number}"),
-                    "watched_at": datetime.now().isoformat()
+                    "watched_at": watched_at,
+                    "watch_count": 1,
+                    "rewatch_count": 0,
+                    "watch_events": [
+                        self._build_watch_event(media_item, watched_at, media_file_path, watched_progress)
+                    ]
                 }
                 if media_file_path:
                     episode_data["file_path"] = str(media_file_path)
@@ -352,7 +448,15 @@ class WatchHistoryManager:
                 logger.info(f"Added episode {episode_number} to existing show '{existing_entry['title']}' (ID: {existing_entry['simkl_id']})")
 
             # Update overall show watched_at and episode count
-            existing_entry["watched_at"] = datetime.now().isoformat()
+            self._append_watch_event(
+                existing_entry,
+                media_item,
+                watched_at,
+                media_file_path,
+                watched_progress,
+                is_rewatch=episode_exists
+            )
+            existing_entry["watched_at"] = watched_at
             existing_entry["episodes_watched"] = len(existing_entry.get("episodes", [])) # Recalculate count
 
             # Move the updated show entry to the top of the list (most recently watched)
@@ -363,7 +467,15 @@ class WatchHistoryManager:
         # --- Handle Movies ---
         elif existing_entry and media_item.get("type") == "movie":
             # Update watched_at timestamp and file info for the existing movie
-            existing_entry["watched_at"] = datetime.now().isoformat()
+            self._append_watch_event(
+                existing_entry,
+                media_item,
+                watched_at,
+                media_file_path,
+                watched_progress,
+                is_rewatch=True
+            )
+            existing_entry["watched_at"] = watched_at
             
             # Update metadata from new media_item
             if "poster_url" in media_item and media_item.get("poster_url"): # Use poster_url
@@ -398,7 +510,12 @@ class WatchHistoryManager:
                 "simkl_id": media_item.get("simkl_id"),
                 "title": media_item.get("title", "Unknown Title"),
                 "type": media_item.get("type", "movie"),
-                "watched_at": datetime.now().isoformat(),
+                "watched_at": watched_at,
+                "watch_count": 1,
+                "rewatch_count": 0,
+                "watch_events": [
+                    self._build_watch_event(media_item, watched_at, media_file_path, watched_progress)
+                ],
                 "poster_url": media_item.get("poster_url", ""), # Use poster_url
                 "year": media_item.get("year"),
                 "runtime": media_item.get("runtime"),
@@ -429,9 +546,15 @@ class WatchHistoryManager:
 
                 # Initialize episodes list with the first episode
                 history_entry["episodes"] = [{
+                    "season": media_item.get("season"),
                     "number": media_item.get("episode"),
                     "title": media_item.get("episode_title", f"Episode {media_item.get('episode')}"),
-                    "watched_at": datetime.now().isoformat()
+                    "watched_at": watched_at,
+                    "watch_count": 1,
+                    "rewatch_count": 0,
+                    "watch_events": [
+                        self._build_watch_event(media_item, watched_at, media_file_path, watched_progress)
+                    ]
                 }]
                 
                 # Add file information to episode if available
