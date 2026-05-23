@@ -244,7 +244,7 @@ def search_file(file_path, client_id, part=None):
         logger.error(f"Simkl API: Network error during file search for '{file_path}': {e}", exc_info=True)
         return None
 
-def add_to_history(payload, client_id, access_token):
+def add_to_history(payload, client_id, access_token, allow_rewatch=False):
     """
     Adds items (movies, shows, episodes) to the user's Simkl watch history.
 
@@ -253,6 +253,7 @@ def add_to_history(payload, client_id, access_token):
                         Example: {'movies': [...], 'shows': [...]}
         client_id (str): Simkl API client ID.
         access_token (str): Simkl API access token.
+        allow_rewatch (bool): If True, allows recording rewatches (Simkl Pro/VIP feature).
 
     Returns:
         dict | None: The parsed JSON response from Simkl on success, None otherwise.
@@ -286,7 +287,16 @@ def add_to_history(payload, client_id, access_token):
 
     logger.info(f"Simkl API: Adding {item_description} to history...")
     try:
-        response = requests.post(f'{SIMKL_API_BASE_URL}/sync/history', headers=headers, json=payload)
+        params = {
+            'client_id': client_id,
+            'app-name': APP_NAME,
+            'app-version': __version__
+        }
+        if allow_rewatch:
+            params['allow_rewatch'] = 'yes'
+            logger.info("Simkl API: Rewatch support enabled for this request.")
+
+        response = requests.post(f'{SIMKL_API_BASE_URL}/sync/history', headers=headers, json=payload, params=params)
 
         if 200 <= response.status_code < 300:
             logger.info(f"Simkl API: Successfully added {item_description} to history.")

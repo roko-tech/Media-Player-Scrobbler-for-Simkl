@@ -1170,6 +1170,23 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             self.show_notification("Error", f"Failed to toggle notifications: {e}")
         
         return 0
+
+    def toggle_rewatch_enabled(self, _=None):
+        """Toggle rewatch scrobbling on/off from the tray menu."""
+        try:
+            current_value = get_setting('allow_rewatch', True)
+            new_value = not current_value
+            set_setting('allow_rewatch', new_value)
+
+            status = "enabled" if new_value else "disabled"
+            logger.info(f"Rewatch scrobbling {status} via tray menu")
+            self.update_icon()  # Refresh menu to show new checkmark state
+            self.show_notification("Settings Updated", f"Rewatch scrobbling {status}.")
+        except Exception as e:
+            logger.error(f"Error toggling rewatch scrobbling: {e}", exc_info=True)
+            self.show_notification("Error", f"Failed to toggle rewatch scrobbling: {e}")
+
+        return 0
     
     def check_first_run(self):
         """Check if this is the first time the app is being run"""
@@ -1212,6 +1229,11 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             pystray.MenuItem("Sync Backlog Now", self.process_backlog),
             pystray.MenuItem("Completion Threshold", threshold_submenu),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Record Rewatches",
+                self.toggle_rewatch_enabled,
+                checked=lambda item: get_setting('allow_rewatch', True)
+            ),
             pystray.MenuItem(
                 "Turn Notifications Off",
                 self.toggle_notifications_disabled,

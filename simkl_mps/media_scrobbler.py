@@ -1369,6 +1369,64 @@ class MediaScrobbler:
             logger.debug(f"No 'identification_pending' backlog entry found for '{original_title_lower}'.")
 
 
+    def _is_local_rewatch(self, simkl_id, media_type, season, episode):
+        """Best-effort check if this item already exists in local watch history."""
+        if not simkl_id or not media_type:
+            return False
+
+        if self.watch_history is None:
+            self.watch_history = WatchHistoryManager(self.app_data_dir)
+
+        entry = self.watch_history.get_entry(simkl_id, media_type=media_type)
+        if not entry:
+            return False
+
+        if media_type == 'movie':
+            return True
+
+        if media_type in ['show', 'anime']:
+            if episode is None:
+                return False
+
+            entry_season = entry.get('season')
+            entry_episode = entry.get('episode')
+            if entry_episode == episode and (season is None or entry_season == season):
+                return True
+
+            for watched_episode in entry.get('episodes', []):
+                if watched_episode.get('number') == episode and (
+                    season is None or watched_episode.get('season') == season
+                ):
+                    return True
+
+        return False
+
+    @staticmethod
+    def _get_sync_counts(sync_result):
+        """Extract added/not_found counts from a /sync/history response payload."""
+        if not isinstance(sync_result, dict):
+            return None, None
+
+        added = sync_result.get("added") or {}
+        not_found = sync_result.get("not_found") or {}
+
+        added_count = 0
+        not_found_count = 0
+
+        for key in ("movies", "shows", "episodes"):
+            value = added.get(key)
+            if isinstance(value, int):
+                added_count += value
+            elif isinstance(value, list):
+                added_count += len(value)
+
+            value = not_found.get(key)
+            if isinstance(value, list):
+                not_found_count += len(value)
+
+        return added_count, not_found_count
+
+
     def _attempt_add_to_history(self):
         """
         Attempts to add the currently tracked media to Simkl history or backlog.
@@ -1447,9 +1505,10 @@ class MediaScrobbler:
         # --- Internet Connection Check (Now that we have a Simkl ID) ---
         if not is_internet_connected():
             logger.warning(f"Offline: Adding '{display_title}' (ID: {self.simkl_id}) to backlog.")
+            allow_rewatch = get_setting('allow_rewatch', True)
             self._add_to_backlog_due_to_issue(
                 self.simkl_id, display_title, "offline_with_id",
-                {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode}
+                {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode, "allow_rewatch": allow_rewatch}
             )
             self._send_notification("Offline: Added to Backlog", f"'{display_title}' will sync when online.", offline_only=True)
             return False
@@ -1480,7 +1539,12 @@ class MediaScrobbler:
             log_item_desc += f" S{self.season}E{self.episode}" if self.media_type == 'show' and self.season else f" E{self.episode}"
 
         try:
-            result = add_to_history(payload, self.client_id, self.access_token)
+            allow_rewatch = get_setting('allow_rewatch', True)
+            is_rewatch = False
+            if allow_rewatch:
+                is_rewatch = self._is_local_rewatch(self.simkl_id, self.media_type, self.season, self.episode)
+
+            result = add_to_history(payload, self.client_id, self.access_token, allow_rewatch=allow_rewatch)
             if result:
                 self.completed = True
                 self._log_playback_event("added_to_history_success", {"simkl_id": self.simkl_id, "type": self.media_type})
@@ -1490,7 +1554,21 @@ class MediaScrobbler:
                     original_filepath=self.current_filepath
                 )
                 media_label = (self.media_type or 'media').capitalize()
-                self._send_notification(f"{media_label} Synced", f"'{display_title}' added to Simkl.", online_only=True)
+                added_count, not_found_count = self._get_sync_counts(result)
+                if added_count == 0 and not_found_count == 0:
+                    self._send_notification(
+                        f"{media_label} Already Watched",
+                        f"'{display_title}' was already marked watched.",
+                        online_only=True
+                    )
+                elif added_count and is_rewatch:
+                    self._send_notification(
+                        f"{media_label} Rewatch Recorded",
+                        f"'{display_title}' rewatch added to Simkl.",
+                        online_only=True
+                    )
+                else:
+                    self._send_notification(f"{media_label} Synced", f"'{display_title}' added to Simkl.", online_only=True)
                 if cache_key_for_cooldown in self.last_backlog_attempt_time:
                     del self.last_backlog_attempt_time[cache_key_for_cooldown]
                 return True
@@ -1956,7 +2034,12 @@ class MediaScrobbler:
                 sync_api_error = None
                 try:
                     logger.info(f"[Backlog] Syncing '{title_to_sync}' (ID: {simkl_id_to_sync}, Type: {media_type_to_sync}) to Simkl.")
-                    sync_result = add_to_history(payload, self.client_id, self.access_token)                    
+                    
+                    # Use the allow_rewatch intent stored in the backlog item, 
+                    # falling back to current settings if not present.
+                    allow_rewatch_intent = item_data.get('allow_rewatch', get_setting('allow_rewatch', True))
+                    
+                    sync_result = add_to_history(payload, self.client_id, self.access_token, allow_rewatch=allow_rewatch_intent)                    
                     if sync_result:                        
                         success_count += 1
                         logger.info(f"[Backlog] Successfully synced '{title_to_sync}'. Removing from backlog.")

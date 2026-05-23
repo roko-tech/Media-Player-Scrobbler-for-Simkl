@@ -26,6 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // State
     let historyData = [];
+    let historyCountsMap = new Map(); // key -> { watchCount, rewatchCount }
     let activeMediaCard = null;
     let currentView = localStorage.getItem('simkl_history_view') || 'grid';
     let currentTheme = localStorage.getItem('simkl_history_theme') || 'dark'; // Default to dark
@@ -120,6 +121,105 @@ document.addEventListener('DOMContentLoaded', () => {
         updateStatistics();
     }
 
+    function getHistoryKey(item) {
+        return item.simkl_id ? String(item.simkl_id) : `${item.title || ''}::${item.year || ''}`;
+    }
+
+    function toPositiveInteger(value) {
+        const parsed = Number(value);
+        return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+    }
+
+    function toNonNegativeInteger(value) {
+        const parsed = Number(value);
+        return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+    }
+
+    function hasExplicitRewatchCount(item) {
+        if (toNonNegativeInteger(item.rewatch_count) !== null) return true;
+        if (!Array.isArray(item.episodes)) return false;
+        return item.episodes.some(ep => toNonNegativeInteger(ep.rewatch_count) !== null);
+    }
+
+    function getItemWatchCount(item) {
+        const storedCount = toPositiveInteger(item.watch_count);
+        if (storedCount !== null) return storedCount;
+
+        if (Array.isArray(item.watch_events) && item.watch_events.length > 0) {
+            return item.watch_events.length;
+        }
+
+        return 1;
+    }
+
+    function getItemRewatchCount(item) {
+        const storedCount = toNonNegativeInteger(item.rewatch_count);
+        if (storedCount !== null) return storedCount;
+
+        if (Array.isArray(item.episodes)) {
+            let episodeRewatches = 0;
+            let hasEpisodeCounts = false;
+            item.episodes.forEach(ep => {
+                const epRewatchCount = toNonNegativeInteger(ep.rewatch_count);
+                if (epRewatchCount !== null) {
+                    episodeRewatches += epRewatchCount;
+                    hasEpisodeCounts = true;
+                    return;
+                }
+
+                const epWatchCount = toPositiveInteger(ep.watch_count);
+                if (epWatchCount !== null) {
+                    episodeRewatches += Math.max(0, epWatchCount - 1);
+                    hasEpisodeCounts = true;
+                }
+            });
+
+            if (hasEpisodeCounts) return episodeRewatches;
+        }
+
+        return Math.max(0, getItemWatchCount(item) - 1);
+    }
+
+    function getItemWatchEvents(item) {
+        if (Array.isArray(item.watch_events) && item.watch_events.length > 0) {
+            return item.watch_events.filter(event => event && event.watched_at);
+        }
+
+        return item.watched_at ? [{ watched_at: item.watched_at }] : [];
+    }
+
+    function getHistoryCounts(item) {
+        const key = getHistoryKey(item);
+        return historyCountsMap.get(key) || {
+            watchCount: getItemWatchCount(item),
+            rewatchCount: getItemRewatchCount(item)
+        };
+    }
+
+    // Build a map of history counts keyed by simkl_id or title-year
+    function buildHistoryCountsMap() {
+        historyCountsMap = new Map();
+        historyData.forEach(h => {
+            const key = getHistoryKey(h);
+            const existing = historyCountsMap.get(key) || {
+                watchCount: 0,
+                rewatchCount: 0,
+                hasExplicitRewatchCount: false
+            };
+
+            existing.watchCount += getItemWatchCount(h);
+            existing.rewatchCount += getItemRewatchCount(h);
+            existing.hasExplicitRewatchCount = existing.hasExplicitRewatchCount || hasExplicitRewatchCount(h);
+            historyCountsMap.set(key, existing);
+        });
+
+        historyCountsMap.forEach(counts => {
+            if (!counts.hasExplicitRewatchCount) {
+                counts.rewatchCount = Math.max(counts.rewatchCount, counts.watchCount - 1);
+            }
+        });
+    }
+
     // Update statistics panel and chart
     function updateStatistics() {
         // Calculate basic statistics
@@ -128,10 +228,21 @@ document.addEventListener('DOMContentLoaded', () => {
         const uniqueAnimeIds = new Set(historyData.filter(item => item.type === 'anime').map(item => item.simkl_id || `${item.title}-${item.year}`));
 
         // Update count displays
-        totalCountEl.textContent = historyData.length;
+        const totalWatchCount = historyData.reduce((sum, item) => sum + getItemWatchCount(item), 0);
+        totalCountEl.textContent = totalWatchCount;
         moviesCountEl.textContent = movieCount;
         showsCountEl.textContent = uniqueShowIds.size;
         animeCountEl.textContent = uniqueAnimeIds.size;
+
+        // Build counts map for rewatch calculations
+        buildHistoryCountsMap();
+
+        // Calculate rewatch metrics
+        const rewatchEvents = Array.from(historyCountsMap.values()).reduce((sum, c) => sum + c.rewatchCount, 0);
+
+        // Update rewatch stat display if present
+        const rewatchEl = document.getElementById('rewatches-count');
+        if (rewatchEl) rewatchEl.textContent = rewatchEvents;
 
         // Create statistics visualizations
         createWatchTrendChart();
@@ -189,11 +300,11 @@ document.addEventListener('DOMContentLoaded', () => {
             };
         }
 
-        // Count watched items by month
+        // Count watched events by month
         historyData.forEach(item => {
-            if (item.watched_at) {
+            getItemWatchEvents(item).forEach(event => {
                 try {
-                    const watchDate = new Date(item.watched_at);
+                    const watchDate = new Date(event.watched_at);
                     if (isNaN(watchDate.getTime())) { // Check for invalid date
                         return; // Skip this item
                     }
@@ -205,7 +316,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 } catch (e) {
                     // Silently handle error
                 }
-            }
+            });
         });
 
         // Sort the chart data chronologically
@@ -499,18 +610,18 @@ document.addEventListener('DOMContentLoaded', () => {
         const hourCounts = Array(24).fill(0);
         let totalEntries = 0;
         
-        // Count entries by hour
+        // Count watch events by hour
         historyData.forEach(item => {
-            if (item.watched_at) {
+            getItemWatchEvents(item).forEach(event => {
                 try {
-                    const watchDate = new Date(item.watched_at);
+                    const watchDate = new Date(event.watched_at);
                     const hour = watchDate.getHours();
                     hourCounts[hour]++;
                     totalEntries++;
                 } catch (e) {
                     // Skip invalid dates
                 }
-            }
+            });
         });
         
         // Skip if no data
@@ -706,6 +817,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function filterHistory() {
         const searchTerm = searchInput.value.toLowerCase().trim();
         const typeFilter = filterType.value;
+        const rewatchFilter = document.getElementById('filter-rewatch') ? document.getElementById('filter-rewatch').value : 'all';
         const yearFilter = filterYear.value;
         const sortOption = sortBy.value;
 
@@ -714,6 +826,12 @@ document.addEventListener('DOMContentLoaded', () => {
             if (typeFilter !== 'all' && item.type !== typeFilter) return false;
             // Year filter
             if (yearFilter !== 'all' && item.year !== parseInt(yearFilter)) return false;
+            // Rewatch filter
+            if (rewatchFilter !== 'all') {
+                const counts = getHistoryCounts(item);
+                if (rewatchFilter === 'original' && counts.rewatchCount > 0) return false;
+                if (rewatchFilter === 'rewatch' && counts.rewatchCount < 1) return false;
+            }
             // Search filter (title, year, overview)
             if (searchTerm) {
                 const titleMatch = item.title && item.title.toLowerCase().includes(searchTerm);
@@ -821,10 +939,15 @@ document.addEventListener('DOMContentLoaded', () => {
             case 'anime': mediaIcon = 'ph-duotone ph-star'; break;
             default: mediaIcon = 'ph-duotone ph-film-strip';
         }
+        const counts = getHistoryCounts(item);
+        const rewatchBadgeHtml = counts.rewatchCount > 0
+            ? `<span class="rewatch-badge" title="Watched ${counts.watchCount} times, ${counts.rewatchCount} rewatch${counts.rewatchCount === 1 ? '' : 'es'}">↻${counts.watchCount}</span>`
+            : '';
 
         card.innerHTML = `
             <div class="poster-container">
                 <img class="poster-img" src="${proxiedPosterUrl}" alt="${item.title || 'Poster'}" loading="lazy">
+                ${rewatchBadgeHtml}
                 <span class="media-type"><i class="${mediaIcon}"></i> ${mediaType}</span>
             </div>
             <div class="media-info">
@@ -1111,6 +1234,18 @@ document.addEventListener('DOMContentLoaded', () => {
         if (metaYear) metaYear.textContent = itemData.year || '-';
         if (metaRuntime) metaRuntime.textContent = itemData.runtime ? `${itemData.runtime} min` : '-';
         if (metaLastWatched) metaLastWatched.textContent = formatDate(itemData.watched_at);
+        // Populate rewatch count in expanded header
+        try {
+            const metaRewatchSpan = expandedHeader.querySelector('[data-field="rewatch_count"] span');
+            if (metaRewatchSpan) {
+                const counts = getHistoryCounts(itemData);
+                metaRewatchSpan.textContent = counts.rewatchCount > 0
+                    ? `${counts.rewatchCount} rewatch${counts.rewatchCount === 1 ? '' : 'es'}`
+                    : '-';
+            }
+        } catch (e) {
+            // ignore
+        }
 
         // Populate Content Details
         populateExpandedContentDetails(expandedContentWrapper, itemData);
@@ -1427,10 +1562,12 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             
             // Format latest episode text
-            if (latestEntry && latestEntry.season > 0 && latestEntry.episode > 0) {
-                latestEpisodeText = `S${String(latestEntry.season).padStart(2, '0')}E${String(latestEntry.episode).padStart(2, '0')}`;
-            } else if (latestEntry && latestEntry.episode > 0) {
-                latestEpisodeText = `E${latestEntry.episode}`;
+            const latestSeasonNumber = latestEntry?.season || 0;
+            const latestEpisodeNumber = latestEntry?.episode || latestEntry?.number || 0;
+            if (latestSeasonNumber > 0 && latestEpisodeNumber > 0) {
+                latestEpisodeText = `S${String(latestSeasonNumber).padStart(2, '0')}E${String(latestEpisodeNumber).padStart(2, '0')}`;
+            } else if (latestEpisodeNumber > 0) {
+                latestEpisodeText = `E${String(latestEpisodeNumber).padStart(2, '0')}`;
             }
             updateField(tvDetailsSection, 'latest_watched_episode', latestEpisodeText);
             updateField(tvDetailsSection, 'total_episodes', item.total_episodes || '-'); // Use item's total_episodes if available
@@ -1490,21 +1627,72 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             if (episodesToDisplay.length > 0) {
-                // Sort episodes by watched date (newest first)
-                episodesToDisplay.sort((a, b) => {
-                    // Parse dates for comparison
-                    const dateA = a.watched_at ? new Date(a.watched_at) : new Date(0);
-                    const dateB = b.watched_at ? new Date(b.watched_at) : new Date(0);
-                    
-                    // Sort by date descending (newest first)
-                    return dateB - dateA;
-                });
+                const getEpisodeSeasonNumber = ep => {
+                    const parsed = Number(ep.season ?? ep.historyEntry?.season ?? 0);
+                    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+                };
+
+                const getEpisodeNumber = ep => {
+                    const parsed = Number(ep.number ?? ep.episode ?? ep.historyEntry?.episode ?? 0);
+                    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+                };
+
+                const uniqueEpisodeSet = new Set();
+                const seasonGroupMap = new Map();
 
                 episodesToDisplay.forEach(ep => {
+                    const seasonNumber = getEpisodeSeasonNumber(ep);
+                    const episodeNumber = getEpisodeNumber(ep);
+                    const seasonKey = seasonNumber > 0 ? String(seasonNumber) : 'unknown';
+
+                    if (!seasonGroupMap.has(seasonKey)) {
+                        seasonGroupMap.set(seasonKey, {
+                            seasonNumber,
+                            episodes: [],
+                            uniqueEpisodes: new Set()
+                        });
+                    }
+
+                    const group = seasonGroupMap.get(seasonKey);
+                    group.episodes.push(ep);
+
+                    if (episodeNumber > 0) {
+                        uniqueEpisodeSet.add(`${seasonNumber}:${episodeNumber}`);
+                        group.uniqueEpisodes.add(episodeNumber);
+                    }
+                });
+
+                const totalWatchedUnique = uniqueEpisodeSet.size || episodesToDisplay.length;
+                updateField(tvDetailsSection, 'episodes_watched_count', totalWatchedUnique);
+
+                const seasonGroups = Array.from(seasonGroupMap.values()).sort((a, b) => {
+                    if (a.seasonNumber === 0 && b.seasonNumber !== 0) return 1;
+                    if (b.seasonNumber === 0 && a.seasonNumber !== 0) return -1;
+                    return a.seasonNumber - b.seasonNumber;
+                });
+
+                // Insert per-season summary at top of episodeList (if any seasons are known)
+                const seasonSummaryContainer = document.createElement('div');
+                seasonSummaryContainer.className = 'season-summary';
+                seasonGroups.forEach(group => {
+                    if (group.seasonNumber === 0) return; // Skip unknown season
+                    const count = group.uniqueEpisodes.size || group.episodes.length;
+                    const badge = document.createElement('div');
+                    badge.className = 'season-badge';
+                    badge.textContent = `Season ${group.seasonNumber}: ${count}`;
+                    seasonSummaryContainer.appendChild(badge);
+                });
+
+                if (seasonSummaryContainer.children.length > 0) {
+                    episodeListContainer.appendChild(seasonSummaryContainer);
+                }
+
+                const appendEpisode = ep => {
                     const epElement = document.createElement('div');
                     epElement.className = 'episode-item';
-                    const epNumber = ep.number || '?';
-                    const seasonNumber = ep.season || 0;
+                    const episodeNumber = getEpisodeNumber(ep);
+                    const seasonNumber = getEpisodeSeasonNumber(ep);
+                    const epNumber = episodeNumber > 0 ? String(episodeNumber).padStart(2, '0') : '?';
                     const epTitle = ep.title; // Already determined above
                     
                     // Use the direct watched_at from the episode object if available (from item.episodes)
@@ -1530,6 +1718,29 @@ document.addEventListener('DOMContentLoaded', () => {
                         </div>
                     `;
                     episodeListContainer.appendChild(epElement);
+                };
+
+                seasonGroups.forEach(group => {
+                    const seasonTitle = group.seasonNumber > 0 ? `Season ${group.seasonNumber}` : 'Unknown Season';
+                    const seasonCount = group.uniqueEpisodes.size || group.episodes.length;
+                    const seasonHeader = document.createElement('div');
+                    seasonHeader.className = 'episode-season-header';
+                    seasonHeader.innerHTML = `
+                        <span class="episode-season-title">${seasonTitle}</span>
+                        <span class="episode-season-count">${seasonCount} episode${seasonCount === 1 ? '' : 's'}</span>
+                    `;
+                    episodeListContainer.appendChild(seasonHeader);
+
+                    group.episodes
+                        .sort((a, b) => {
+                            const episodeDiff = getEpisodeNumber(a) - getEpisodeNumber(b);
+                            if (episodeDiff !== 0) return episodeDiff;
+
+                            const dateA = a.watched_at ? new Date(a.watched_at) : new Date(0);
+                            const dateB = b.watched_at ? new Date(b.watched_at) : new Date(0);
+                            return dateB - dateA;
+                        })
+                        .forEach(appendEpisode);
                 });
             } else {
                 episodeListContainer.innerHTML = '<div class="no-episodes">No episode watch history found.</div>';
