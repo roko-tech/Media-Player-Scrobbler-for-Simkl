@@ -1686,7 +1686,7 @@ class MediaScrobbler:
 
         # Use provided watched_at or fallback to now (UTC, ISO8601)
         if not watched_at:
-            watched_at = datetime.utcnow().isoformat() + "Z"
+            watched_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
         payload = {}
         if self.media_type == 'movie':
