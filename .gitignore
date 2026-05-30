@@ -73,3 +73,4 @@ delete_tag.bat
 testing
 bump_version.bat
 simklapi.txt
+*.bak

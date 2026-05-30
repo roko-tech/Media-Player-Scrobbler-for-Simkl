@@ -118,7 +118,13 @@ def search_movie(title, client_id, access_token, file_path=None):
     # 1. Try movie title search first
     logger.info(f"Simkl API: Searching for movie by title: '{title}'...")
     try:
-        params = {'q': title, 'extended': 'full'}
+        params = {
+            'q': title, 
+            'extended': 'full',
+            'client_id': client_id,
+            'app-name': APP_NAME,
+            'app-version': __version__
+        }
         response = requests.get(f'{SIMKL_API_BASE_URL}/search/movie', headers=headers, params=params)
 
         if response.status_code == 200:
@@ -162,7 +168,13 @@ def search_movie(title, client_id, access_token, file_path=None):
     # 3. Try anime search for anime movies
     logger.info(f"Simkl API: Trying anime search for: '{title}'...")
     try:
-        params = {'q': title, 'extended': 'full'}
+        params = {
+            'q': title, 
+            'extended': 'full',
+            'client_id': client_id,
+            'app-name': APP_NAME,
+            'app-version': __version__
+        }
         response = requests.get(f'{SIMKL_API_BASE_URL}/search/anime', headers=headers, params=params)
 
         if response.status_code == 200:
@@ -225,7 +237,12 @@ def search_file(file_path, client_id, part=None):
 
     logger.info(f"Simkl API: Searching by file: '{file_path}' (Part: {part if part else 'N/A'})...")
     try:
-        response = requests.post(f'{SIMKL_API_BASE_URL}/search/file', headers=headers, json=data)
+        params = {
+            'client_id': client_id,
+            'app-name': APP_NAME,
+            'app-version': __version__
+        }
+        response = requests.post(f'{SIMKL_API_BASE_URL}/search/file', headers=headers, json=data, params=params)
 
         if response.status_code != 200:
             error_details = ""
@@ -345,7 +362,12 @@ def get_movie_details(simkl_id, client_id, access_token):
         'Authorization': f'Bearer {access_token}'
     }
     headers = _add_user_agent(headers)
-    params = {'extended': 'full'}
+    params = {
+        'extended': 'full',
+        'client_id': client_id,
+        'app-name': APP_NAME,
+        'app-version': __version__
+    }
     try:
         logger.info(f"Simkl API: Fetching details for movie ID {simkl_id}...")
         response = requests.get(f'{SIMKL_API_BASE_URL}/movies/{simkl_id}', headers=headers, params=params)
@@ -409,7 +431,12 @@ def get_show_details(simkl_id, client_id, access_token):
         'Authorization': f'Bearer {access_token}'
     }
     headers = _add_user_agent(headers)
-    params = {'extended': 'full'}
+    params = {
+        'extended': 'full',
+        'client_id': client_id,
+        'app-name': APP_NAME,
+        'app-version': __version__
+    }
     try:
         logger.info(f"Simkl API: Fetching details for show/anime ID {simkl_id}...")
         response = requests.get(f'{SIMKL_API_BASE_URL}/tv/{simkl_id}', headers=headers, params=params)
@@ -492,7 +519,12 @@ def get_user_settings(client_id, access_token):
     account_url = f'{SIMKL_API_BASE_URL}/users/account'
     try:
         logger.info("Simkl API: Requesting user account information...")
-        account_response = requests.get(account_url, headers=headers, timeout=15)
+        params = {
+            'client_id': client_id,
+            'app-name': APP_NAME,
+            'app-version': __version__
+        }
+        account_response = requests.get(account_url, headers=headers, params=params, timeout=15)
         
         if account_response.status_code == 200:
             account_info = account_response.json()
@@ -526,7 +558,12 @@ def get_user_settings(client_id, access_token):
     settings_url = f'{SIMKL_API_BASE_URL}/users/settings'
     try:
         logger.info("Simkl API: Requesting user settings information...")
-        settings_response = requests.get(settings_url, headers=headers, timeout=15)
+        params = {
+            'client_id': client_id,
+            'app-name': APP_NAME,
+            'app-version': __version__
+        }
+        settings_response = requests.get(settings_url, headers=headers, params=params, timeout=15)
         
         if settings_response.status_code != 200:
             logger.error(f"Simkl API: Error getting user settings: {settings_response.status_code} {settings_response.text}")
@@ -691,9 +728,15 @@ def pin_auth_flow(client_id, redirect_uri="urn:ietf:wg:oauth:2.0:oob"):
                         }
                         auth_headers = _add_user_agent(auth_headers)
                         
+                        params = {
+                            'client_id': client_id,
+                            'app-name': APP_NAME,
+                            'app-version': __version__
+                        }
                         account_resp = requests.get(
                             f"{SIMKL_API_BASE_URL}/users/account", 
                             headers=auth_headers,
+                            params=params,
                             timeout=10
                         )
                         
@@ -829,9 +872,15 @@ def _validate_access_token(client_id, access_token):
         }
         headers = _add_user_agent(headers)
         
+        params = {
+            'client_id': client_id,
+            'app-name': APP_NAME,
+            'app-version': __version__
+        }
         response = requests.get(
             f'{SIMKL_API_BASE_URL}/users/settings', 
             headers=headers,
+            params=params,
             timeout=10
         )
         return response.status_code == 200

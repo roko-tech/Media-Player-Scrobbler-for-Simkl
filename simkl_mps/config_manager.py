@@ -38,7 +38,7 @@ DEFAULT_SETTINGS = {
     "user_subdir": DEFAULT_USER_SUBDIR,
     "auto_sync_interval": 120,  # Auto sync backlog every 2 minutes by default
     "disable_notifications": False,  # Show all notifications by default
-    "allow_rewatch": True,
+    "allow_rewatch": False,
     "allow_dirs": [],
     "deny_dirs": []
 }
