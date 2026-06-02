@@ -131,6 +131,10 @@ class MediaScrobbler:
         self._allow_dirs = get_setting('allow_dirs', [])
         self._deny_dirs = get_setting('deny_dirs', [])
         self._dir_filter_last_refresh = 0
+        self._account_type = None # Cache for user account type ('free', 'pro', 'vip')
+        self._account_settings_all = None # Cached /sync/activities settings timestamp
+        self._last_account_settings_check = 0
+        self._menu_refresh_callback = None
 
     def _refresh_dir_filters(self, min_interval_seconds=60):
         """Refresh directory allow/deny lists periodically to avoid frequent disk I/O."""
@@ -146,9 +150,101 @@ class MediaScrobbler:
         self._dir_filter_last_refresh = 0
         logger.info("Received signal to refresh directory filters.")
 
+    def _refresh_account_type(self, force=False):
+        """
+        Refresh the cached account type from Simkl API.
+        Uses /users/settings as the source of truth and only falls back to the network
+        when the cache is empty or the caller explicitly requests a refresh.
+        """
+        if not self.client_id or not self.access_token:
+            return None
+
+        if self._account_type and not force:
+            return self._account_type
+
+        try:
+            from simkl_mps.simkl_api import get_user_settings
+            settings = get_user_settings(self.client_id, self.access_token)
+            if settings:
+                account = settings.get('account') if isinstance(settings.get('account'), dict) else {}
+                account_type = account.get('type') or settings.get('account_type')
+                if isinstance(account_type, str):
+                    account_type = account_type.strip().lower()
+                if account_type:
+                    self._account_type = account_type
+                    logger.info(f"Simkl account type refreshed: {self._account_type}")
+                    try:
+                        if self._menu_refresh_callback:
+                            threading.Thread(target=self._menu_refresh_callback, daemon=True).start()
+                    except Exception:
+                        logger.debug("Failed to run menu refresh callback", exc_info=True)
+                    return self._account_type
+        except Exception as e:
+            logger.error(f"Error refreshing account type from Simkl API: {e}")
+        
+        return self._account_type
+
+    def refresh_account_type_if_needed(self, min_interval_seconds=300):
+        """
+        Refresh cached account type only when /sync/activities reports settings changes.
+        This avoids polling while still allowing plan upgrades to take effect quickly.
+        """
+        if not self.client_id or not self.access_token:
+            return self._account_type
+
+        now = time.time()
+        if now - self._last_account_settings_check < min_interval_seconds:
+            return self._account_type
+        self._last_account_settings_check = now
+
+        try:
+            from simkl_mps.simkl_api import get_activities, get_user_settings
+            activities = get_activities(self.client_id, self.access_token)
+            settings_all = None
+            if activities:
+                settings_all = activities.get('settings', {}).get('all')
+
+            if not settings_all:
+                return self._account_type
+
+            if self._account_settings_all == settings_all and self._account_type:
+                return self._account_type
+
+            settings = get_user_settings(self.client_id, self.access_token, settings_all=settings_all)
+            account_type = None
+            if settings:
+                account = settings.get('account') if isinstance(settings.get('account'), dict) else {}
+                account_type = account.get('type') or settings.get('account_type')
+                if isinstance(account_type, str):
+                    account_type = account_type.strip().lower()
+                self._account_settings_all = settings_all
+
+            if account_type and account_type != self._account_type:
+                self._account_type = account_type
+                logger.info(f"Simkl account type updated from activities gate: {self._account_type}")
+                try:
+                    if self._menu_refresh_callback:
+                        threading.Thread(target=self._menu_refresh_callback, daemon=True).start()
+                except Exception:
+                    logger.debug("Failed to run menu refresh callback", exc_info=True)
+
+        except Exception as e:
+            logger.debug(f"Account type refresh via activities failed: {e}")
+
+        return self._account_type
+
+    def is_pro_or_vip(self):
+        """Check if the current user has a Pro or VIP account."""
+        account_type = self._refresh_account_type()
+        return account_type in ['pro', 'vip']
+
     def set_notification_callback(self, callback):
         """Set a callback function for notifications"""
         self.notification_callback = callback
+
+    def set_menu_refresh_callback(self, callback):
+        """Set a callback to be invoked when menu should refresh (e.g., account type changed)."""
+        self._menu_refresh_callback = callback
 
     def clear_backlog_processing_state(self):
         """Clear the in-memory backlog processing state. Called when cache is cleared."""
@@ -398,10 +494,16 @@ class MediaScrobbler:
                 logger.error(f"Error getting filepath from {process_name} ({integration.__class__.__name__}): {e}", exc_info=True)
         return None
 
-    def set_credentials(self, client_id, access_token):
+    def set_credentials(self, client_id, access_token, account_type=None, settings_all=None):
         """Set API credentials"""
         self.client_id = client_id
         self.access_token = access_token
+        if account_type:
+            self._account_type = account_type.strip().lower() if isinstance(account_type, str) else account_type
+        if settings_all is not None:
+            self._account_settings_all = settings_all
+        if not self._account_type and self.client_id and self.access_token and not self.testing_mode:
+            self._refresh_account_type(force=True)
 
     def process_window(self, window_info):
         """Process the current window and update scrobbling state (advanced tracking only, no window title parsing)."""
@@ -665,7 +767,7 @@ class MediaScrobbler:
         if 'duration_seconds' in cached_info and self.total_duration_seconds is None:
             self.total_duration_seconds = cached_info['duration_seconds']
             self.estimated_duration = self.total_duration_seconds
-            logger.info(f"Set duration from cache for '{self.movie_name}': {self.total_duration_seconds}s")
+            logger.info(f"Set duration from cache for '{self.movie_name or self.currently_tracking}' from {self.total_duration_seconds}s")
         
         # Send notification for cached identification if actively tracking this item
         if self.currently_tracking and self.movie_name and self.simkl_id:
@@ -1199,7 +1301,7 @@ class MediaScrobbler:
         final_season_for_cache = self.season # Episode specific, from search_file
         final_episode_for_cache = self.episode # Episode specific, from search_file
         final_year_for_cache = year
-        final_runtime_minutes_for_cache = runtime_minutes # Already considers episode runtime from search_file
+        final_runtime_minutes_for_cache = runtime_minutes # Already considers episode-specific runtime from search_file
         final_api_ids_for_cache = media_item.get('ids', {})
         final_overview_for_cache = media_item.get('overview') or episode_details_from_api.get('overview')
         final_poster_url_for_cache = media_item.get('poster') or episode_details_from_api.get('poster')
@@ -1505,7 +1607,11 @@ class MediaScrobbler:
         # --- Internet Connection Check (Now that we have a Simkl ID) ---
         if not is_internet_connected():
             logger.warning(f"Offline: Adding '{display_title}' (ID: {self.simkl_id}) to backlog.")
-            allow_rewatch = get_setting('allow_rewatch', True)
+            # Only allow rewatch in backlog if user is Pro/VIP
+            allow_rewatch = False
+            if self.is_pro_or_vip():
+                allow_rewatch = get_setting('allow_rewatch', True)
+            
             self._add_to_backlog_due_to_issue(
                 self.simkl_id, display_title, "offline_with_id",
                 {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode, "allow_rewatch": allow_rewatch}
@@ -1539,7 +1645,11 @@ class MediaScrobbler:
             log_item_desc += f" S{self.season}E{self.episode}" if self.media_type == 'show' and self.season else f" E{self.episode}"
 
         try:
-            allow_rewatch = get_setting('allow_rewatch', True)
+            # Only allow rewatch if user is Pro/VIP
+            allow_rewatch = False
+            if self.is_pro_or_vip():
+                allow_rewatch = get_setting('allow_rewatch', True)
+            
             is_rewatch = False
             if allow_rewatch:
                 is_rewatch = self._is_local_rewatch(self.simkl_id, self.media_type, self.season, self.episode)
@@ -2140,7 +2250,7 @@ class MediaScrobbler:
                     item_data['title'] = api_details.get('title', title_from_backlog)
                     item_data['type'] = api_details.get('type', media_type_from_backlog) # API type is canonical
                     if item_data['type'] in ['show', 'anime']:
-                        # If backlog item had S/E (e.g. from guessit), use it unless API provides better
+                        # If backlog item had S/E (e.g., from guessit), use it unless API provides better
                         # This part is tricky; Simkl's get_show_details doesn't return specific episode info
                         # We rely on the S/E stored in the backlog item if it was from /search/file or guessit
                         # If item_data['season'] or ['episode'] is None, it remains so.
@@ -2165,9 +2275,9 @@ class MediaScrobbler:
             episode_patterns = [
                 r'[sS]\d{1,3}[eE]\d{1,4}',  # S01E02, s1e2
                 r'\d{1,3}x\d{1,4}',         # 1x02, 10x5
-                r'[sS]\d{1,3}\.?[eE]?\d{1,4}', # S01.E02, S01E02, S01e02
-                r'episode\s*\d{1,4}',       # episode 1, episode 12
-                r'\s\d{1,2}\s',             # space-padded episode numbers (anime)
+                r'[sS]\d{1,3}\.?[eE]?(\d{1,4})', # S01.E01, S01E01, S01e01
+                r'episode.*?(\d{1,4})', # "episode 01", "Episode.1" (captures episode only)
+                r' (\d{1,4}) ', # Space-padded number, might be an episode for anime
             ]
             for pattern in episode_patterns:
                 if re.search(pattern, title, re.IGNORECASE):
@@ -2667,7 +2777,8 @@ class MediaScrobbler:
             if wrapper_name:
                 return f"{wrapper_name} (MPV Wrapper)"
             return "MPV Wrapper"
-        # Unsupported players: Windows Media Player, QuickTime, etc.
+        # Unsupported players: Windows Media Player, QuickTime, and other players
+        # that don't support getting position/duration data
         return None
         
     def _get_player_config_instructions(self, player_type):

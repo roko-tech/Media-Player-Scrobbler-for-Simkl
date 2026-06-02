@@ -61,7 +61,7 @@ def get_credentials():
     Retrieves the Simkl API credentials.
 
     Client ID/Secret are read from module-level variables (injected at build).
-    Access Token and User ID are read directly from the .env file *each time* this function
+    Access Token, User ID, and cached account metadata are read directly from the .env file *each time* this function
     is called to ensure the latest values are used.
 
     Returns:
@@ -121,6 +121,8 @@ def get_credentials():
 
     access_token = None
     user_id = None
+    account_type = None
+    settings_all = None
     env_file_path = get_env_file_path()
     if env_file_path.exists():
         logger.debug(f"Reading credentials from {env_file_path} inside get_credentials()")
@@ -128,11 +130,16 @@ def get_credentials():
 
         access_token = config.get("SIMKL_ACCESS_TOKEN")
         user_id = config.get("SIMKL_USER_ID")
+        account_type = config.get("SIMKL_ACCOUNT_TYPE")
+        settings_all = config.get("SIMKL_SETTINGS_ALL")
 
         if user_id:
             logger.debug(f"Found user ID in env file: {user_id}")
         else:
             logger.debug("User ID not found in env file")
+
+        if account_type:
+            logger.debug(f"Found account type in env file: {account_type}")
 
         if not access_token:
             logger.warning(
@@ -150,7 +157,9 @@ def get_credentials():
         "client_id": client_id,
         "client_secret": client_secret,
         "access_token": access_token,
-        "user_id": user_id
+        "user_id": user_id,
+        "account_type": account_type,
+        "settings_all": settings_all
     }
 
 def get_env_file_path():

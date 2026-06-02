@@ -206,11 +206,11 @@ class Monitor:
 
         logger.info("Media monitoring service stopped")
 
-    def set_credentials(self, client_id, access_token):
+    def set_credentials(self, client_id, access_token, account_type=None, settings_all=None):
         """Set API credentials"""
         self.client_id = client_id
         self.access_token = access_token
-        self.scrobbler.set_credentials(client_id, access_token)
+        self.scrobbler.set_credentials(client_id, access_token, account_type=account_type, settings_all=settings_all)
 
     def cache_media_info(self, title, simkl_id, display_name, media_type='movie', season=None, episode=None,
                          year=None, runtime=None, season_display=None, episode_display=None):
