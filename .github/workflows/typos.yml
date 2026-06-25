@@ -12,9 +12,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Run typos check
-        uses: crate-ci/typos@v1.46.3
+        uses: crate-ci/typos@v1.47.2
         with:
           config: ./.github/typos_config.toml
