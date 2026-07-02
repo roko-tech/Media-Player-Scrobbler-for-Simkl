@@ -271,7 +271,13 @@ class PotPlayerIntegration:
                 if is_video:
                     video_handles.append(candidate_path)
                 if target_basename:
-                    if candidate_basename == target_basename:
+                    target_stem, target_ext = os.path.splitext(target_basename)
+                    # exact match, or stem match when the title hid the extension (video only,
+                    # so we don't grab a same-named .srt)
+                    if candidate_basename == target_basename or (
+                        is_video and not target_ext
+                        and os.path.splitext(candidate_basename)[0] == target_stem
+                    ):
                         return candidate_path
                 elif is_video:
                     return candidate_path

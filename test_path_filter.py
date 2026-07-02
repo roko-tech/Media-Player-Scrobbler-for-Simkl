@@ -195,6 +195,46 @@ def test_load_persists_enrichment_to_disk():
         assert "allow_dirs" in on_disk  # enrichment actually persisted
 
 
+def test_non_dict_settings_json_falls_back():
+    # settings.json holding valid-but-non-dict JSON must not crash the load.
+    with _TempSettings():
+        config_manager.save_settings({**config_manager.DEFAULT_SETTINGS, "allow_dirs": [P("downloads")]})
+        with open(config_manager.SETTINGS_FILE, "w", encoding="utf-8") as f:
+            f.write("[1, 2, 3]")
+        assert config_manager.get_setting("allow_dirs") == [P("downloads")]
+
+
+def test_non_dict_backup_ignored():
+    with _TempSettings():
+        with open(config_manager._backup_path(), "w", encoding="utf-8") as f:
+            f.write('"not a dict"')
+        assert config_manager._load_backup() is None
+
+
+def test_defaults_not_mutated_by_returned_settings():
+    with _TempSettings():
+        config_manager._last_good_settings = None  # no cache, no backup -> returns defaults
+        settings = config_manager._fallback_settings()
+        settings["allow_dirs"].append("x")
+        assert config_manager.DEFAULT_SETTINGS["allow_dirs"] == []
+
+
+def test_save_survives_fsync_failure():
+    with _TempSettings():
+        real_fsync = os.fsync
+
+        def boom(fd):
+            raise OSError("fsync unsupported")
+
+        config_manager.os.fsync = boom
+        try:
+            ok = config_manager.save_settings({**config_manager.DEFAULT_SETTINGS, "allow_dirs": [P("downloads")]})
+        finally:
+            config_manager.os.fsync = real_fsync
+        assert ok is True
+        assert config_manager.get_setting("allow_dirs") == [P("downloads")]
+
+
 def _run_standalone():
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

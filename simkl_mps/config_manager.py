@@ -72,7 +72,10 @@ def _atomic_write_json(target_path, settings_dict):
         with open(tmp_file, 'w', encoding='utf-8') as f:
             json.dump(settings_dict, f, indent=4)
             f.flush()
-            os.fsync(f.fileno())
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass  # some filesystems (network/virtual) don't support fsync
     except Exception as e:
         log.error(f"Could not write temp settings file {tmp_file}: {e}")
         _remove_quietly(tmp_file)
@@ -92,10 +95,11 @@ def _atomic_write_json(target_path, settings_dict):
 
 
 def _load_backup():
-    """Parse the backup file, or None if it's missing/unreadable."""
+    """Parse the backup file (must be a dict), or None if missing/unreadable/wrong shape."""
     try:
         with open(_backup_path(), 'r', encoding='utf-8') as f:
-            return json.load(f)
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -110,13 +114,13 @@ def _fallback_settings():
     backup = _load_backup()
     if backup is not None:
         log.warning("Recovered settings from backup after a settings read error.")
-        merged = DEFAULT_SETTINGS.copy()
+        merged = copy.deepcopy(DEFAULT_SETTINGS)
         merged.update(backup)
         _last_good_settings = copy.deepcopy(merged)
         return merged
 
     log.error("No settings backup available; using defaults (allow-list is disabled).")
-    return DEFAULT_SETTINGS.copy()
+    return copy.deepcopy(DEFAULT_SETTINGS)
 
 
 def _sanitize_dir_list(value):
@@ -139,14 +143,16 @@ def load_settings():
         except OSError as e:
             log.error(f"Could not create settings directory {SETTINGS_DIR}: {e}")
             # Return defaults without attempting to save if dir creation fails
-            return DEFAULT_SETTINGS.copy()
+            return copy.deepcopy(DEFAULT_SETTINGS)
         # Save default settings on first load if file doesn't exist
-        save_settings(DEFAULT_SETTINGS.copy())
-        return DEFAULT_SETTINGS.copy()
+        save_settings(copy.deepcopy(DEFAULT_SETTINGS))
+        return copy.deepcopy(DEFAULT_SETTINGS)
     try:
         with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
             settings = json.load(f)
-    except (json.JSONDecodeError, IOError, OSError) as e:
+        if not isinstance(settings, dict):
+            raise ValueError("settings.json is not a JSON object")
+    except (json.JSONDecodeError, IOError, OSError, ValueError) as e:
         log.error(f"Error loading settings from {SETTINGS_FILE}: {e}. Falling back.")
         return _fallback_settings()
     except Exception as e:
