@@ -201,17 +201,25 @@ def load_settings():
 def save_settings(settings_dict):
     """Save settings atomically (temp file + rename) plus a .bak. Returns True on success."""
     global _last_good_settings
+
+    # Sanitize the allow/deny lists before writing and caching, so a partial or malformed
+    # save can't later be handed back by _fallback_settings with the allow-list dropped.
+    to_save = dict(settings_dict) if isinstance(settings_dict, dict) else settings_dict
+    if isinstance(to_save, dict):
+        for key in ("allow_dirs", "deny_dirs"):
+            to_save[key] = _sanitize_dir_list(to_save.get(key))
+
     try:
         SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         log.error(f"Could not create settings directory {SETTINGS_DIR}: {e}")
         return False
 
-    if not _atomic_write_json(SETTINGS_FILE, settings_dict):
+    if not _atomic_write_json(SETTINGS_FILE, to_save):
         return False
 
-    _last_good_settings = copy.deepcopy(settings_dict)
-    _atomic_write_json(_backup_path(), settings_dict)  # best effort; failure isn't fatal
+    _last_good_settings = copy.deepcopy(to_save)
+    _atomic_write_json(_backup_path(), to_save)  # best effort; failure isn't fatal
     log.info(f"Settings saved successfully to {SETTINGS_FILE}")
     return True
 

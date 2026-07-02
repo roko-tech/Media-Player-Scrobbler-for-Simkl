@@ -235,6 +235,14 @@ def test_save_survives_fsync_failure():
         assert config_manager.get_setting("allow_dirs") == [P("downloads")]
 
 
+def test_save_sanitizes_dir_lists():
+    # junk/missing dir lists get cleaned before write + cache, so a later fallback is safe.
+    with _TempSettings():
+        config_manager.save_settings({"allow_dirs": ["  ", 123, P("downloads")]})
+        assert config_manager.get_setting("allow_dirs") == [P("downloads")]
+        assert config_manager.get_setting("deny_dirs") == []
+
+
 def _run_standalone():
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]
