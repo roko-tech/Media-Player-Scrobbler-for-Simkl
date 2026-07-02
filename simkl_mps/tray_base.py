@@ -305,7 +305,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
 
     def set_allow_dirs(self, _=None):
         current_value = self._format_dir_list_for_dialog(get_setting("allow_dirs", []))
-        help_text = "Enter paths or glob patterns, separated by commas or semicolons."
+        help_text = "Enter folder paths, separated by commas or semicolons. Use * and ? as wildcards; [brackets] in names are matched literally."
         updated_text = self._ask_directory_filter_dialog("Set Allow Directories", current_value, help_text)
         if updated_text is not None:
             entries = self._parse_dir_list_input(updated_text)
@@ -315,7 +315,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
 
     def set_deny_dirs(self, _=None):
         current_value = self._format_dir_list_for_dialog(get_setting("deny_dirs", []))
-        help_text = "Enter paths or glob patterns, separated by commas or semicolons."
+        help_text = "Enter folder paths, separated by commas or semicolons. Use * and ? as wildcards; [brackets] in names are matched literally."
         updated_text = self._ask_directory_filter_dialog("Set Deny Directories", current_value, help_text)
         if updated_text is not None:
             entries = self._parse_dir_list_input(updated_text)

@@ -1,7 +1,9 @@
+import copy
 import json
 import os
 import logging
 import sys
+import time
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -43,6 +45,80 @@ DEFAULT_SETTINGS = {
     "deny_dirs": []
 }
 
+# Last settings read/written OK; fallback so a corrupt read doesn't blank allow_dirs.
+_last_good_settings = None
+
+# Retry the rename: on Windows os.replace fails while another handle holds the file.
+_REPLACE_RETRIES = 5
+_REPLACE_DELAY_SECONDS = 0.1
+
+
+def _backup_path():
+    """Sibling backup file, e.g. settings.json.bak."""
+    return SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".bak")
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _atomic_write_json(target_path, settings_dict):
+    """Write JSON to target_path via a temp file + atomic rename. Returns True on success."""
+    tmp_file = target_path.with_name(target_path.name + ".tmp")
+    try:
+        with open(tmp_file, 'w', encoding='utf-8') as f:
+            json.dump(settings_dict, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:
+        log.error(f"Could not write temp settings file {tmp_file}: {e}")
+        _remove_quietly(tmp_file)
+        return False
+
+    last_error = None
+    for _ in range(_REPLACE_RETRIES):
+        try:
+            os.replace(tmp_file, target_path)  # atomic rename
+            return True
+        except OSError as e:
+            last_error = e
+            time.sleep(_REPLACE_DELAY_SECONDS)
+    log.error(f"Could not replace {target_path} after {_REPLACE_RETRIES} tries: {last_error}")
+    _remove_quietly(tmp_file)
+    return False
+
+
+def _load_backup():
+    """Parse the backup file, or None if it's missing/unreadable."""
+    try:
+        with open(_backup_path(), 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _fallback_settings():
+    """Settings after a read error: in-memory cache, then .bak, then defaults."""
+    global _last_good_settings
+    if _last_good_settings is not None:
+        log.warning("Falling back to last known good settings after a settings read error.")
+        return copy.deepcopy(_last_good_settings)
+
+    backup = _load_backup()
+    if backup is not None:
+        log.warning("Recovered settings from backup after a settings read error.")
+        merged = DEFAULT_SETTINGS.copy()
+        merged.update(backup)
+        _last_good_settings = copy.deepcopy(merged)
+        return merged
+
+    log.error("No settings backup available; using defaults (allow-list is disabled).")
+    return DEFAULT_SETTINGS.copy()
+
+
 def _sanitize_dir_list(value):
     """Ensure allow/deny dir settings are stored as a list of strings."""
     if value is None:
@@ -70,60 +146,68 @@ def load_settings():
     try:
         with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
             settings = json.load(f)
-            
-            # Ensure all default settings exist, otherwise add them
-            settings_updated = False
-            for key, default_value in DEFAULT_SETTINGS.items():
-                if key not in settings:
-                    settings[key] = default_value
-                    settings_updated = True
-            
-            # Validate threshold value
-            try:
-                current_threshold = int(settings['watch_completion_threshold'])
-                if not (1 <= current_threshold <= 100):
-                    log.warning(f"Invalid watch_completion_threshold '{current_threshold}' in {SETTINGS_FILE}. Resetting to {DEFAULT_THRESHOLD}.")
-                    settings['watch_completion_threshold'] = DEFAULT_THRESHOLD
-                    settings_updated = True
-            except (ValueError, TypeError):
-                 log.warning(f"Non-integer watch_completion_threshold '{settings.get('watch_completion_threshold')}' in {SETTINGS_FILE}. Resetting to {DEFAULT_THRESHOLD}.")
-                 settings['watch_completion_threshold'] = DEFAULT_THRESHOLD
-                 settings_updated = True
-
-            # Sanitize allow/deny directory lists
-            for key in ("allow_dirs", "deny_dirs"):
-                sanitized = _sanitize_dir_list(settings.get(key))
-                if settings.get(key) != sanitized:
-                    settings[key] = sanitized
-                    settings_updated = True
-
-            # Save the file only if defaults were added or invalid values corrected
-            if settings_updated:
-                save_settings(settings)
-                
-            return settings
-    except (json.JSONDecodeError, IOError) as e:
-        log.error(f"Error loading settings from {SETTINGS_FILE}: {e}. Using defaults.")
-        return DEFAULT_SETTINGS.copy()
+    except (json.JSONDecodeError, IOError, OSError) as e:
+        log.error(f"Error loading settings from {SETTINGS_FILE}: {e}. Falling back.")
+        return _fallback_settings()
     except Exception as e:
-        log.error(f"An unexpected error occurred while loading settings: {e}. Using defaults.")
-        return DEFAULT_SETTINGS.copy()
+        log.error(f"An unexpected error occurred while loading settings: {e}. Falling back.")
+        return _fallback_settings()
+
+    # File is closed now; save AFTER this, never inside the read block (Windows can't
+    # rename over a file that's still open -> WinError 5).
+    global _last_good_settings
+
+    # Ensure all default settings exist, otherwise add them
+    settings_updated = False
+    for key, default_value in DEFAULT_SETTINGS.items():
+        if key not in settings:
+            settings[key] = default_value
+            settings_updated = True
+
+    # Validate threshold value
+    try:
+        current_threshold = int(settings['watch_completion_threshold'])
+        if not (1 <= current_threshold <= 100):
+            log.warning(f"Invalid watch_completion_threshold '{current_threshold}' in {SETTINGS_FILE}. Resetting to {DEFAULT_THRESHOLD}.")
+            settings['watch_completion_threshold'] = DEFAULT_THRESHOLD
+            settings_updated = True
+    except (ValueError, TypeError):
+        log.warning(f"Non-integer watch_completion_threshold '{settings.get('watch_completion_threshold')}' in {SETTINGS_FILE}. Resetting to {DEFAULT_THRESHOLD}.")
+        settings['watch_completion_threshold'] = DEFAULT_THRESHOLD
+        settings_updated = True
+
+    # Sanitize allow/deny directory lists
+    for key in ("allow_dirs", "deny_dirs"):
+        sanitized = _sanitize_dir_list(settings.get(key))
+        if settings.get(key) != sanitized:
+            settings[key] = sanitized
+            settings_updated = True
+
+    _last_good_settings = copy.deepcopy(settings)
+
+    # Persist enrichment/corrections only now that the read handle is closed.
+    if settings_updated:
+        save_settings(settings)
+
+    return settings
 
 
 def save_settings(settings_dict):
-    """Saves the provided settings dictionary to the JSON file in the user config directory."""
+    """Save settings atomically (temp file + rename) plus a .bak. Returns True on success."""
+    global _last_good_settings
     try:
-        # Ensure parent directory exists
         SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(settings_dict, f, indent=4)
-        log.info(f"Settings saved successfully to {SETTINGS_FILE}")
     except OSError as e:
-         log.error(f"Could not create or write to settings directory/file {SETTINGS_FILE}: {e}")
-    except IOError as e:
-        log.error(f"Error saving settings to {SETTINGS_FILE}: {e}")
-    except Exception as e:
-        log.error(f"An unexpected error occurred while saving settings: {e}")
+        log.error(f"Could not create settings directory {SETTINGS_DIR}: {e}")
+        return False
+
+    if not _atomic_write_json(SETTINGS_FILE, settings_dict):
+        return False
+
+    _last_good_settings = copy.deepcopy(settings_dict)
+    _atomic_write_json(_backup_path(), settings_dict)  # best effort; failure isn't fatal
+    log.info(f"Settings saved successfully to {SETTINGS_FILE}")
+    return True
 
 
 def get_setting(key, default=None):

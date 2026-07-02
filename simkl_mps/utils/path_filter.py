@@ -19,12 +19,16 @@ def _is_case_sensitive_filesystem() -> bool:
 
 
 def _normalize_path(path_value: str, case_sensitive: bool) -> str:
-    """Normalize a path for reliable comparisons."""
-    try:
-        resolved = Path(path_value).expanduser().resolve(strict=False)
-    except Exception:
-        resolved = Path(path_value).expanduser().absolute()
-    normalized = os.path.normpath(str(resolved))
+    """Normalize for comparison; relative paths aren't resolved against the CWD."""
+    expanded = os.path.expanduser(path_value)
+    if os.path.isabs(expanded):
+        try:
+            resolved = str(Path(expanded).resolve(strict=False))
+        except Exception:
+            resolved = os.path.abspath(expanded)
+        normalized = os.path.normpath(resolved)
+    else:
+        normalized = os.path.normpath(expanded)
     return normalized if case_sensitive else normalized.lower()
 
 
@@ -60,8 +64,23 @@ def _coerce_string_list(values: Optional[Iterable[str]]) -> List[str]:
     return [value for value in values if isinstance(value, str) and value.strip()]
 
 
-def _contains_glob(pattern_value: str) -> bool:
-    return any(char in pattern_value for char in ("*", "?", "[", "]"))
+def _contains_wildcard(pattern_value: str) -> bool:
+    """True for a real glob wildcard. '[' and ']' don't count -- folders like
+    '[SubsPlease]' would otherwise be read as fnmatch character classes."""
+    return "*" in pattern_value or "?" in pattern_value
+
+
+def _escape_literal_brackets(pattern_value: str) -> str:
+    """Escape '[' and ']' for fnmatch so bracketed folder names match literally."""
+    escaped_chars = []
+    for char in pattern_value:
+        if char == "[":
+            escaped_chars.append("[[]")
+        elif char == "]":
+            escaped_chars.append("[]]")
+        else:
+            escaped_chars.append(char)
+    return "".join(escaped_chars)
 
 
 def _normalize_for_match(path_value: str) -> str:
@@ -80,13 +99,14 @@ def _match_rule(file_path: str, rule: str, case_sensitive: bool) -> bool:
     normalized_file = _normalize_for_match(file_path)
     normalized_rule = _normalize_for_match(rule)
 
-    if _contains_glob(normalized_rule) or not os.path.isabs(normalized_rule):
-        # Treat relative patterns as match-anywhere
+    if _contains_wildcard(normalized_rule) or not os.path.isabs(normalized_rule):
+        # relative patterns match anywhere
         if not os.path.isabs(normalized_rule) and not normalized_rule.startswith("**"):
             normalized_rule = os.path.join("**", normalized_rule)
-        return fnmatch.fnmatchcase(normalized_file, normalized_rule)
+        pattern = _escape_literal_brackets(normalized_rule)
+        return fnmatch.fnmatchcase(normalized_file, pattern)
 
-    # Non-glob absolute rule: directory prefix match
+    # plain absolute dir: prefix match by path parts
     return _is_path_within_directory(normalized_file, normalized_rule)
 
 

@@ -213,7 +213,9 @@ class PotPlayerIntegration:
             
             cleaned_filename = self._clean_filename(clean_title)
             if cleaned_filename:
-                resolved_path = self._resolve_full_path(cleaned_filename, hwnd)
+                # Match on the raw title: _clean_filename strips leading "[Group]" tags,
+                # but the file on disk keeps them, so the cleaned name wouldn't match.
+                resolved_path = self._resolve_full_path(clean_title, hwnd)
                 if resolved_path:
                     if self.cached_filepath != resolved_path:
                         logger.debug(f"Resolved PotPlayer media to full path: '{resolved_path}'")
@@ -258,18 +260,26 @@ class PotPlayerIntegration:
         target_basename = os.path.basename(filename).lower() if filename else None
 
         # Try open file handles first
+        video_handles = []
         try:
             for open_file in process.open_files():
                 candidate_path = open_file.path
                 if not candidate_path:
                     continue
                 candidate_basename = os.path.basename(candidate_path).lower()
+                is_video = os.path.splitext(candidate_basename)[1].lower() in VIDEO_EXTENSIONS
+                if is_video:
+                    video_handles.append(candidate_path)
                 if target_basename:
                     if candidate_basename == target_basename:
                         return candidate_path
-                else:
-                    if os.path.splitext(candidate_basename)[1].lower() in VIDEO_EXTENSIONS:
-                        return candidate_path
+                elif is_video:
+                    return candidate_path
+            # log what was open, for diagnosing resolution failures
+            logger.debug(
+                f"PotPlayer open_files() found no match for '{target_basename}'. "
+                f"Open video files: {video_handles or 'none'}"
+            )
         except Exception as exc:  # pragma: no cover - defensive
             if psutil and isinstance(exc, (psutil.AccessDenied, psutil.NoSuchProcess)):
                 logger.debug(f"Access denied enumerating PotPlayer open files: {exc}")
