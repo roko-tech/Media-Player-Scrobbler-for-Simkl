@@ -150,7 +150,12 @@ class SimklScrobbler:
             return False
 
         # Set credentials in the monitor using the loaded values
-        self.monitor.set_credentials(self.client_id, self.access_token)
+        self.monitor.set_credentials(
+            self.client_id,
+            self.access_token,
+            account_type=creds.get("account_type"),
+            settings_all=creds.get("settings_all")
+        )
 
         # Initialize Watch History Manager early
         try:

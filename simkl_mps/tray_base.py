@@ -37,6 +37,8 @@ from simkl_mps.config_manager import get_setting, set_setting, DEFAULT_THRESHOLD
 logger = logging.getLogger(__name__)
 
 DEFAULT_DONATION_URL = "https://github.com/sponsors/itskavin"
+# Hardcoded application version (used by About dialog).
+APP_HARDCODED_VERSION = "2.4.0"
 
 def get_simkl_scrobbler():
     """Lazy import for SimklScrobbler to avoid circular imports"""
@@ -236,6 +238,11 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         self._last_known_client_id = client_id
         if changed and not initial:
             logger.info("Authentication state changed: %s", "authenticated" if authenticated else "not authenticated")
+            # Refresh the tray menu/icon when auth state changes
+            try:
+                self.update_icon()
+            except Exception:
+                logger.debug("Failed to update icon after auth state change", exc_info=True)
         return changed
 
     def _get_media_scrobbler(self) -> Any:
@@ -334,30 +341,13 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         return 0
 
     def _get_app_version(self) -> str:
-        """Resolve application version from installed metadata or local package source."""
-        # 1) Prefer installed package metadata
-        for dist_name in ("simkl-mps", "simkl_mps"):
-            try:
-                version = importlib_metadata.version(dist_name)
-                if version:
-                    return version
-            except importlib_metadata.PackageNotFoundError:
-                continue
-            except Exception:
-                logger.debug("Failed to read version from importlib.metadata for %s", dist_name, exc_info=True)
+        """Return the hardcoded application version.
 
-        # 2) Fallback: parse local package __init__.py version constant
-        try:
-            init_file = Path(__file__).parent / "__init__.py"
-            if init_file.exists():
-                content = init_file.read_text(encoding="utf-8", errors="ignore")
-                match = re.search(r"__version__\s*=\s*[\"']([^\"']+)[\"']", content)
-                if match:
-                    return match.group(1).strip()
-        except Exception:
-            logger.debug("Failed to parse local __version__ from __init__.py", exc_info=True)
-
-        return "0.0.0"
+        This deliberately returns a fixed string to avoid runtime lookups.
+        Keep `APP_HARDCODED_VERSION` in this file in sync with the project's
+        versioning (the `version_manager.py` script now updates this constant).
+        """
+        return APP_HARDCODED_VERSION
 
     def _build_about_text(self) -> str:
         """Build standard About dialog text."""
@@ -427,11 +417,17 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                 try:
                     # Ensure the latest credentials are cached
                     self._refresh_auth_state()
+                    refreshed_creds = get_credentials()
                     if self.scrobbler:
                         self.scrobbler.access_token = new_token
                         self.scrobbler.client_id = client_id
                         if hasattr(self.scrobbler, 'monitor') and self.scrobbler.monitor:
-                            self.scrobbler.monitor.set_credentials(client_id, new_token)
+                            self.scrobbler.monitor.set_credentials(
+                                client_id,
+                                new_token,
+                                account_type=refreshed_creds.get("account_type"),
+                                settings_all=refreshed_creds.get("settings_all")
+                            )
                 except Exception as update_err:
                     logger.error(f"Failed to propagate new credentials to running components: {update_err}", exc_info=True)
             else:
@@ -626,7 +622,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
 
             logger.info("No stored user ID found, attempting to retrieve from Simkl API...")
             
-            # Use the improved get_user_settings function that tries account endpoint first
+            # Use the cached /users/settings lookup to recover the authenticated Simkl user ID
             settings = get_user_settings(client_id, access_token)
             
             if settings:
@@ -757,6 +753,12 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                     
             if hasattr(self.scrobbler, 'monitor') and hasattr(self.scrobbler.monitor, 'scrobbler'):
                 self.scrobbler.monitor.scrobbler.set_notification_callback(self.show_notification)
+                # Register menu refresh callback so UI updates when account type changes
+                if hasattr(self.scrobbler.monitor.scrobbler, 'set_menu_refresh_callback'):
+                    try:
+                        self.scrobbler.monitor.scrobbler.set_menu_refresh_callback(self.update_icon)
+                    except Exception as e:
+                        logger.debug(f"Failed to set menu refresh callback: {e}")
                 
             try:
                 started = self.scrobbler.start()
@@ -1174,8 +1176,23 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
     def toggle_rewatch_enabled(self, _=None):
         """Toggle rewatch scrobbling on/off from the tray menu."""
         try:
+            media_scrobbler = self._get_media_scrobbler()
+            if media_scrobbler is not None and hasattr(media_scrobbler, "refresh_account_type_if_needed"):
+                media_scrobbler.refresh_account_type_if_needed(min_interval_seconds=0)
+            account_type = getattr(media_scrobbler, '_account_type', None) if media_scrobbler is not None else None
             current_value = get_setting('allow_rewatch', True)
             new_value = not current_value
+
+            if new_value and account_type not in ('pro', 'vip'):
+                set_setting('allow_rewatch', False)
+                logger.info("Blocked rewatch enable attempt for non-Pro/VIP account.")
+                self.update_icon()
+                self.show_notification(
+                    "Rewatch Tracking Unavailable",
+                    "Rewatch tracking requires Simkl Pro or VIP."
+                )
+                return 0
+
             set_setting('allow_rewatch', new_value)
 
             status = "enabled" if new_value else "disabled"
@@ -1201,6 +1218,12 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
         )
         is_preset = lambda val: current_threshold == val
+        # Determine cached account type (do not force network refresh here)
+        media_scrobbler = self._get_media_scrobbler()
+        cached_account_type = None
+        if media_scrobbler is not None:
+            cached_account_type = getattr(media_scrobbler, '_account_type', None)
+        can_record_rewatches = cached_account_type in ('pro', 'vip')
 
         menu_items = [
             pystray.MenuItem("MPS for SIMKL", None),
@@ -1232,7 +1255,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             pystray.MenuItem(
                 "Record Rewatches",
                 self.toggle_rewatch_enabled,
-                checked=lambda item: get_setting('allow_rewatch', True)
+                checked=lambda item, _allowed=can_record_rewatches: get_setting('allow_rewatch', True) if _allowed else False
             ),
             pystray.MenuItem(
                 "Turn Notifications Off",
