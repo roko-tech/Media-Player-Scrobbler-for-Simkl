@@ -213,9 +213,10 @@ class PotPlayerIntegration:
             
             cleaned_filename = self._clean_filename(clean_title)
             if cleaned_filename:
-                # Match on the raw title: _clean_filename strips leading "[Group]" tags,
-                # but the file on disk keeps them, so the cleaned name wouldn't match.
-                resolved_path = self._resolve_full_path(clean_title, hwnd)
+                # Try the raw title first (keeps "[Group]" tags the real file has), then the
+                # cleaned name (handles title-only appendages like "(With subtitles)").
+                resolved_path = (self._resolve_full_path(clean_title, hwnd)
+                                 or self._resolve_full_path(cleaned_filename, hwnd))
                 if resolved_path:
                     if self.cached_filepath != resolved_path:
                         logger.debug(f"Resolved PotPlayer media to full path: '{resolved_path}'")

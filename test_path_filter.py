@@ -24,6 +24,7 @@ def _load(name, relpath):
 
 path_filter = _load("path_filter", os.path.join("simkl_mps", "utils", "path_filter.py"))
 config_manager = _load("config_manager", os.path.join("simkl_mps", "config_manager.py"))
+potplayer = _load("potplayer", os.path.join("simkl_mps", "players", "potplayer.py"))
 is_path_allowed = path_filter.is_path_allowed
 
 # Absolute paths valid on the host OS; lowercase to dodge case-insensitivity surprises.
@@ -241,6 +242,50 @@ def test_save_sanitizes_dir_lists():
         config_manager.save_settings({"allow_dirs": ["  ", 123, P("downloads")]})
         assert config_manager.get_setting("allow_dirs") == [P("downloads")]
         assert config_manager.get_setting("deny_dirs") == []
+
+
+# --- PotPlayer full-path resolution (forward slashes so os.path.basename splits on any OS) ---
+
+class _FakeOpenFile:
+    def __init__(self, path):
+        self.path = path
+
+
+class _FakeProc:
+    def __init__(self, paths):
+        self._paths = paths
+
+    def open_files(self):
+        return [_FakeOpenFile(p) for p in self._paths]
+
+    def cmdline(self):
+        return []
+
+
+def _potplayer_with_open_files(paths):
+    integ = potplayer.PotPlayerIntegration()
+    integ._get_process_from_hwnd = lambda hwnd: _FakeProc(paths)
+    return integ
+
+
+def test_potplayer_resolves_group_tagged_file():
+    # Raw title (with the [Group] tag the real file has) resolves; the cleaned name doesn't.
+    integ = _potplayer_with_open_files(["D:/downloads/[Erai-raws] Baki-dou - 15.mkv"])
+    assert integ._resolve_full_path("[Erai-raws] Baki-dou - 15.mkv", 1) == "D:/downloads/[Erai-raws] Baki-dou - 15.mkv"
+    assert integ._resolve_full_path("Baki-dou - 15.mkv", 1) is None
+
+
+def test_potplayer_falls_back_to_cleaned_name():
+    # File on disk has no appendage; the cleaned name matches, the raw title doesn't.
+    integ = _potplayer_with_open_files(["D:/movies/Show.mkv"])
+    assert integ._resolve_full_path("Show (With subtitles).mkv", 1) is None
+    assert integ._resolve_full_path("Show.mkv", 1) == "D:/movies/Show.mkv"
+
+
+def test_potplayer_hidden_extension_prefers_video_not_subtitle():
+    # Title hid the extension -> stem match, but must pick the video, not a same-named .srt.
+    integ = _potplayer_with_open_files(["D:/dl/Show.srt", "D:/dl/Show.mkv"])
+    assert integ._resolve_full_path("Show", 1) == "D:/dl/Show.mkv"
 
 
 def _run_standalone():
