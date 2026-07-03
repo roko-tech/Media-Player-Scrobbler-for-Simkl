@@ -213,7 +213,10 @@ class PotPlayerIntegration:
             
             cleaned_filename = self._clean_filename(clean_title)
             if cleaned_filename:
-                resolved_path = self._resolve_full_path(cleaned_filename, hwnd)
+                # Try the raw title first (keeps "[Group]" tags the real file has), then the
+                # cleaned name (handles title-only appendages like "(With subtitles)").
+                resolved_path = (self._resolve_full_path(clean_title, hwnd)
+                                 or self._resolve_full_path(cleaned_filename, hwnd))
                 if resolved_path:
                     if self.cached_filepath != resolved_path:
                         logger.debug(f"Resolved PotPlayer media to full path: '{resolved_path}'")
@@ -258,18 +261,32 @@ class PotPlayerIntegration:
         target_basename = os.path.basename(filename).lower() if filename else None
 
         # Try open file handles first
+        video_handles = []
         try:
             for open_file in process.open_files():
                 candidate_path = open_file.path
                 if not candidate_path:
                     continue
                 candidate_basename = os.path.basename(candidate_path).lower()
+                is_video = os.path.splitext(candidate_basename)[1].lower() in VIDEO_EXTENSIONS
+                if is_video:
+                    video_handles.append(candidate_path)
                 if target_basename:
-                    if candidate_basename == target_basename:
+                    target_stem, target_ext = os.path.splitext(target_basename)
+                    # exact match, or stem match when the title hid the extension (video only,
+                    # so we don't grab a same-named .srt)
+                    if candidate_basename == target_basename or (
+                        is_video and not target_ext
+                        and os.path.splitext(candidate_basename)[0] == target_stem
+                    ):
                         return candidate_path
-                else:
-                    if os.path.splitext(candidate_basename)[1].lower() in VIDEO_EXTENSIONS:
-                        return candidate_path
+                elif is_video:
+                    return candidate_path
+            # log what was open, for diagnosing resolution failures
+            logger.debug(
+                f"PotPlayer open_files() found no match for '{target_basename}'. "
+                f"Open video files: {video_handles or 'none'}"
+            )
         except Exception as exc:  # pragma: no cover - defensive
             if psutil and isinstance(exc, (psutil.AccessDenied, psutil.NoSuchProcess)):
                 logger.debug(f"Access denied enumerating PotPlayer open files: {exc}")
