@@ -10,6 +10,13 @@ import pathlib
 
 logger = logging.getLogger(__name__)
 
+# Bump whenever media *identification* logic changes. The cache is consulted
+# before a fresh search, so a stamped-version mismatch clears it and stale
+# mis-identifications can't persist. This only clears the filename->id lookup
+# cache -- never watch history, Simkl, or Trakt.
+CACHE_VERSION = 2
+
+
 class MediaCache:
     """Cache for storing identified media (movies, TV shows, anime) to avoid repeated searches"""
 
@@ -19,12 +26,22 @@ class MediaCache:
         self.cache = self._load_cache()
 
     def _load_cache(self):
-        """Load the cache from file"""
+        """Load the cache, clearing it if the identification-logic version changed
+        (so stale entries can't bypass improved matching). Only the filename->id
+        lookup cache is affected -- never watch history / Simkl / Trakt."""
         if os.path.exists(self.cache_file):
             try:
-                # Specify encoding for reading JSON
                 with open(self.cache_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                if isinstance(data, dict) and data.get("version") == CACHE_VERSION:
+                    entries = data.get("entries")
+                    if isinstance(entries, dict):
+                        return entries
+                # legacy flat format or a version bump -> drop it so files
+                # re-identify with the current logic
+                logger.info(f"Media cache version changed/legacy; clearing "
+                            f"{self.cache_file} so files re-identify.")
+                return {}
             except json.JSONDecodeError as e:
                 logger.error(f"Error decoding cache file {self.cache_file}: {e}")
             except Exception as e:
@@ -32,11 +49,10 @@ class MediaCache:
         return {}
 
     def _save_cache(self):
-        """Save the cache to file"""
+        """Save the cache to file, stamped with the current logic version."""
         try:
-            # Specify encoding for writing JSON
             with open(self.cache_file, 'w', encoding='utf-8') as f:
-                json.dump(self.cache, f, indent=4) # Add indent for readability
+                json.dump({"version": CACHE_VERSION, "entries": self.cache}, f, indent=4)
         except Exception as e:
             logger.error(f"Error saving cache: {e}")
 
