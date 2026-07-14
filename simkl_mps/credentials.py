@@ -25,8 +25,12 @@ CLIENT_ID_PLACEHOLDER = "SIMKL_CLIENT_ID_PLACEHOLDER"
 CLIENT_SECRET_PLACEHOLDER = "SIMKL_CLIENT_SECRET_PLACEHOLDER"
 # --- End of injected values ---
 
-SIMKL_CLIENT_ID = CLIENT_ID_PLACEHOLDER
-SIMKL_CLIENT_SECRET = CLIENT_SECRET_PLACEHOLDER
+# Patched for source builds: if the build process did NOT inject real values,
+# treat the credentials as empty so get_credentials() falls back to runtime
+# sources (env vars / .simkl_mps.env / .env) instead of sending the literal
+# placeholder to the Simkl API (which returns 412 client_id_failed).
+SIMKL_CLIENT_ID = "" if "PLACEHOLDER" in CLIENT_ID_PLACEHOLDER else CLIENT_ID_PLACEHOLDER
+SIMKL_CLIENT_SECRET = "" if "PLACEHOLDER" in CLIENT_SECRET_PLACEHOLDER else CLIENT_SECRET_PLACEHOLDER
 
 APP_NAME_FOR_PATH = "simkl-mps"
 USER_SUBDIR_FOR_PATH = "kavin"  # Updated from kavinthangavel

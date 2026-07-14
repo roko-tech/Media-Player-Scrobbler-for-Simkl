@@ -74,3 +74,5 @@ testing
 bump_version.bat
 simklapi.txt
 *.bak
+# local dev virtual env (contains user paths)
+.venv/
