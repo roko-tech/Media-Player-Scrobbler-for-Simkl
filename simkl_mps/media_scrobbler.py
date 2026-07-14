@@ -24,6 +24,7 @@ from simkl_mps.simkl_api import (
     get_show_details,
     search_file,
     search_show_by_title,
+    find_tvdb_season_entry,
     add_to_history,
     search_movie
 )
@@ -1120,6 +1121,7 @@ class MediaScrobbler:
             # Existing logic for processing valid results
             if result:
                 result = self._correct_year_mismatch(result, guessit_info, filepath)
+                result = self._resolve_anime_split_season(result, guessit_info, filepath)
                 logger.info(f"SIMKL API returned result for file search: {result}")
                 self._process_simkl_search_result(result, filepath, cache_key, "simkl_search_file")
             else:
@@ -1195,6 +1197,49 @@ class MediaScrobbler:
             return fixed
         except Exception as e:
             logger.error(f"Year-mismatch correction failed for '{filepath}': {e}", exc_info=True)
+            return result
+
+    def _resolve_anime_split_season(self, result, guessit_info, filepath):
+        """For split-cours anime, remap the filename's TVDB season to the correct
+        Simkl entry. Sonarr treats the show as one series with N seasons, but each
+        cour is a separate Simkl title (tagged with mapped_tvdb_seasons). Only
+        touches anime episodes whose season is > 1.
+        """
+        try:
+            if not guessit_info or not isinstance(result, dict) or result.get('type') != 'episode':
+                return result
+            show = result.get('show') or {}
+            ids = show.get('ids') or {}
+            base_id = ids.get('simkl')
+            season = guessit_info.get('season')
+            is_anime = (f"{os.sep}anime{os.sep}" in filepath.lower()
+                        or bool(ids.get('anilist') or ids.get('mal') or ids.get('anidb')))
+            if not (base_id and season and is_anime):
+                return result
+            try:
+                if int(season) <= 1:
+                    return result  # season 1 is the base entry
+            except (TypeError, ValueError):
+                return result
+
+            entry = find_tvdb_season_entry(base_id, season, self.client_id)
+            entry_id = (entry or {}).get('ids', {}).get('simkl')
+            if not entry_id:
+                return result  # base already owns this season, or no match found
+
+            ep_num = guessit_info.get('episode')
+            logger.warning(
+                f"Split-cours anime: '{os.path.basename(filepath)}' S{season} -> "
+                f"'{entry.get('title')}' (simkl {entry_id}) E{ep_num}."
+            )
+            fixed = dict(result)
+            fixed['show'] = {'title': entry.get('title'), 'year': entry.get('year'),
+                             'ids': entry.get('ids')}
+            # the sequel cour is a standalone Simkl title -> its own season 1
+            fixed['episode'] = {'season': 1, 'episode': ep_num}
+            return fixed
+        except Exception as e:
+            logger.error(f"Split-season resolution failed for '{filepath}': {e}", exc_info=True)
             return result
 
     def _handle_offline_identification_fallback(self, filepath, guessit_info, cache_key, retry_attempt=1):

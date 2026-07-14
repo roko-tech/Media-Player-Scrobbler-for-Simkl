@@ -303,6 +303,65 @@ def search_show_by_title(title, year, client_id, is_anime=False):
     logger.info(f"Simkl title search: no {year}-matching result for '{title}'.")
     return None
 
+def find_tvdb_season_entry(base_simkl_id, tvdb_season, client_id):
+    """Split-cours anime: find the Simkl anime entry that owns a given TVDB season.
+
+    Sonarr numbers anime by combined TVDB seasons, but each cour is a separate
+    Simkl title tagged with `mapped_tvdb_seasons` (e.g. Arslan Senki (2015) owns
+    TVDB S1 while its sequel Fuujin Ranbu owns TVDB S2). Starting from the base
+    entry, walk its relation graph until an entry owning `tvdb_season` is found.
+
+    Returns that entry's full detail dict (with 'ids' guaranteed to carry 'simkl',
+    plus 'title'/'year'), or None if the base already owns the season / no match.
+    """
+    if not (base_simkl_id and tvdb_season and client_id) or not is_internet_connected():
+        return None
+    try:
+        want = int(tvdb_season)
+    except (TypeError, ValueError):
+        return None
+
+    def _details(sid):
+        try:
+            resp = requests.get(
+                f'{SIMKL_API_BASE_URL}/anime/{sid}',
+                headers={'simkl-api-key': client_id, 'User-Agent': USER_AGENT},
+                params={'extended': 'full', 'client_id': client_id}, timeout=20,
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except requests.exceptions.RequestException:
+            return None
+
+    def _owns(det):
+        seasons = det.get('mapped_tvdb_seasons') if det else None
+        return isinstance(seasons, list) and want in seasons
+
+    base = _details(base_simkl_id)
+    if not base or _owns(base):
+        return None  # base already covers the season (or lookup failed) -> no remap
+
+    seen = {int(base_simkl_id)}
+    queue = list(base.get('relations') or [])
+    while queue and len(seen) < 15:  # bound the relation walk
+        rid = (queue.pop(0).get('ids') or {}).get('simkl')
+        try:
+            rid = int(rid)
+        except (TypeError, ValueError):
+            continue
+        if rid in seen:
+            continue
+        seen.add(rid)
+        det = _details(rid)
+        if not det:
+            continue
+        if _owns(det):
+            det.setdefault('ids', {})['simkl'] = rid
+            logger.info(f"Split-cours: TVDB season {want} -> '{det.get('title')}' (simkl {rid}).")
+            return det
+        queue.extend(det.get('relations') or [])
+    logger.info(f"Split-cours: no entry owning TVDB season {want} from base {base_simkl_id}.")
+    return None
+
 def add_to_history(payload, client_id, access_token, allow_rewatch=False):
     """
     Adds items (movies, shows, episodes) to the user's Simkl watch history.
