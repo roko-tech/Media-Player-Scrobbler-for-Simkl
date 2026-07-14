@@ -23,6 +23,7 @@ from simkl_mps.simkl_api import (
     get_movie_details,
     get_show_details,
     search_file,
+    search_show_by_title,
     add_to_history,
     search_movie
 )
@@ -1118,6 +1119,7 @@ class MediaScrobbler:
 
             # Existing logic for processing valid results
             if result:
+                result = self._correct_year_mismatch(result, guessit_info, filepath)
                 logger.info(f"SIMKL API returned result for file search: {result}")
                 self._process_simkl_search_result(result, filepath, cache_key, "simkl_search_file")
             else:
@@ -1138,6 +1140,63 @@ class MediaScrobbler:
         except Exception as e:
             logger.error(f"Error during Simkl file identification for '{filepath}': {e}", exc_info=True)
             self._store_guessit_fallback_data(filepath, guessit_info, cache_key) # Fallback on other errors    
+    def _correct_year_mismatch(self, result, guessit_info, filepath):
+        """Guard against Simkl /search/file returning the wrong title.
+
+        The file matcher is fuzzy and can pick the wrong adaptation (e.g. the 1991
+        vs 2015 anime of the same name, which also flattens S02->S01). If the
+        matched show's year disagrees with the year parsed from the filename,
+        re-resolve by title+year via Simkl's title-search endpoints and substitute
+        the correct show (taking season/episode from the filename). If no
+        year-matching result is found, the original match is kept unchanged.
+        """
+        try:
+            if not guessit_info or not isinstance(result, dict):
+                return result
+            if result.get('type') not in ('episode', 'show'):
+                return result
+            show = result.get('show') or {}
+            sy, gy = show.get('year'), guessit_info.get('year')
+            if not (sy and gy) or abs(int(sy) - int(gy)) <= 1:
+                return result  # years agree (or unknown) -> trust the file match
+
+            ids = show.get('ids') or {}
+            is_anime = (f"{os.sep}anime{os.sep}" in filepath.lower()
+                        or bool(ids.get('anilist') or ids.get('mal') or ids.get('anidb')))
+            corrected = search_show_by_title(guessit_info.get('title'), gy, self.client_id, is_anime)
+            if not corrected or not (corrected.get('ids') or {}).get('simkl'):
+                logger.warning(
+                    f"Year mismatch on '{os.path.basename(filepath)}': /search/file gave "
+                    f"'{show.get('title')}' ({sy}) but the filename says {gy}, and no "
+                    f"{gy}-matching title result was found - keeping the original match."
+                )
+                return result
+
+            logger.warning(
+                f"Corrected wrong /search/file match for '{os.path.basename(filepath)}': "
+                f"'{show.get('title')}' ({sy}) -> '{corrected.get('title')}' "
+                f"({corrected.get('year')}) [filename year {gy}]."
+            )
+            fixed = dict(result)
+            fixed['show'] = {
+                'title': corrected.get('title'),
+                'year': corrected.get('year'),
+                'ids': corrected.get('ids'),
+            }
+            # /search/file's season/episode belonged to the wrong show; take them
+            # from the filename instead (episode-specific id no longer applies).
+            ep = {}
+            if guessit_info.get('season') is not None:
+                ep['season'] = guessit_info.get('season')
+            if guessit_info.get('episode') is not None:
+                ep['episode'] = guessit_info.get('episode')
+            if ep:
+                fixed['episode'] = ep
+            return fixed
+        except Exception as e:
+            logger.error(f"Year-mismatch correction failed for '{filepath}': {e}", exc_info=True)
+            return result
+
     def _handle_offline_identification_fallback(self, filepath, guessit_info, cache_key, retry_attempt=1):
         """Handles offline identification using guessit with retry mechanism."""
         max_retries = 3

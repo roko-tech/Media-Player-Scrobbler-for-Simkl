@@ -261,6 +261,48 @@ def search_file(file_path, client_id, part=None):
         logger.error(f"Simkl API: Network error during file search for '{file_path}': {e}", exc_info=True)
         return None
 
+def search_show_by_title(title, year, client_id, is_anime=False):
+    """Resolve a show/anime by title + year via Simkl's title-search endpoints.
+
+    Used to correct wrong /search/file matches (e.g. the file matcher picking the
+    1991 vs 2015 adaptation of an anime that share a title). Returns the first
+    result whose year matches `year` (within 1), as {'title', 'year', 'ids'} with
+    ids normalised to the 'simkl' key, or None if no year-matching result is found
+    (in which case the caller should keep its original match rather than guess).
+    """
+    if not is_internet_connected() or not client_id or not title or not year:
+        return None
+    headers = {'Content-Type': 'application/json', 'simkl-api-key': client_id, 'User-Agent': USER_AGENT}
+    # anime-first for anime paths, else tv-first; try both so cross-listed titles still resolve
+    endpoints = ['anime', 'tv'] if is_anime else ['tv', 'anime']
+    for ep in endpoints:
+        try:
+            response = requests.get(
+                f'{SIMKL_API_BASE_URL}/search/{ep}',
+                headers=headers,
+                params={'q': title, 'client_id': client_id, 'app-name': APP_NAME,
+                        'app-version': __version__, 'extended': 'full'},
+                timeout=20,
+            )
+            if response.status_code != 200:
+                continue
+            for item in (response.json() or []):
+                iy = item.get('year')
+                try:
+                    if iy and abs(int(iy) - int(year)) <= 1:
+                        ids = dict(item.get('ids') or {})
+                        if 'simkl_id' in ids and 'simkl' not in ids:
+                            ids['simkl'] = ids.pop('simkl_id')
+                        logger.info(f"Simkl title search (/search/{ep}): '{title}' ({year}) -> "
+                                    f"'{item.get('title')}' ({iy}), simkl={ids.get('simkl')}")
+                        return {'title': item.get('title'), 'year': iy, 'ids': ids}
+                except (ValueError, TypeError):
+                    continue
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"Simkl title search /search/{ep} failed for '{title}': {e}")
+    logger.info(f"Simkl title search: no {year}-matching result for '{title}'.")
+    return None
+
 def add_to_history(payload, client_id, access_token, allow_rewatch=False):
     """
     Adds items (movies, shows, episodes) to the user's Simkl watch history.
