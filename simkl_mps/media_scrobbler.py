@@ -30,6 +30,7 @@ from simkl_mps.simkl_api import (
 )
 from simkl_mps.backlog_cleaner import BacklogCleaner
 from simkl_mps.window_detection import parse_movie_title, parse_filename_from_path, is_video_player
+from simkl_mps import anime_mapping
 from simkl_mps.media_cache import MediaCache
 
 logger = logging.getLogger(__name__)
@@ -1222,19 +1223,28 @@ class MediaScrobbler:
             except (TypeError, ValueError):
                 return result
 
-            entry = find_tvdb_season_entry(base_id, season, self.client_id)
-            entry_id = (entry or {}).get('ids', {}).get('simkl')
+            # Fribb/anime-lists offline map first (deterministic, same data Sonarr
+            # uses); Simkl relation-walk as a fallback for anything not indexed.
+            entry_id = anime_mapping.resolve_split_season(base_id, season)
+            entry_ids = {'simkl': entry_id} if entry_id else None
+            entry_title = show.get('title')
             if not entry_id:
+                entry = find_tvdb_season_entry(base_id, season, self.client_id)
+                entry_id = (entry or {}).get('ids', {}).get('simkl')
+                entry_ids = (entry or {}).get('ids')
+                entry_title = (entry or {}).get('title', entry_title)
+            if not entry_id or int(entry_id) == int(base_id):
                 return result  # base already owns this season, or no match found
 
             ep_num = guessit_info.get('episode')
             logger.warning(
                 f"Split-cours anime: '{os.path.basename(filepath)}' S{season} -> "
-                f"'{entry.get('title')}' (simkl {entry_id}) E{ep_num}."
+                f"simkl {entry_id} E{ep_num}."
             )
             fixed = dict(result)
-            fixed['show'] = {'title': entry.get('title'), 'year': entry.get('year'),
-                             'ids': entry.get('ids')}
+            # only the corrected simkl id is needed; _process_simkl_search_result
+            # fetches the entry's full details (title, ids, runtime) from it.
+            fixed['show'] = {'title': entry_title, 'ids': entry_ids}
             # the sequel cour is a standalone Simkl title -> its own season 1
             fixed['episode'] = {'season': 1, 'episode': ep_num}
             return fixed
