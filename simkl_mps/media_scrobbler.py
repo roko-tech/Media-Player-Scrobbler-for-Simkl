@@ -1207,7 +1207,12 @@ class MediaScrobbler:
         touches anime episodes whose season is > 1.
         """
         try:
-            if not guessit_info or not isinstance(result, dict) or result.get('type') != 'episode':
+            # /search/file returns either shape for the same show, so accept both
+            # (matching _correct_year_mismatch) -- gating on 'episode' alone let
+            # 'show'-shaped matches skip the remap and hit a season the base
+            # entry doesn't have, which Simkl silently drops.
+            if (not guessit_info or not isinstance(result, dict)
+                    or result.get('type') not in ('episode', 'show')):
                 return result
             show = result.get('show') or {}
             ids = show.get('ids') or {}

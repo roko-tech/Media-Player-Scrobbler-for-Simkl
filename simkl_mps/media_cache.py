@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # before a fresh search, so a stamped-version mismatch clears it and stale
 # mis-identifications can't persist. This only clears the filename->id lookup
 # cache -- never watch history, Simkl, or Trakt.
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 class MediaCache:
