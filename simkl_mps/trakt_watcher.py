@@ -22,6 +22,87 @@ class TraktSyncWatcher:
     def configured(self):
         return trakt_sync.CONFIG_FILE.exists() and trakt_sync.TOKEN_FILE.exists()
 
+    @property
+    def running(self):
+        return bool(self._thread and self._thread.is_alive())
+
+    @staticmethod
+    def _format_time(value):
+        if not value:
+            return "never"
+        try:
+            return trakt_sync.parse_dt(value).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except (TypeError, ValueError):
+            return "unknown"
+
+    @staticmethod
+    def _media_label(event, include_title):
+        if not event:
+            return "none"
+        title = event.get("title") if include_title else None
+        if event.get("kind") == "movie":
+            return title or "movie"
+        episode = trakt_sync._int(event.get("episode"))
+        if event.get("is_anime"):
+            suffix = f"E{episode:02d}" if episode else "episode"
+        else:
+            season = trakt_sync._int(event.get("season"))
+            suffix = f"S{season:02d}E{episode:02d}" if season and episode else "episode"
+        return f"{title} - {suffix}" if title else suffix
+
+    def health_report(self, include_title=True):
+        """Build a local panel or a redacted, shareable diagnostic report."""
+        try:
+            snapshot = trakt_sync.get_sync_health()
+        except trakt_sync.TraktSyncError as exc:
+            logger.warning("Could not read Trakt sync health: %s", exc)
+            snapshot = {"latest_event": None, "pending": 0, "health": {}}
+
+        latest = snapshot.get("latest_event")
+        simkl_pending = snapshot.get("simkl_pending", 0)
+        health = snapshot.get("health") or {}
+        last_ok = health.get("last_ok")
+        trakt_status = "not run" if last_ok is None else ("OK" if last_ok else "ERROR")
+        if simkl_pending:
+            simkl_status = "pending retry"
+        else:
+            simkl_status = "accepted" if latest else "not run"
+        lines = [
+            "MEDIA SYNC HEALTH",
+            "",
+            f"Watcher: {'running' if self.running else 'stopped'}",
+            f"Configuration: {'ready' if self.configured else 'not configured'}",
+            "",
+            "SIMKL",
+            f"Status: {simkl_status}",
+            f"Latest: {self._media_label(latest, include_title)}",
+            f"Completed: {self._format_time(latest.get('watched_at') if latest else None)}",
+            f"Pending retries: {simkl_pending}",
+            "",
+            "TRAKT",
+            f"Status: {trakt_status}",
+        ]
+        if include_title:
+            lines.append(f"Last result: {health.get('last_summary') or self.last_summary}")
+        if health.get("last_http_status") is not None:
+            lines.extend(
+                [
+                    f"Last response: HTTP {health['last_http_status']}",
+                    "Added: "
+                    f"{health.get('last_added_episodes', 0)} episode(s), "
+                    f"{health.get('last_added_movies', 0)} movie(s)",
+                    f"Not found: {health.get('last_not_found', 0)}",
+                ]
+            )
+        lines.extend(
+            [
+                f"Pending retries: {snapshot.get('pending', 0)}",
+                f"Last success: {self._format_time(health.get('last_success_at'))}",
+                f"Last attempt: {self._format_time(health.get('last_attempt_at'))}",
+            ]
+        )
+        return "\n".join(lines)
+
     def start(self):
         if self._thread and self._thread.is_alive():
             return True

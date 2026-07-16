@@ -736,6 +736,44 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         watcher = self._get_trakt_watcher()
         return getattr(watcher, "last_summary", "not running") if watcher else "not running"
 
+    def show_sync_health(self, _=None):
+        watcher = self._get_trakt_watcher()
+        report = watcher.health_report(include_title=True) if watcher else "Sync health is not available."
+        self._show_info_dialog("Media Sync Health", report)
+        return 0
+
+    def _copy_text_to_clipboard(self, text):
+        def copy_with_root(root):
+            root.clipboard_clear()
+            root.clipboard_append(text)
+            root.update()
+            return True
+
+        if hasattr(self, "_run_on_tk_thread"):
+            return bool(
+                self._run_on_tk_thread(
+                    lambda: copy_with_root(self._tk_root), default=False
+                )
+            )
+
+        root = tk.Tk()
+        try:
+            root.withdraw()
+            return copy_with_root(root)
+        finally:
+            root.destroy()
+
+    def copy_sync_diagnostics(self, _=None):
+        watcher = self._get_trakt_watcher()
+        if not watcher:
+            self.show_notification("Sync Health", "Sync diagnostics are not available.")
+            return 1
+        if self._copy_text_to_clipboard(watcher.health_report(include_title=False)):
+            self.show_notification("Sync Health", "Safe diagnostics copied to the clipboard.")
+            return 0
+        self.show_notification("Sync Health", "Could not copy diagnostics.")
+        return 1
+
     def sync_trakt_now(self, _=None):
         """Run the integrated Trakt bridge without blocking the tray UI."""
         watcher = self._get_trakt_watcher()
@@ -1316,12 +1354,14 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                 None,
                 enabled=False,
             ),
+            pystray.MenuItem("Sync Health...", self.show_sync_health),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "Sync Now",
+                "Retry / Sync Now",
                 self.sync_trakt_now,
                 enabled=bool(trakt_watcher and trakt_watcher.configured),
             ),
+            pystray.MenuItem("Copy Safe Diagnostics", self.copy_sync_diagnostics),
             pystray.MenuItem("Open Website", self.open_trakt),
         )))
 

@@ -31,6 +31,7 @@ CONFIG_FILE = APP_DATA_DIR / "trakt_config.json"
 TOKEN_FILE = APP_DATA_DIR / "trakt_token.json"
 STATE_FILE = APP_DATA_DIR / "trakt_sync_state.json"
 HISTORY_FILE = APP_DATA_DIR / "watch_history.json"
+SIMKL_BACKLOG_FILE = APP_DATA_DIR / "backlog.json"
 FRIBB_FILE = APP_DATA_DIR / "anime-list-full.json"
 
 
@@ -77,6 +78,63 @@ def iso(value):
     return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
         "+00:00", "Z"
     )
+
+
+def _record_health(
+    state,
+    summary,
+    ok,
+    *,
+    http_status=None,
+    added_movies=0,
+    added_episodes=0,
+    not_found=0,
+    pending=0,
+):
+    """Persist secret-free sync diagnostics alongside the durable queue state."""
+    health = dict(state.get("health") or {})
+    health.update(
+        {
+            "last_attempt_at": iso(now_utc()),
+            "last_ok": bool(ok),
+            "last_summary": summary,
+            "last_pending": int(pending),
+        }
+    )
+    if http_status is not None:
+        health.update(
+            {
+                "last_http_status": int(http_status),
+                "last_added_movies": int(added_movies),
+                "last_added_episodes": int(added_episodes),
+                "last_not_found": int(not_found),
+            }
+        )
+        if ok:
+            health["last_success_at"] = iso(now_utc())
+    state["health"] = health
+    save_json(STATE_FILE, state)
+
+
+def get_sync_health():
+    """Return structured health data without credentials, IDs, or file paths."""
+    state = load_json(STATE_FILE, {}) or {}
+    history = load_json(HISTORY_FILE, []) or []
+    backlog = load_json(SIMKL_BACKLOG_FILE, {}) or {}
+    events = collect_history_events(history, None)
+    latest = events[-1] if events else None
+    if latest:
+        latest = {
+            key: latest.get(key)
+            for key in ("kind", "title", "season", "episode", "watched_at", "is_anime")
+        }
+    return {
+        "latest_event": latest,
+        "simkl_pending": len(backlog) if isinstance(backlog, (dict, list)) else 0,
+        "pending": len(state.get("pending") or []),
+        "synced_through": state.get("synced_through"),
+        "health": dict(state.get("health") or {}),
+    }
 
 
 def _int(value):
@@ -446,6 +504,9 @@ def sync_history(since=None, dry_run=False):
             ensure_state()
         summary = "Trakt sync initialized. New watch events will sync automatically."
         logger.info(summary)
+        if not dry_run:
+            state = load_json(STATE_FILE, {}) or {}
+            _record_health(state, summary, True, pending=0)
         return SyncResult(True, summary)
 
     history = load_json(HISTORY_FILE, []) or []
@@ -462,6 +523,8 @@ def sync_history(since=None, dry_run=False):
     if not events:
         summary = f"Trakt: nothing new after {iso(marker)}."
         logger.info(summary)
+        if not dry_run:
+            _record_health(state, summary, True, pending=0)
         return SyncResult(True, summary)
 
     client_id = get_credentials().get("client_id")
@@ -485,13 +548,24 @@ def sync_history(since=None, dry_run=False):
         )
         summary = f"Trakt: no matchable events; {len(unresolved)} queued for retry."
         logger.warning(summary)
+        state = load_json(STATE_FILE, {}) or {}
+        _record_health(state, summary, False, pending=len(unresolved))
         return SyncResult(False, summary, pending=len(unresolved))
 
-    config = trakt_config()
-    status, body = push_trakt(config, trakt_token(config), payload)
+    try:
+        config = trakt_config()
+        token = trakt_token(config)
+    except (KeyError, TraktSyncError) as exc:
+        logger.error("Trakt setup or authorization failed: %s", exc)
+        summary = "Trakt setup or authorization failed. Open logs for details."
+        _record_health(state, summary, False, pending=len(events))
+        return SyncResult(False, summary, pending=len(events))
+
+    status, body = push_trakt(config, token, payload)
     if status is None:
         summary = "Trakt push failed after retries; state was not advanced."
         logger.error(summary)
+        _record_health(state, summary, False, pending=len(events))
         return SyncResult(False, summary, pending=len(events))
 
     added = (body or {}).get("added", {})
@@ -511,6 +585,16 @@ def sync_history(since=None, dry_run=False):
     if status not in (200, 201):
         summary = f"Trakt returned HTTP {status}; state was not advanced."
         logger.error(summary)
+        _record_health(
+            state,
+            summary,
+            False,
+            http_status=status,
+            added_movies=added.get("movies", 0),
+            added_episodes=added.get("episodes", 0),
+            not_found=not_found_count,
+            pending=len(events),
+        )
         return SyncResult(False, summary, pending=len(events))
 
     retry_events = unresolved + (events if not_found_count else [])
@@ -527,4 +611,15 @@ def sync_history(since=None, dry_run=False):
         f"+{added.get('movies', 0)} movie(s); {len(retry_events)} pending."
     )
     logger.info(summary)
+    state = load_json(STATE_FILE, {}) or state
+    _record_health(
+        state,
+        summary,
+        True,
+        http_status=status,
+        added_movies=added.get("movies", 0),
+        added_episodes=added.get("episodes", 0),
+        not_found=not_found_count,
+        pending=len(retry_events),
+    )
     return SyncResult(True, summary, pushed=True, pending=len(retry_events))

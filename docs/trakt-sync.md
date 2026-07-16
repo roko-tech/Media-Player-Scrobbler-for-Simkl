@@ -35,8 +35,14 @@ simkl-mps trakt-sync --dry-run
 simkl-mps trakt-sync --since 2026-07-14
 ```
 
-The tray menu also contains **Trakt → Sync Now**. Automatic syncing starts with
-the normal Simkl tray; no second watcher process or tray icon is required.
+The tray menu also contains **Trakt → Retry / Sync Now** and **Sync Health**.
+Sync Health shows the latest Simkl-accepted watch, separate Simkl and Trakt
+pending counts, the last Trakt HTTP response, added/not-found counts, and the
+last attempt and success times. **Copy Safe Diagnostics** omits media titles,
+service IDs, file paths, and credentials so its output can be shared safely.
+
+Automatic syncing starts with the normal Simkl tray; no second watcher process
+or tray icon is required.
 
 ## Letterboxd
 
