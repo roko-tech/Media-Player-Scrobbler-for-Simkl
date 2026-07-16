@@ -17,6 +17,7 @@
 - 🔌 **Offline Support** – Queues updates when offline
 - 🧠 **Smart Media Detection** – Intelligent filename parsing
 - 🍿 **Media-Focused** – Optimized for every type of media (Movies,TV Shows and Anime)
+- ✅ **Optional Trakt Sync** – Pushes the same completed watches from local history to Trakt
 
 ## ⚡ Quick Start
 
@@ -25,6 +26,8 @@
 - **macOS:** Use the [Mac Guide](docs/mac-guide.md) (pip install, tray app, setup command needed, untested).
 
 After installation, authenticate with SIMKL and **configure your media players** using the [Media Players Guide](docs/media-players.md) (this step is critical for accurate tracking).
+
+To keep Trakt current from the same tray process, see the [Automatic Trakt Sync Guide](docs/trakt-sync.md).
 
 
 ## 🔍 How It Works
@@ -35,6 +38,7 @@ graph LR
     B -->|Parse Title| C[Media Identification]
     C -->|Track Progress| D[Simkl API]
     D -->|Mark as Watched| E[Simkl Profile]
+    D -->|Completed local event| F[Trakt History]
     
     style A fill:#d5f5e3,stroke:#333,stroke-width:2px
     style E fill:#d5f5e3,stroke:#333,stroke-width:2px

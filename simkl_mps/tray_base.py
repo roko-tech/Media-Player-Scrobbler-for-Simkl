@@ -729,6 +729,35 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                 f"Could not open log file: {e}"
             )
 
+    def _get_trakt_watcher(self):
+        return getattr(self.scrobbler, "trakt_watcher", None) if self.scrobbler else None
+
+    def get_trakt_status_text(self):
+        watcher = self._get_trakt_watcher()
+        return getattr(watcher, "last_summary", "not running") if watcher else "not running"
+
+    def sync_trakt_now(self, _=None):
+        """Run the integrated Trakt bridge without blocking the tray UI."""
+        watcher = self._get_trakt_watcher()
+        if not watcher:
+            self.show_notification("simkl-mps", "Trakt sync is not running.")
+            return 0
+
+        def run_sync():
+            result = watcher.sync_now()
+            self.show_notification("Trakt Sync", result.summary)
+            try:
+                self.update_icon()
+            except Exception:
+                logger.debug("Could not refresh tray menu after Trakt sync", exc_info=True)
+
+        threading.Thread(target=run_sync, name="trakt-sync-manual", daemon=True).start()
+        return 0
+
+    def open_trakt(self, _=None):
+        webbrowser.open("https://trakt.tv/")
+        return 0
+
     def start_monitoring(self, _=None):
         """Start the scrobbler monitoring"""
         # Check if this is a manual start (from the menu) vs. autostart
@@ -1279,6 +1308,23 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             pystray.MenuItem("Open Watch History", self.open_simkl_history),
         )))
 
+        # --- Trakt submenu ---
+        trakt_watcher = self._get_trakt_watcher()
+        menu_items.append(pystray.MenuItem("Trakt", pystray.Menu(
+            pystray.MenuItem(
+                lambda item: f"Status: {self.get_trakt_status_text()}",
+                None,
+                enabled=False,
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Sync Now",
+                self.sync_trakt_now,
+                enabled=bool(trakt_watcher and trakt_watcher.configured),
+            ),
+            pystray.MenuItem("Open Website", self.open_trakt),
+        )))
+
         # --- Maintenance submenu ---
         menu_items.append(pystray.MenuItem("Maintenance", pystray.Menu(
             pystray.MenuItem("Open Logs", self.open_logs),
@@ -1484,6 +1530,20 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                 except (PermissionError, OSError) as e:
                     logger.warning(f"Could not delete settings file: {e}")
                     failed_items.append("settings file")
+
+            # Clear optional Trakt integration credentials and state.
+            for trakt_path in (
+                APP_DATA_DIR / "trakt_config.json",
+                APP_DATA_DIR / "trakt_token.json",
+                APP_DATA_DIR / "trakt_sync_state.json",
+            ):
+                if trakt_path.exists():
+                    try:
+                        trakt_path.unlink()
+                        cleared_items.append(trakt_path.name)
+                    except (PermissionError, OSError) as e:
+                        logger.warning(f"Could not delete {trakt_path.name}: {e}")
+                        failed_items.append(trakt_path.name)
             
             # Clear in-memory cache and reset tracked media in scrobbler if running
             if self.scrobbler:

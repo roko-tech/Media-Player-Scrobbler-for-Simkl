@@ -15,6 +15,7 @@ from simkl_mps.monitor import Monitor
 from simkl_mps.credentials import get_credentials
 from simkl_mps.config_manager import get_app_data_dir, initialize_paths, get_setting, APP_NAME
 from simkl_mps.watch_history_manager import WatchHistoryManager # Added import
+from simkl_mps.trakt_watcher import TraktSyncWatcher
 
 # Import platform-specific tray implementation
 # Only import get_tray_app, do not import TrayApp or run_tray_app directly
@@ -122,6 +123,7 @@ class SimklScrobbler:
         self.access_token = None
         self.monitor = Monitor(app_data_dir=APP_DATA_DIR)
         self.watch_history_manager = None # Added instance variable
+        self.trakt_watcher = TraktSyncWatcher()
         logger.debug("SimklScrobbler instance created.")
 
     def initialize(self):
@@ -200,6 +202,10 @@ class SimklScrobbler:
         logger.info("Starting background backlog synchronization thread...")
         self.monitor.scrobbler.start_offline_sync_thread() # Use default interval
 
+        # Trakt is optional. When configured, the same tray process watches the
+        # local history file and pushes exact completed-watch events.
+        self.trakt_watcher.start()
+
         return True
 
     def stop(self):
@@ -210,6 +216,7 @@ class SimklScrobbler:
 
         logger.info("Initiating scrobbler shutdown...")
         self.running = False
+        self.trakt_watcher.stop()
         self.monitor.stop()
         logger.info("Scrobbler shutdown complete.")
 

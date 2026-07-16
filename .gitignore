@@ -19,6 +19,9 @@ ENV/
 
 # Environment files with sensitive data
 .env
+trakt_config.json
+trakt_token.json
+trakt_sync_state.json
 
 # Logs
 *.log
@@ -76,3 +79,4 @@ simklapi.txt
 *.bak
 # local dev virtual env (contains user paths)
 .venv/
+.testtmp*/

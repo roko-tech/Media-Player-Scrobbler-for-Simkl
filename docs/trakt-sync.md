@@ -1,0 +1,46 @@
+# Automatic Trakt sync
+
+This fork can keep Trakt current from the same tray process that scrobbles to
+Simkl. After Simkl accepts a completed watch, the app reads the exact event from
+its local `watch_history.json` and sends it to Trakt. Events Trakt cannot match
+are retained in `trakt_sync_state.json` and retried later.
+
+## One-time setup
+
+1. Create a Trakt API application at <https://trakt.tv/oauth/applications>.
+2. In the app data folder shown by `simkl-mps version`, create
+   `trakt_config.json`:
+
+   ```json
+   {
+     "client_id": "YOUR_TRAKT_CLIENT_ID",
+     "client_secret": "YOUR_TRAKT_CLIENT_SECRET"
+   }
+   ```
+
+3. Authorize it once:
+
+   ```text
+   simkl-mps trakt-auth
+   ```
+
+The config, OAuth token, sync state, and watch history live in the app data
+folder. They are never stored in this Git repository.
+
+## Commands
+
+```text
+simkl-mps trakt-sync
+simkl-mps trakt-sync --dry-run
+simkl-mps trakt-sync --since 2026-07-14
+```
+
+The tray menu also contains **Trakt → Sync Now**. Automatic syncing starts with
+the normal Simkl tray; no second watcher process or tray icon is required.
+
+## Letterboxd
+
+Letterboxd exposes write endpoints only to approved API clients. Its API access
+form says private/personal projects are not currently accepted, so this project
+does not include an unsupported browser-scraping login. The old CSV importer can
+remain as a separate manual archive if needed.

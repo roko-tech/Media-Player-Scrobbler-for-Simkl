@@ -290,6 +290,28 @@ def version_command(args):
     print(f"\nData directory: {APP_DATA_DIR}")
     return 0
 
+def trakt_auth_command(args):
+    """Authorize the optional integrated Trakt history sync."""
+    try:
+        from simkl_mps.trakt_sync import authenticate
+        authenticate()
+        return 0
+    except Exception as e:
+        logger.exception("Trakt authorization failed: %s", e)
+        print(f"{Fore.RED}ERROR: {e}{Style.RESET_ALL}", file=sys.stderr)
+        return 1
+
+def trakt_sync_command(args):
+    """Run the integrated Simkl local-history -> Trakt sync once."""
+    try:
+        from simkl_mps.trakt_sync import sync_history
+        result = sync_history(since=args.since, dry_run=args.dry_run)
+        return 0 if result.ok else 1
+    except Exception as e:
+        logger.exception("Trakt sync failed: %s", e)
+        print(f"{Fore.RED}ERROR: {e}{Style.RESET_ALL}", file=sys.stderr)
+        return 1
+
 def check_for_updates(silent=False):
     """
     Check for updates to the application.
@@ -567,6 +589,22 @@ def create_parser():
         aliases=['e', 'stop', 'quit'],
         help="Stop all running instances of the application and terminate all background activities."
     )
+
+    subparsers.add_parser(
+        "trakt-auth",
+        help="Authorize the optional integrated Trakt history sync."
+    )
+
+    trakt_sync_parser = subparsers.add_parser(
+        "trakt-sync",
+        help="Push local completed-watch events to Trakt now."
+    )
+    trakt_sync_parser.add_argument(
+        "--since", metavar="YYYY-MM-DD", help="Backfill local watch events from this UTC date."
+    )
+    trakt_sync_parser.add_argument(
+        "--dry-run", action="store_true", help="Preview the payload without writing to Trakt."
+    )
     
     return parser
 
@@ -636,6 +674,8 @@ def main():
         "tray": tray_command,
         "version": version_command,
         "exit": exit_command,
+        "trakt-auth": trakt_auth_command,
+        "trakt-sync": trakt_sync_command,
         "help": lambda _: parser.print_help()
     }
 
