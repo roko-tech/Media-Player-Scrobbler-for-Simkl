@@ -1,7 +1,57 @@
 import json
+import threading
 
 from simkl_mps import trakt_sync
 from simkl_mps.trakt_watcher import TraktSyncWatcher
+from simkl_mps.watch_history_manager import WatchHistoryManager
+
+
+def test_history_save_callback_runs_after_completed_event_is_on_disk(tmp_path, monkeypatch):
+    monkeypatch.setattr(WatchHistoryManager, "_ensure_viewer_exists", lambda self: None)
+    manager = WatchHistoryManager(tmp_path)
+    observed = []
+
+    def on_saved():
+        observed.extend(json.loads(manager.history_file.read_text(encoding="utf-8")))
+
+    manager.set_on_saved(on_saved)
+    assert manager.add_entry(
+        {
+            "simkl_id": 42,
+            "title": "Example",
+            "type": "show",
+            "season": 1,
+            "episode": 2,
+            "ids": {"tvdb": 123},
+        }
+    )
+
+    assert observed[0]["simkl_id"] == 42
+    assert observed[0]["episode"] == 2
+
+
+def test_history_saved_notification_wakes_trakt_without_waiting_for_poll(monkeypatch):
+    watcher = TraktSyncWatcher(poll_seconds=60, debounce_seconds=0)
+    calls = 0
+    startup_done = threading.Event()
+    direct_done = threading.Event()
+
+    def fake_sync_now():
+        nonlocal calls
+        calls += 1
+        (startup_done if calls == 1 else direct_done).set()
+        return trakt_sync.SyncResult(True, "ok")
+
+    monkeypatch.setattr(watcher, "sync_now", fake_sync_now)
+    watcher._thread = threading.Thread(target=watcher._watch_loop, daemon=True)
+    watcher._thread.start()
+    try:
+        assert startup_done.wait(1)
+        watcher.notify_history_saved()
+        assert direct_done.wait(1)
+        assert calls == 2
+    finally:
+        watcher.stop()
 
 
 def test_build_payload_uses_exact_local_events_and_remaps_anime(monkeypatch):

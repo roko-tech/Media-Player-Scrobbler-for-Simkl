@@ -21,6 +21,7 @@ class WatchHistoryManager:
     def __init__(self, app_data_dir: pathlib.Path, history_file="watch_history.json"):
         self.app_data_dir = app_data_dir
         self.history_file = self.app_data_dir / history_file
+        self._on_saved = None
         self.history = self._load_history()
         if self.history is None:
             logger.error("Failed to load history, initializing to empty list.")
@@ -28,6 +29,18 @@ class WatchHistoryManager:
         
         # Make sure we have the viewer files in the app_data_dir
         self._ensure_viewer_exists()
+
+    def set_on_saved(self, callback):
+        """Set a callback that runs after a completed-watch event is saved."""
+        self._on_saved = callback
+
+    def _notify_saved(self):
+        if not self._on_saved:
+            return
+        try:
+            self._on_saved()
+        except Exception:
+            logger.exception("Watch-history saved callback failed")
         
     def _load_history(self):
         """Load the history from file, creating the file if it does not exist."""
@@ -114,8 +127,10 @@ class WatchHistoryManager:
             self.history.append(media_info)
             logger.info(f"Added '{media_info['title']}' to watch history")
             
-        self._save_history()
-        return True
+        saved = self._save_history()
+        if saved:
+            self._notify_saved()
+        return saved
 
     def get_history(self, limit=None, offset=0, sort_by="watched_at", sort_order="desc"):
         """
@@ -574,7 +589,10 @@ class WatchHistoryManager:
         if max_history > 0 and len(self.history) > max_history:
             self.history = self.history[:max_history]
         
-        return self._save_history()
+        saved = self._save_history()
+        if saved:
+            self._notify_saved()
+        return saved
     
     def _get_file_metadata(self, file_path):
         """Extract metadata from media file"""

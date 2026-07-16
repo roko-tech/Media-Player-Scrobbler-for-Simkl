@@ -9,6 +9,7 @@ import logging
 import os
 from dotenv import dotenv_values
 from .migration import get_app_data_dir, perform_full_migration
+from .secure_store import is_protected, protect_secret, unprotect_secret
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +49,44 @@ except Exception as e:
 DEV_CREDS_PATH = pathlib.Path(".env")
 
 
+def _replace_env_values(path, replacements):
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    remaining = dict(replacements)
+    for index, line in enumerate(lines):
+        key = line.split("=", 1)[0].strip() if "=" in line else None
+        if key in remaining:
+            ending = "\n" if line.endswith("\n") else ""
+            lines[index] = f"{key}={remaining.pop(key)}{ending}"
+    for key, value in remaining.items():
+        lines.append(f"{key}={value}\n")
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text("".join(lines), encoding="utf-8")
+    temp.replace(path)
+
+
+def _load_secure_env(path, migrate=True):
+    config = dict(dotenv_values(path))
+    replacements = {}
+    for key in ("SIMKL_CLIENT_SECRET", "SIMKL_ACCESS_TOKEN"):
+        stored = config.get(key)
+        if not stored:
+            continue
+        config[key] = unprotect_secret(stored)
+        if migrate and os.name == "nt" and not is_protected(stored):
+            replacements[key] = protect_secret(stored)
+    if replacements:
+        try:
+            _replace_env_values(path, replacements)
+            logger.info("Protected plaintext Simkl secrets with Windows DPAPI.")
+        except OSError as exc:
+            logger.warning("Could not migrate Simkl secrets to DPAPI yet: %s", exc)
+    return config
+
+
 SIMKL_ACCESS_TOKEN = None
 if ENV_FILE_PATH.exists():
     logger.debug(f"Loading access token from {ENV_FILE_PATH}")
-    config = dotenv_values(ENV_FILE_PATH)
+    config = _load_secure_env(ENV_FILE_PATH)
     SIMKL_ACCESS_TOKEN = config.get("SIMKL_ACCESS_TOKEN")
     if not SIMKL_ACCESS_TOKEN:
         logger.warning(f"Found env file at {ENV_FILE_PATH}, but SIMKL_ACCESS_TOKEN key is missing or empty.")
@@ -100,7 +135,7 @@ def get_credentials():
         env_file_path = get_env_file_path()
         if (not client_id or not client_secret) and env_file_path.exists():
             logger.debug(f"Loading runtime credentials from {env_file_path}")
-            runtime_config = dotenv_values(env_file_path)
+            runtime_config = _load_secure_env(env_file_path)
             
             runtime_client_id = runtime_config.get("SIMKL_CLIENT_ID")
             runtime_client_secret = runtime_config.get("SIMKL_CLIENT_SECRET")
@@ -130,7 +165,7 @@ def get_credentials():
     env_file_path = get_env_file_path()
     if env_file_path.exists():
         logger.debug(f"Reading credentials from {env_file_path} inside get_credentials()")
-        config = dotenv_values(env_file_path)
+        config = _load_secure_env(env_file_path)
 
         access_token = config.get("SIMKL_ACCESS_TOKEN")
         user_id = config.get("SIMKL_USER_ID")

@@ -1,0 +1,37 @@
+name: Windows Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest ruff
+
+      - name: Lint maintained integration code
+        run: python -m ruff check simkl_mps/anime_mapping.py simkl_mps/trakt_sync.py simkl_mps/trakt_watcher.py simkl_mps/media_overrides.py simkl_mps/secure_store.py tests
+
+      - name: Run tests
+        run: python -m pytest tests -q

@@ -905,6 +905,7 @@ def _save_access_token(env_path, access_token, user_id=None, account_type=None, 
     """
     try:
         from pathlib import Path
+        from simkl_mps.secure_store import protect_secret
         
         env_path = Path(env_path)
         env_dir = env_path.parent
@@ -918,6 +919,8 @@ def _save_access_token(env_path, access_token, user_id=None, account_type=None, 
             with open(env_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
         
+        access_token_to_store = protect_secret(access_token)
+
         # Update or add the access token
         token_found = False
         user_id_found = False
@@ -926,7 +929,7 @@ def _save_access_token(env_path, access_token, user_id=None, account_type=None, 
         
         for i, line in enumerate(lines):
             if line.strip().startswith("SIMKL_ACCESS_TOKEN="):
-                lines[i] = f"SIMKL_ACCESS_TOKEN={access_token}\n"
+                lines[i] = f"SIMKL_ACCESS_TOKEN={access_token_to_store}\n"
                 token_found = True
             elif line.strip().startswith("SIMKL_USER_ID=") and user_id is not None:
                 lines[i] = f"SIMKL_USER_ID={user_id}\n"
@@ -939,7 +942,7 @@ def _save_access_token(env_path, access_token, user_id=None, account_type=None, 
                 settings_all_found = True
         
         if not token_found:
-            lines.append(f"SIMKL_ACCESS_TOKEN={access_token}\n")
+            lines.append(f"SIMKL_ACCESS_TOKEN={access_token_to_store}\n")
         
         if user_id is not None and not user_id_found:
             lines.append(f"SIMKL_USER_ID={user_id}\n")

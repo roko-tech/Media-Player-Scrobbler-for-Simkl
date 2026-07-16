@@ -1317,6 +1317,11 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         menu_items.append(pystray.MenuItem("Scrobbling", pystray.Menu(
             pystray.MenuItem("Retry Last Scrobble", self.try_scrobble_again),
             pystray.MenuItem("Sync Backlog Now", self.process_backlog),
+            pystray.MenuItem("Media Identification", pystray.Menu(
+                pystray.MenuItem("Override Current File...", self.set_current_file_override),
+                pystray.MenuItem("Override Current Folder...", self.set_current_folder_override),
+                pystray.MenuItem("Remove Current Override", self.remove_current_media_override),
+            )),
             pystray.MenuItem("Completion Threshold", threshold_submenu),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
@@ -1624,7 +1629,81 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         except Exception as e:
             logger.error(f"Error clearing all data: {e}")
             self.show_notification("simkl-mps Error", f"Failed to clear all data: {e}")
-        return 0    
+        return 0
+
+    def _set_current_media_override(self, scope):
+        media_scrobbler = self._get_media_scrobbler()
+        filepath = getattr(media_scrobbler, 'current_filepath', None)
+        if not media_scrobbler or not filepath:
+            self.show_notification("Media Override", "No local media file is currently playing.")
+            return 0
+
+        current_id = getattr(media_scrobbler, 'simkl_id', None)
+        current_season = getattr(media_scrobbler, 'season', None)
+        current_value = str(current_id or "")
+        if current_id and current_season is not None:
+            current_value += f", {current_season}"
+        help_text = (
+            "Enter the correct Simkl ID. For an episode, optionally add the target "
+            "Simkl season after a comma (example: 529392, 1)."
+        )
+        value = self._ask_directory_filter_dialog(
+            f"Override Current {scope.title()}", current_value, help_text
+        )
+        if value is None:
+            return 0
+
+        match = re.fullmatch(r"\s*(\d+)\s*(?:[,;]\s*(\d+)\s*)?", value)
+        if not match:
+            self.show_notification("Media Override", "Enter a Simkl ID, optionally followed by a season.")
+            return 0
+
+        simkl_id = int(match.group(1))
+        target_season = int(match.group(2)) if match.group(2) else None
+        has_episode = getattr(media_scrobbler, 'episode', None) is not None
+        media_type = getattr(media_scrobbler, 'media_type', None)
+        if has_episode and (media_type == 'anime' or f"{os.sep}anime{os.sep}" in filepath.lower()):
+            media_type = 'anime'
+        elif has_episode:
+            media_type = 'show'
+        else:
+            media_type = 'movie'
+        target_path = filepath if scope == 'file' else os.path.dirname(filepath)
+        title = getattr(media_scrobbler, 'movie_name', None) or getattr(
+            media_scrobbler, 'currently_tracking', None
+        )
+        media_scrobbler.media_overrides.set(
+            scope,
+            target_path,
+            simkl_id,
+            season=target_season,
+            title=title,
+            media_type=media_type,
+        )
+        logger.info("Saved %s media override for current playback", scope)
+        self.show_notification("Media Override", "Saved. Re-identifying the current media now.")
+        return self.try_scrobble_again()
+
+    def set_current_file_override(self, _=None):
+        return self._set_current_media_override('file')
+
+    def set_current_folder_override(self, _=None):
+        return self._set_current_media_override('folder')
+
+    def remove_current_media_override(self, _=None):
+        media_scrobbler = self._get_media_scrobbler()
+        filepath = getattr(media_scrobbler, 'current_filepath', None)
+        if not media_scrobbler or not filepath:
+            self.show_notification("Media Override", "No local media file is currently playing.")
+            return 0
+        removed = media_scrobbler.media_overrides.remove_match(filepath)
+        if not removed:
+            self.show_notification("Media Override", "No override applies to the current media.")
+            return 0
+        logger.info("Removed %s media override for current playback", removed['scope'])
+        self.show_notification("Media Override", "Removed. Re-identifying the current media now.")
+        return self.try_scrobble_again()
+
     def try_scrobble_again(self, _=None):
         """Force re-identification of the currently playing media by clearing cached data and re-running identification."""
         logger.info("Forcing re-identification of currently playing media...")
@@ -1708,7 +1787,11 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             from simkl_mps.simkl_api import is_internet_connected
             
             # Try to re-identify based on available information
-            if current_filepath and is_internet_connected():
+            has_override = bool(
+                current_filepath
+                and actual_scrobbler.media_overrides.find(current_filepath)
+            )
+            if current_filepath and (is_internet_connected() or has_override):
                 # Try file-based identification first
                 logger.info(f"Attempting file-based re-identification for: '{current_filepath}'")
                   # Parse with guessit to get media type hint

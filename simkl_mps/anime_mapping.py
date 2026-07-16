@@ -67,34 +67,56 @@ def _ensure_data():
     return None
 
 
+def _build_indices(data):
+    by_tvdb_season, by_simkl = {}, {}
+    for e in (data or []):
+        tvdb, simkl = e.get("tvdb_id"), e.get("simkl_id")
+        season = (e.get("season") or {}).get("tvdb")
+        if tvdb is None or season is None or not simkl:
+            continue
+        key = (int(tvdb), int(season))
+        # prefer a TV entry over OVA/movie when a (tvdb, season) collides
+        if key not in by_tvdb_season or e.get("type") == "TV":
+            by_tvdb_season[key] = int(simkl)
+        by_simkl.setdefault(int(simkl), (int(tvdb), int(season)))
+    return by_tvdb_season, by_simkl
+
+
+def _log_index_size(indices):
+    logger.info(
+        "anime-lists: indexed %s (tvdb,season) keys, %s simkl ids",
+        len(indices[0]),
+        len(indices[1]),
+    )
+
+
 def _load_worker():
     global _indices, _loading
     try:
-        data = _ensure_data()
-        by_tvdb_season, by_simkl = {}, {}
-        for e in (data or []):
-            tvdb, simkl = e.get("tvdb_id"), e.get("simkl_id")
-            season = (e.get("season") or {}).get("tvdb")
-            if tvdb is None or season is None or not simkl:
-                continue
-            key = (int(tvdb), int(season))
-            # prefer a TV entry over OVA/movie when a (tvdb, season) collides
-            if key not in by_tvdb_season or e.get("type") == "TV":
-                by_tvdb_season[key] = int(simkl)
-            by_simkl.setdefault(int(simkl), (int(tvdb), int(season)))
-        _indices = (by_tvdb_season, by_simkl)
-        logger.info(f"anime-lists: indexed {len(by_tvdb_season)} (tvdb,season) keys, "
-                    f"{len(by_simkl)} simkl ids")
+        indices = _build_indices(_ensure_data())
+        if indices[0] or indices[1]:
+            _indices = indices
+            _log_index_size(indices)
     finally:
         _loading = False
 
 
 def _get():
-    """Return the (by_tvdb_season, by_simkl) indices, or None while still loading."""
-    global _loading
+    """Return cached indices immediately; refresh stale data in the background."""
+    global _indices, _loading
     if _indices is None:
         with _lock:
-            if _indices is None and not _loading:
+            path = _cache_path()
+            if _indices is None and path.exists():
+                try:
+                    cached = _build_indices(json.loads(path.read_text(encoding="utf-8")))
+                    if cached[0] or cached[1]:
+                        _indices = cached
+                        _log_index_size(cached)
+                except (OSError, ValueError, TypeError) as exc:
+                    logger.warning("anime-lists: cached map unavailable: %s", exc)
+            stale = not path.exists() or (time.time() - path.stat().st_mtime) >= _MAX_AGE
+            if stale and not _loading:
                 _loading = True
                 threading.Thread(target=_load_worker, name="anime-lists-load",
                                  daemon=True).start()

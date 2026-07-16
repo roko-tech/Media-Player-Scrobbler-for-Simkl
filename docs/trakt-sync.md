@@ -2,8 +2,9 @@
 
 This fork can keep Trakt current from the same tray process that scrobbles to
 Simkl. After Simkl accepts a completed watch, the app reads the exact event from
-its local `watch_history.json` and sends it to Trakt. Events Trakt cannot match
-are retained in `trakt_sync_state.json` and retried later.
+its local `watch_history.json` and immediately sends it to Trakt. Startup and
+file polling remain as recovery paths. Events Trakt cannot match are retained in
+`trakt_sync_state.json` and retried later.
 
 ## One-time setup
 
@@ -25,7 +26,9 @@ are retained in `trakt_sync_state.json` and retried later.
    ```
 
 The config, OAuth token, sync state, and watch history live in the app data
-folder. They are never stored in this Git repository.
+folder. On Windows, the client secret and OAuth tokens are encrypted for the
+current Windows user with DPAPI. Existing plaintext files migrate on first read.
+They are never stored in this Git repository.
 
 ## Commands
 
@@ -43,6 +46,15 @@ service IDs, file paths, and credentials so its output can be shared safely.
 
 Automatic syncing starts with the normal Simkl tray; no second watcher process
 or tray icon is required.
+
+## Correcting a media match
+
+While the media is playing, use **Scrobbling → Media Identification** to save an
+override for either the exact file or its folder. Enter the correct Simkl ID. For
+an episode, add the target Simkl season after a comma, such as `529392, 1` for a
+split-cour title that Simkl stores as season 1. Exact-file overrides take
+precedence over folder overrides, and the nearest matching folder wins. Use
+**Remove Current Override** to return to automatic matching.
 
 ## Letterboxd
 

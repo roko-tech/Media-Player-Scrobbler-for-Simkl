@@ -32,6 +32,7 @@ from simkl_mps.backlog_cleaner import BacklogCleaner
 from simkl_mps.window_detection import parse_movie_title, parse_filename_from_path, is_video_player
 from simkl_mps import anime_mapping
 from simkl_mps.media_cache import MediaCache
+from simkl_mps.media_overrides import MediaOverrides
 
 logger = logging.getLogger(__name__)
 try:
@@ -88,6 +89,7 @@ class MediaScrobbler:
         self.movie_name = None # Official title from Simkl (movie title or show title)
         self.last_scrobble_time = 0
         self.media_cache = MediaCache(app_data_dir=self.app_data_dir)
+        self.media_overrides = MediaOverrides(app_data_dir=self.app_data_dir)
         self.last_progress_check = 0
         self.completion_threshold = get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
         self.completed = False
@@ -1043,7 +1045,42 @@ class MediaScrobbler:
         Handles offline fallback using guessit with retry mechanism.
         """
         max_retries = 3
-        
+
+        override = self.media_overrides.find(filepath)
+        if override:
+            guessed_type = (guessit_info or {}).get('type')
+            is_episode = guessed_type == 'episode' or (guessit_info or {}).get('episode') is not None
+            media_type = override.get('media_type') or ('show' if is_episode else 'movie')
+            title = override.get('title') or (guessit_info or {}).get('title') or os.path.basename(filepath)
+            ids = {'simkl': override['simkl_id']}
+            if is_episode or media_type in ('show', 'anime'):
+                result = {
+                    'type': 'episode',
+                    'show': {'title': title, 'type': media_type, 'ids': ids},
+                    'episode': {
+                        'season': override.get('season', (guessit_info or {}).get('season')),
+                        'episode': (guessit_info or {}).get('episode'),
+                    },
+                }
+            else:
+                result = {
+                    'type': 'movie',
+                    'movie': {'title': title, 'type': 'movie', 'ids': ids},
+                }
+            logger.warning(
+                "Using %s media override for '%s': simkl=%s",
+                override['scope'],
+                os.path.basename(filepath),
+                override['simkl_id'],
+            )
+            self._process_simkl_search_result(
+                result,
+                filepath,
+                os.path.basename(filepath).lower(),
+                f"manual_{override['scope']}_override",
+            )
+            return
+
         if not self.client_id:
             logger.warning("Cannot identify media from filepath: Missing Client ID.")
             return

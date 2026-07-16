@@ -14,6 +14,7 @@ class TraktSyncWatcher:
         self.poll_seconds = poll_seconds
         self.debounce_seconds = debounce_seconds
         self._stop = threading.Event()
+        self._history_saved = threading.Event()
         self._sync_lock = threading.Lock()
         self._thread = None
         self.last_summary = "not configured"
@@ -125,9 +126,14 @@ class TraktSyncWatcher:
 
     def stop(self):
         self._stop.set()
+        self._history_saved.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=self.poll_seconds + 1)
         logger.info("Trakt sync watcher stopped")
+
+    def notify_history_saved(self):
+        """Wake the watcher after a completed-watch event is safely on disk."""
+        self._history_saved.set()
 
     def sync_now(self):
         if not self.configured:
@@ -157,7 +163,17 @@ class TraktSyncWatcher:
     def _watch_loop(self):
         last_mtime = self._mtime() or 0.0
         self.sync_now()  # catch up and retry pending events after startup
-        while not self._stop.wait(self.poll_seconds):
+        while not self._stop.is_set():
+            notified = self._history_saved.wait(self.poll_seconds)
+            if self._stop.is_set():
+                return
+            if notified:
+                self._history_saved.clear()
+                last_mtime = self._mtime() or last_mtime
+                logger.info("Trakt sync: completed-watch event saved; syncing now")
+                self.sync_now()
+                continue
+
             current_mtime = self._mtime()
             if current_mtime is None or current_mtime == last_mtime:
                 continue

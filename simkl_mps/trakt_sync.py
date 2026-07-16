@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ import requests
 
 from simkl_mps.config_manager import get_app_data_dir
 from simkl_mps.credentials import get_credentials
+from simkl_mps.secure_store import is_protected, protect_secret, unprotect_secret
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,36 @@ def save_json(path: Path, data: Any):
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     temp.replace(path)
+
+
+def load_secret_json(path, secret_keys, default=None):
+    stored = load_json(path, default)
+    if not isinstance(stored, dict):
+        return stored
+    runtime = dict(stored)
+    migrate = False
+    for key in secret_keys:
+        value = stored.get(key)
+        if not value:
+            continue
+        runtime[key] = unprotect_secret(value)
+        if os.name == "nt" and not is_protected(value):
+            migrate = True
+    if migrate:
+        try:
+            save_secret_json(path, runtime, secret_keys)
+            logger.info("Protected plaintext secrets in %s with Windows DPAPI.", path.name)
+        except OSError as exc:
+            logger.warning("Could not migrate secrets in %s yet: %s", path.name, exc)
+    return runtime
+
+
+def save_secret_json(path, data, secret_keys):
+    stored = dict(data)
+    for key in secret_keys:
+        if stored.get(key):
+            stored[key] = protect_secret(stored[key])
+    save_json(path, stored)
 
 
 def now_utc():
@@ -373,7 +405,7 @@ def count_payload(payload):
 
 
 def trakt_config():
-    config = load_json(CONFIG_FILE, {}) or {}
+    config = load_secret_json(CONFIG_FILE, ("client_secret",), {}) or {}
     if not config.get("client_id") or not config.get("client_secret"):
         raise TraktSyncError(
             f"Trakt is not configured. Add client_id/client_secret to {CONFIG_FILE}."
@@ -407,7 +439,11 @@ def authenticate(config=None):
             timeout=30,
         )
         if token_response.status_code == 200:
-            save_json(TOKEN_FILE, token_response.json())
+            save_secret_json(
+                TOKEN_FILE,
+                token_response.json(),
+                ("access_token", "refresh_token"),
+            )
             print(f"\n\nAuthorized. Token saved to {TOKEN_FILE}")
             return
         if token_response.status_code == 400:
@@ -420,7 +456,9 @@ def authenticate(config=None):
 
 
 def trakt_token(config):
-    token = load_json(TOKEN_FILE, {}) or {}
+    token = load_secret_json(
+        TOKEN_FILE, ("access_token", "refresh_token"), {}
+    ) or {}
     if not token:
         raise TraktSyncError("Trakt is not authorized. Run: simkl-mps trakt-auth")
     if token["created_at"] + token["expires_in"] - 3600 < now_utc().timestamp():
@@ -438,7 +476,7 @@ def trakt_token(config):
         if response.status_code != 200:
             raise TraktSyncError("Trakt token refresh failed. Run: simkl-mps trakt-auth")
         token = response.json()
-        save_json(TOKEN_FILE, token)
+        save_secret_json(TOKEN_FILE, token, ("access_token", "refresh_token"))
     return token["access_token"]
 
 

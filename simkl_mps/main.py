@@ -162,6 +162,9 @@ class SimklScrobbler:
         # Initialize Watch History Manager early
         try:
             self.watch_history_manager = WatchHistoryManager(APP_DATA_DIR)
+            self.monitor.scrobbler.watch_history.set_on_saved(
+                self.trakt_watcher.notify_history_saved
+            )
             logger.info("Watch History Manager initialized.")
         except Exception as e:
             logger.error(f"Failed to initialize Watch History Manager: {e}", exc_info=True)
