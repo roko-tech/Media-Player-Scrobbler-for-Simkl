@@ -60,6 +60,7 @@ class TrayAppWin(TrayAppBase):
     def __init__(self):
         super().__init__() # Call base class constructor
         self.tray_icon = None # Initialize tray_icon attribute
+        self._exit_requested = False
         self._update_check_running = False # Initialize update check flag
         self._tk_queue: "queue.Queue[tuple[callable, queue.Queue]] | None" = None
         self._tk_thread: threading.Thread | None = None
@@ -536,18 +537,26 @@ Tips:
         else:
             self.update_status("error", "Failed to initialize")
             
-        try:
-            self.tray_icon.run()
-        except Exception as e:
-            logger.error(f"Error running tray icon: {e}")
-            self.show_notification("Tray Error", f"Error with system tray: {e}")
-            
+        self._run_tray_loop()
+
+    def _run_tray_loop(self, retry_delay=2):
+        """Keep the tray available unless the user explicitly exits."""
+        while not self._exit_requested:
             try:
-                while self.scrobbler and self.monitoring_active:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                if self.monitoring_active:
-                    self.stop_monitoring()
+                self.tray_icon.run()
+            except Exception as e:
+                logger.error(f"Error running tray icon: {e}", exc_info=True)
+
+            if self._exit_requested:
+                break
+
+            logger.error(
+                "Tray event loop exited unexpectedly; recreating the tray icon in %ss.",
+                retry_delay,
+            )
+            time.sleep(retry_delay)
+            if not self._exit_requested:
+                self.setup_icon()
 
     # start_monitoring is now in base class
     # stop_monitoring is now in base class
@@ -600,10 +609,13 @@ Tips:
     def exit_app(self, _=None):
         """Exit the pystray application"""
         logger.info("Exiting application from tray")
-        if self.monitoring_active:
-            self.stop_monitoring()
-        if self.tray_icon:
-            self.tray_icon.stop()
+        self._exit_requested = True
+        try:
+            if self.monitoring_active:
+                self.stop_monitoring()
+        finally:
+            if self.tray_icon:
+                self.tray_icon.stop()
         return 0
 
     def _setup_auto_update_if_needed(self):
