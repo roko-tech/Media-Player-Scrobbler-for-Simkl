@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # before a fresh search, so a stamped-version mismatch clears it and stale
 # incorrect identifications can't persist. This only clears the filename->id lookup
 # cache -- never watch history, Simkl, or Trakt.
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 
 class MediaCache:
@@ -50,11 +50,20 @@ class MediaCache:
 
     def _save_cache(self):
         """Save the cache to file, stamped with the current logic version."""
+        temp = self.cache_file.with_suffix(self.cache_file.suffix + ".tmp")
         try:
-            with open(self.cache_file, 'w', encoding='utf-8') as f:
+            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(temp, 'w', encoding='utf-8') as f:
                 json.dump({"version": CACHE_VERSION, "entries": self.cache}, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            temp.replace(self.cache_file)
         except Exception as e:
             logger.error(f"Error saving cache: {e}")
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _filter_media_info(self, raw_info: dict) -> dict:
         filtered = {}

@@ -4,6 +4,7 @@ Tracks and manages local history of watched media.
 """
 
 import os
+import copy
 import json
 import logging
 import pathlib
@@ -12,6 +13,7 @@ import webbrowser
 import shutil
 import sys
 import mimetypes
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,8 @@ class WatchHistoryManager:
     def __init__(self, app_data_dir: pathlib.Path, history_file="watch_history.json"):
         self.app_data_dir = app_data_dir
         self.history_file = self.app_data_dir / history_file
+        self.backup_file = self.history_file.with_suffix(self.history_file.suffix + ".bak")
+        self._lock = threading.RLock()
         self._on_saved = None
         self.history = self._load_history()
         if self.history is None:
@@ -58,16 +62,16 @@ class WatchHistoryManager:
                     content = f.read().strip()
                     if content:
                         f.seek(0)
-                        return json.load(f)
+                        loaded = json.load(f)
+                        if not isinstance(loaded, list):
+                            raise TypeError("Watch history must be a JSON list")
+                        return loaded
                     else:
                         logger.debug("History file exists but is empty. Starting with empty history.")
                         return []
-            except json.JSONDecodeError as e:
+            except (json.JSONDecodeError, TypeError) as e:
                 logger.error(f"Error loading history: {e}")
-                logger.info("Creating new empty history due to loading error")
-                self.history = []
-                self._save_history()
-                return []
+                return self._recover_history()
             except Exception as e:
                 logger.error(f"Error loading history: {e}")
         else:
@@ -81,17 +85,73 @@ class WatchHistoryManager:
             return []
         return []
 
-    def _save_history(self):
-        """Save the history to file"""
+    def _recover_history(self):
+        """Preserve a corrupt primary file and recover the last valid backup."""
+        recovered = []
         try:
-            with open(self.history_file, 'w', encoding='utf-8') as f:
-                json.dump(self.history, f, indent=4)
-            return True # Indicate success
-        except Exception as e:
-            logger.error(f"Error saving history: {e}")
-            return False # Indicate failure
+            backup_data = json.loads(self.backup_file.read_text(encoding='utf-8'))
+            if isinstance(backup_data, list):
+                recovered = backup_data
+            else:
+                logger.error("Watch-history backup has an unexpected data type.")
+        except FileNotFoundError:
+            logger.error("No watch-history backup is available for recovery.")
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.error("Could not read watch-history backup: %s", exc)
+
+        if self.history_file.exists():
+            stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+            corrupt = self.history_file.with_name(f"{self.history_file.name}.corrupt-{stamp}")
+            try:
+                self.history_file.replace(corrupt)
+                logger.error("Preserved corrupt watch history as %s", corrupt.name)
+            except OSError as exc:
+                logger.error("Could not preserve corrupt watch history: %s", exc)
+                return recovered
+
+        self.history = recovered
+        if self._save_history(create_backup=False):
+            logger.warning("Recovered %d watch-history entries from backup.", len(recovered))
+        return recovered
+
+    def _save_history(self, create_backup=True):
+        """Save the history to file"""
+        temp = self.history_file.with_suffix(self.history_file.suffix + '.tmp')
+        with self._lock:
+            try:
+                self.history_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(temp, 'w', encoding='utf-8') as f:
+                    json.dump(self.history, f, indent=4)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if create_backup and self.history_file.exists():
+                    try:
+                        current = json.loads(self.history_file.read_text(encoding='utf-8'))
+                        if isinstance(current, list):
+                            backup_temp = self.backup_file.with_suffix(self.backup_file.suffix + '.tmp')
+                            shutil.copy2(self.history_file, backup_temp)
+                            backup_temp.replace(self.backup_file)
+                    except (OSError, json.JSONDecodeError):
+                        logger.warning("Skipped backup of an invalid watch-history file.")
+                temp.replace(self.history_file)
+                return True
+            except Exception as e:
+                logger.error(f"Error saving history: {e}")
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return False
 
     def add(self, media_info):
+        with self._lock:
+            previous = copy.deepcopy(self.history)
+            saved = self._add_unlocked(media_info)
+            if not saved:
+                self.history = previous
+            return saved
+
+    def _add_unlocked(self, media_info):
         """
         Add a media item to the history
         
@@ -173,27 +233,32 @@ class WatchHistoryManager:
 
     def remove(self, simkl_id, media_type="movie"):
         """Remove a specific entry from history"""
-        initial_length = len(self.history)
-        self.history = [item for item in self.history 
-                        if not (item.get('simkl_id') == simkl_id and item.get('type', 'movie') == media_type)]
-        
-        if len(self.history) != initial_length:
-            self._save_history()
-            return True
-        return False
+        with self._lock:
+            previous = copy.deepcopy(self.history)
+            initial_length = len(self.history)
+            self.history = [item for item in self.history
+                            if not (item.get('simkl_id') == simkl_id and item.get('type', 'movie') == media_type)]
+
+            if len(self.history) != initial_length:
+                if self._save_history():
+                    return True
+                self.history = previous
+            return False
 
     def clear(self):
         """Clear the entire history"""
-        self.history = []
-        self._save_history()
-        return True
+        with self._lock:
+            previous = self.history
+            self.history = []
+            if self._save_history():
+                return True
+            self.history = previous
+            return False
         
     def _ensure_viewer_exists(self):
         """Ensure the watch history viewer files exist in the user's app data directory, always copying from the bundled source."""
         import shutil
-        from .migration import get_app_data_dir
-        # Use migration-aware path
-        user_dir = get_app_data_dir() / "watch-history-viewer"
+        user_dir = self.app_data_dir / "watch-history-viewer"
         source_dir = self._get_source_dir()
         # Always copy all files from source_dir to user_dir, overwriting if needed
         if not user_dir.exists():
@@ -373,8 +438,16 @@ class WatchHistoryManager:
         episode_entry["rewatch_count"] = (self._positive_int(episode_entry.get("rewatch_count")) or 0) + 1
 
     def add_entry(self, media_item, media_file_path=None, watched_progress=100):
+        with self._lock:
+            previous = copy.deepcopy(self.history)
+            saved = self._add_entry_unlocked(media_item, media_file_path, watched_progress)
+            if not saved:
+                self.history = previous
+            return saved
+
+    def _add_entry_unlocked(self, media_item, media_file_path=None, watched_progress=100):
         """Add a new entry to watch history, or update existing show entries with new episodes"""
-        watched_at = datetime.now().isoformat()
+        watched_at = media_item.get("watched_at") or datetime.now().isoformat()
         
         # Check if we already have this item in the history
         existing_entry = None

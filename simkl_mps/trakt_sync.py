@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,6 +48,7 @@ class SyncResult:
     summary: str
     pushed: bool = False
     pending: int = 0
+    retry_after: int = 0
 
 
 def load_json(path: Path, default=None):
@@ -59,8 +61,59 @@ def load_json(path: Path, default=None):
 def save_json(path: Path, data: Any):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    with temp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
     temp.replace(path)
+
+
+def save_state(data, create_backup=True):
+    backup = STATE_FILE.with_suffix(STATE_FILE.suffix + ".bak")
+    if create_backup and STATE_FILE.exists():
+        try:
+            current = load_json(STATE_FILE)
+            if isinstance(current, dict):
+                backup_temp = backup.with_suffix(backup.suffix + ".tmp")
+                shutil.copy2(STATE_FILE, backup_temp)
+                backup_temp.replace(backup)
+        except TraktSyncError:
+            logger.warning("Trakt sync: skipped backup of an invalid state file")
+    save_json(STATE_FILE, data)
+
+
+def load_state(default=None):
+    try:
+        state = load_json(STATE_FILE, default)
+        if state is not None and not isinstance(state, dict):
+            raise TraktSyncError("Trakt state must be a JSON object")
+        return state
+    except TraktSyncError as exc:
+        logger.error("Trakt sync: state recovery required: %s", exc)
+
+    backup = STATE_FILE.with_suffix(STATE_FILE.suffix + ".bak")
+    recovered = default
+    try:
+        recovered = load_json(backup, default)
+        if recovered is not None and not isinstance(recovered, dict):
+            raise TraktSyncError("Trakt state backup must be a JSON object")
+    except TraktSyncError as exc:
+        logger.error("Trakt sync: state backup recovery failed: %s", exc)
+        recovered = default
+
+    if STATE_FILE.exists():
+        stamp = now_utc().strftime("%Y%m%d-%H%M%S-%f")
+        corrupt = STATE_FILE.with_name(f"{STATE_FILE.name}.corrupt-{stamp}")
+        try:
+            STATE_FILE.replace(corrupt)
+            logger.error("Trakt sync: preserved corrupt state as %s", corrupt.name)
+        except OSError as exc:
+            logger.error("Trakt sync: could not preserve corrupt state: %s", exc)
+            return recovered
+
+    save_state(recovered, create_backup=False)
+    logger.warning("Trakt sync: recovered state from the last valid backup")
+    return recovered
 
 
 def load_secret_json(path, secret_keys, default=None):
@@ -122,6 +175,7 @@ def _record_health(
     added_episodes=0,
     not_found=0,
     pending=0,
+    retry_after=0,
 ):
     """Persist secret-free sync diagnostics alongside the durable queue state."""
     health = dict(state.get("health") or {})
@@ -140,17 +194,18 @@ def _record_health(
                 "last_added_movies": int(added_movies),
                 "last_added_episodes": int(added_episodes),
                 "last_not_found": int(not_found),
+                "last_retry_after": int(retry_after or 0),
             }
         )
         if ok:
             health["last_success_at"] = iso(now_utc())
     state["health"] = health
-    save_json(STATE_FILE, state)
+    save_state(state)
 
 
 def get_sync_health():
     """Return structured health data without credentials, IDs, or file paths."""
-    state = load_json(STATE_FILE, {}) or {}
+    state = load_state({}) or {}
     history = load_json(HISTORY_FILE, []) or []
     backlog = load_json(SIMKL_BACKLOG_FILE, {}) or {}
     events = collect_history_events(history, None)
@@ -203,12 +258,17 @@ def _show_ids(ids):
 
 _DETAIL_CACHE = {}
 _FRIBB = None
+_FRIBB_MTIME = None
 
 
 def _fribb_map():
     """Return ``simkl_id -> Trakt-usable IDs + TVDB season``."""
-    global _FRIBB
-    if _FRIBB is not None:
+    global _FRIBB, _FRIBB_MTIME
+    try:
+        current_mtime = FRIBB_FILE.stat().st_mtime_ns
+    except OSError:
+        current_mtime = None
+    if _FRIBB is not None and current_mtime == _FRIBB_MTIME:
         return _FRIBB
 
     mapping = {}
@@ -235,6 +295,7 @@ def _fribb_map():
     except TraktSyncError as exc:
         logger.warning("Trakt sync: Fribb mapping unavailable: %s", exc)
     _FRIBB = mapping
+    _FRIBB_MTIME = current_mtime
     return mapping
 
 
@@ -339,6 +400,41 @@ def _deduplicate(events):
     for event in events:
         unique[_event_key(event)] = event
     return list(unique.values())
+
+
+def _not_found_count(not_found):
+    if not isinstance(not_found, dict):
+        return 0
+    return sum(len(value) for value in not_found.values() if isinstance(value, list))
+
+
+def _not_found_events(events, not_found):
+    """Match Trakt's echoed not_found items back to exact local watch events."""
+    echoed_times = set()
+
+    def visit(value):
+        if isinstance(value, dict):
+            watched_at = value.get("watched_at")
+            if watched_at:
+                try:
+                    echoed_times.add(iso(parse_dt(watched_at)))
+                except (TypeError, ValueError):
+                    pass
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(not_found)
+    matched = [event for event in events if event.get("watched_at") in echoed_times]
+    if matched or not _not_found_count(not_found):
+        return matched
+    logger.error(
+        "Trakt sync: could not map not_found response to exact events; "
+        "retaining the full batch to avoid data loss"
+    )
+    return list(events)
 
 
 def build_payload(events, client_id=None):
@@ -499,14 +595,31 @@ def push_trakt(config, token, payload, retries=3):
                 body = response.json()
             except ValueError:
                 body = {}
-            return response.status_code, body
+            if response.status_code == 429:
+                retry_after = _int(response.headers.get("Retry-After")) or 60
+                logger.warning(
+                    "Trakt sync: HTTP 429 rate limited | Retry-After=%ss | X-Ratelimit=%s",
+                    retry_after,
+                    response.headers.get("X-Ratelimit", "missing"),
+                )
+                return response.status_code, body, retry_after
+            if response.status_code in (502, 503, 504) and attempt < retries:
+                logger.warning(
+                    "Trakt sync: HTTP %s; retrying in 30s (%d/%d)",
+                    response.status_code,
+                    attempt,
+                    retries,
+                )
+                time.sleep(30)
+                continue
+            return response.status_code, body, 0
         except requests.RequestException as exc:
             logger.warning(
                 "Trakt sync: push attempt %d/%d failed: %s", attempt, retries, exc
             )
             if attempt < retries:
                 time.sleep(3)
-    return None, None
+    return None, None, 0
 
 
 def _log_payload(payload):
@@ -526,13 +639,13 @@ def _log_payload(payload):
 
 def ensure_state():
     if not STATE_FILE.exists():
-        save_json(STATE_FILE, {"synced_through": iso(now_utc()), "pending": []})
+        save_state({"synced_through": iso(now_utc()), "pending": []})
         logger.info("Trakt sync: initialized marker at current time")
 
 
 def sync_history(since=None, dry_run=False):
     """Sync local history to Trakt and return a structured result."""
-    state = load_json(STATE_FILE, {}) or {}
+    state = load_state({}) or {}
     if since:
         marker = parse_dt(f"{since}T00:00:00Z")
     elif state.get("synced_through"):
@@ -543,7 +656,7 @@ def sync_history(since=None, dry_run=False):
         summary = "Trakt sync initialized. New watch events will sync automatically."
         logger.info(summary)
         if not dry_run:
-            state = load_json(STATE_FILE, {}) or {}
+            state = load_state({}) or {}
             _record_health(state, summary, True, pending=0)
         return SyncResult(True, summary)
 
@@ -580,13 +693,10 @@ def sync_history(since=None, dry_run=False):
 
     if movie_count == 0 and episode_count == 0:
         latest = max((parse_dt(event["watched_at"]) for event in new_events), default=marker)
-        save_json(
-            STATE_FILE,
-            {"synced_through": iso(max(marker, latest)), "pending": unresolved},
-        )
+        save_state({"synced_through": iso(max(marker, latest)), "pending": unresolved})
         summary = f"Trakt: no matchable events; {len(unresolved)} queued for retry."
         logger.warning(summary)
-        state = load_json(STATE_FILE, {}) or {}
+        state = load_state({}) or {}
         _record_health(state, summary, False, pending=len(unresolved))
         return SyncResult(False, summary, pending=len(unresolved))
 
@@ -599,7 +709,12 @@ def sync_history(since=None, dry_run=False):
         _record_health(state, summary, False, pending=len(events))
         return SyncResult(False, summary, pending=len(events))
 
-    status, body = push_trakt(config, token, payload)
+    push_result = push_trakt(config, token, payload)
+    if len(push_result) == 2:  # Compatibility for callers/tests using the old shape.
+        status, body = push_result
+        retry_after = 0
+    else:
+        status, body, retry_after = push_result
     if status is None:
         summary = "Trakt push failed after retries; state was not advanced."
         logger.error(summary)
@@ -608,7 +723,7 @@ def sync_history(since=None, dry_run=False):
 
     added = (body or {}).get("added", {})
     not_found = (body or {}).get("not_found", {})
-    not_found_count = sum(len(not_found.get(key) or []) for key in ("shows", "episodes", "movies"))
+    not_found_count = _not_found_count(not_found)
     logger.info(
         "Trakt sync: HTTP %s | added movies=%s episodes=%s | not_found=%s",
         status,
@@ -632,32 +747,41 @@ def sync_history(since=None, dry_run=False):
             added_episodes=added.get("episodes", 0),
             not_found=not_found_count,
             pending=len(events),
+            retry_after=retry_after,
         )
-        return SyncResult(False, summary, pending=len(events))
+        return SyncResult(
+            False,
+            summary,
+            pending=len(events),
+            retry_after=retry_after,
+        )
 
-    retry_events = unresolved + (events if not_found_count else [])
+    retry_events = unresolved + _not_found_events(events, not_found)
     retry_events = _deduplicate(retry_events)
     if not since:
         latest = max((parse_dt(event["watched_at"]) for event in new_events), default=marker)
-        save_json(
-            STATE_FILE,
-            {"synced_through": iso(max(marker, latest)), "pending": retry_events},
-        )
+        save_state({"synced_through": iso(max(marker, latest)), "pending": retry_events})
 
     summary = (
         f"Trakt: +{added.get('episodes', 0)} episode(s), "
         f"+{added.get('movies', 0)} movie(s); {len(retry_events)} pending."
     )
     logger.info(summary)
-    state = load_json(STATE_FILE, {}) or state
+    state = load_state({}) or state
+    fully_synced = not retry_events
     _record_health(
         state,
         summary,
-        True,
+        fully_synced,
         http_status=status,
         added_movies=added.get("movies", 0),
         added_episodes=added.get("episodes", 0),
         not_found=not_found_count,
         pending=len(retry_events),
     )
-    return SyncResult(True, summary, pushed=True, pending=len(retry_events))
+    return SyncResult(
+        fully_synced,
+        summary,
+        pushed=True,
+        pending=len(retry_events),
+    )

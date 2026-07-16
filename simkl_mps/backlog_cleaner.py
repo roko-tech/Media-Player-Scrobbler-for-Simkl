@@ -4,9 +4,13 @@ Handles tracking of watched movies to sync when connection is restored.
 """
 
 import os
+import copy
 import json
 import logging
 import pathlib
+import shutil
+import threading
+import uuid
 from datetime import datetime
 
 # Configure module logging
@@ -18,6 +22,8 @@ class BacklogCleaner:
     def __init__(self, app_data_dir: pathlib.Path, backlog_file="backlog.json"):
         self.app_data_dir = app_data_dir
         self.backlog_file = self.app_data_dir / backlog_file # Use app_data_dir
+        self.backup_file = self.backlog_file.with_suffix(self.backlog_file.suffix + ".bak")
+        self._lock = threading.RLock()
         self.backlog = self._load_backlog()
         # threshold_days parameter removed as it was unused
 
@@ -46,7 +52,12 @@ class BacklogCleaner:
                                 if isinstance(item, dict) and 'simkl_id' in item:
                                     item_key = str(item['simkl_id'])
                                     if item_key in converted_backlog:
-                                        logger.warning(f"Duplicate simkl_id '{item_key}' found during backlog list conversion. Overwriting.")
+                                        logger.warning(
+                                            "Duplicate simkl_id '%s' found during backlog list "
+                                            "conversion. Preserving it as a distinct watch event.",
+                                            item_key,
+                                        )
+                                        item_key = f"watch_{uuid.uuid4().hex}"
                                     converted_backlog[item_key] = item
                                 else:
                                     malformed_items += 1
@@ -63,20 +74,15 @@ class BacklogCleaner:
                         elif isinstance(loaded_data, dict):
                             return loaded_data # Already a dictionary
                         else:
-                            logger.error(f"Backlog file contained unexpected data type: {type(loaded_data)}. Creating new empty backlog.")
-                            # Fall through to return empty dict after saving
-                            self.backlog = {}
-                            self._save_backlog() # Save the empty dict state
-                            return {}
+                            raise TypeError(
+                                f"Backlog must be a JSON object, got {type(loaded_data).__name__}"
+                            )
                     else:
                         logger.debug("Backlog file exists but is empty. Starting with empty backlog.")
                         return {} # Return empty dict for empty file
-            except json.JSONDecodeError as e:
+            except (json.JSONDecodeError, TypeError) as e:
                 logger.error(f"Error loading backlog: {e}")
-                logger.info("Creating new empty backlog due to loading error")
-                self.backlog = {} # Initialize as dict
-                self._save_backlog()
-                return {} # Return empty dict
+                return self._recover_backlog()
             except Exception as e:
                 logger.error(f"Error loading backlog: {e}")
                 return {} # Return empty dict on other load errors
@@ -93,16 +99,69 @@ class BacklogCleaner:
         # but return {} for safety.
         return {}
 
-    def _save_backlog(self):
-        """Save the backlog to file"""
+    def _recover_backlog(self):
+        """Preserve a corrupt primary file and recover the last valid backup."""
+        recovered = {}
         try:
-            # Specify encoding for writing JSON
-            with open(self.backlog_file, 'w', encoding='utf-8') as f:
-                json.dump(self.backlog, f, indent=4) # Add indent for readability
-        except Exception as e:
-            logger.error(f"Error saving backlog: {e}")
+            backup_data = json.loads(self.backup_file.read_text(encoding='utf-8'))
+            if isinstance(backup_data, dict):
+                recovered = backup_data
+            else:
+                logger.error("Backlog backup has an unexpected data type.")
+        except FileNotFoundError:
+            logger.error("No backlog backup is available for recovery.")
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.error("Could not read backlog backup: %s", exc)
 
-    def add(self, simkl_id, title, additional_data=None):
+        if self.backlog_file.exists():
+            stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+            corrupt = self.backlog_file.with_name(f"{self.backlog_file.name}.corrupt-{stamp}")
+            try:
+                self.backlog_file.replace(corrupt)
+                logger.error("Preserved corrupt backlog as %s", corrupt.name)
+            except OSError as exc:
+                logger.error("Could not preserve corrupt backlog: %s", exc)
+                return recovered
+
+        self.backlog = recovered
+        if self._save_backlog(create_backup=False):
+            logger.warning("Recovered %d backlog event(s) from backup.", len(recovered))
+        return recovered
+
+    def _save_backlog(self, create_backup=True):
+        """Save the backlog to file"""
+        temp = self.backlog_file.with_suffix(self.backlog_file.suffix + '.tmp')
+        with self._lock:
+            try:
+                self.backlog_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(temp, 'w', encoding='utf-8') as f:
+                    json.dump(self.backlog, f, indent=4)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if create_backup and self.backlog_file.exists():
+                    try:
+                        current = json.loads(self.backlog_file.read_text(encoding='utf-8'))
+                        if isinstance(current, dict):
+                            backup_temp = self.backup_file.with_suffix(self.backup_file.suffix + '.tmp')
+                            shutil.copy2(self.backlog_file, backup_temp)
+                            backup_temp.replace(self.backup_file)
+                    except (OSError, json.JSONDecodeError):
+                        logger.warning("Skipped backup of an invalid backlog file.")
+                temp.replace(self.backlog_file)
+                return True
+            except Exception as e:
+                logger.error(f"Error saving backlog: {e}")
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return False
+
+    def add(self, simkl_id, title, additional_data=None, unique_event=False):
+        with self._lock:
+            return self._add_unlocked(simkl_id, title, additional_data, unique_event)
+
+    def _add_unlocked(self, simkl_id, title, additional_data=None, unique_event=False):
         """
         Add or update a media item in the backlog dictionary.
 
@@ -111,10 +170,11 @@ class BacklogCleaner:
             title: Title of the media.
             additional_data: Dictionary with additional data (type, season, episode, etc.).
         """
-        item_key = str(simkl_id) # Use string representation as key
+        item_key = f"watch_{uuid.uuid4().hex}" if unique_event else str(simkl_id)
 
         # Check if item already exists
         existing_entry = self.backlog.get(item_key)
+        previous_entry = copy.deepcopy(existing_entry)
 
         if existing_entry:
             # Update existing entry - prioritize new data but keep old tracking info
@@ -144,14 +204,20 @@ class BacklogCleaner:
 
             self.backlog[item_key] = entry
 
-        self._save_backlog()
+        if not self._save_backlog():
+            if previous_entry is None:
+                self.backlog.pop(item_key, None)
+            else:
+                self.backlog[item_key] = previous_entry
+            return None
+        return item_key
 
     def get_pending(self) -> dict:
         """Get all pending backlog entries as a dictionary."""
-        # Ensure backlog is loaded (might be redundant but safe)
-        if not isinstance(self.backlog, dict):
-             self.backlog = self._load_backlog()
-        return self.backlog
+        with self._lock:
+            if not isinstance(self.backlog, dict):
+                 self.backlog = self._load_backlog()
+            return copy.deepcopy(self.backlog)
 
     def update_item(self, simkl_id, updates: dict):
          """
@@ -162,12 +228,15 @@ class BacklogCleaner:
              updates: A dictionary containing the fields and values to update.
          """
          item_key = str(simkl_id)
-         if item_key in self.backlog:
-             self.backlog[item_key].update(updates)
-             self._save_backlog()
-             logger.debug(f"Updated backlog item {item_key} with: {updates}")
-             return True
-         else:
+         with self._lock:
+             if item_key in self.backlog:
+                 previous = copy.deepcopy(self.backlog[item_key])
+                 self.backlog[item_key].update(updates)
+                 if self._save_backlog():
+                     logger.debug(f"Updated backlog item {item_key} with: {updates}")
+                     return True
+                 self.backlog[item_key] = previous
+                 return False
              logger.warning(f"Attempted to update non-existent backlog item: {item_key}")
              return False
 
@@ -179,30 +248,38 @@ class BacklogCleaner:
             simkl_id: The Simkl ID (key) of the item to remove.
         """
         item_key = str(simkl_id) # Ensure key is string
-        if item_key in self.backlog:
-            try:
-                del self.backlog[item_key]
-                self._save_backlog()
-                logger.info(f"Removed item '{item_key}' from backlog.")
-                return True
-            except KeyError:
-                 logger.warning(f"KeyError trying to remove '{item_key}' though it was present initially.")
-                 return False # Should not happen if check passes, but handle defensively
-            except Exception as e:
-                 logger.error(f"Error removing item '{item_key}' from backlog: {e}", exc_info=True)
-                 return False
-        else:
+        with self._lock:
+            if item_key in self.backlog:
+                try:
+                    previous = self.backlog.pop(item_key)
+                    if self._save_backlog():
+                        logger.info(f"Removed item '{item_key}' from backlog.")
+                        return True
+                    self.backlog[item_key] = previous
+                    return False
+                except KeyError:
+                     logger.warning(f"KeyError trying to remove '{item_key}' though it was present initially.")
+                     return False # Should not happen if check passes, but handle defensively
+                except Exception as e:
+                     logger.error(f"Error removing item '{item_key}' from backlog: {e}", exc_info=True)
+                     return False
             logger.debug(f"Attempted to remove non-existent item '{item_key}' from backlog.")
             return False # Item wasn't there
 
     def clear(self):
         """Clear the entire backlog dictionary."""
-        self.backlog = {}
-        self._save_backlog()
-        logger.info("Cleared the entire backlog.")
+        with self._lock:
+            previous = self.backlog
+            self.backlog = {}
+            if self._save_backlog():
+                logger.info("Cleared the entire backlog.")
+                return True
+            self.backlog = previous
+            return False
 
     def has_pending_items(self) -> bool:
         """Check if there are any pending items in the backlog."""
-        return bool(self.backlog)
+        with self._lock:
+            return bool(self.backlog)
 
     # Removed the internal process_backlog method as it's handled by MediaScrobbler

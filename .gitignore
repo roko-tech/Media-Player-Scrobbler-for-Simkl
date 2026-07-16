@@ -19,6 +19,7 @@ ENV/
 
 # Environment files with sensitive data
 .env
+.simkl_mps.env
 trakt_config.json
 trakt_token.json
 trakt_sync_state.json
@@ -31,6 +32,12 @@ trakt_sync_state.json
 # Cache files
 *_cache.json
 media_cache.json
+anime-list-full.json
+
+# Personal media state
+watch_history.json
+media_overrides.json
+watch-history-viewer/data.js
 
 
 # Backlog data

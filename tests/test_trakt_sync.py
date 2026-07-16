@@ -107,6 +107,83 @@ def test_build_payload_uses_exact_local_events_and_remaps_anime(monkeypatch):
     assert anime["seasons"][0]["episodes"][0]["number"] == 6
 
 
+def test_partial_not_found_retries_only_echoed_event():
+    events = [
+        {
+            "kind": "episode",
+            "simkl_id": 1,
+            "season": 1,
+            "episode": 1,
+            "watched_at": "2026-07-15T18:00:00.000Z",
+        },
+        {
+            "kind": "episode",
+            "simkl_id": 1,
+            "season": 1,
+            "episode": 2,
+            "watched_at": "2026-07-15T18:30:00.000Z",
+        },
+    ]
+    not_found = {
+        "shows": [
+            {
+                "seasons": [
+                    {
+                        "number": 1,
+                        "episodes": [
+                            {
+                                "number": 2,
+                                "watched_at": "2026-07-15T18:30:00.000Z",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+
+    retry = trakt_sync._not_found_events(events, not_found)
+
+    assert retry == [events[1]]
+
+
+def test_push_trakt_exposes_retry_after_without_immediate_loop(monkeypatch):
+    calls = []
+
+    class Response:
+        status_code = 429
+        headers = {"Retry-After": "300", "X-Ratelimit": '{"remaining":0}'}
+
+        @staticmethod
+        def json():
+            return {"error": "rate limited"}
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Response()
+
+    monkeypatch.setattr(trakt_sync.requests, "post", fake_post)
+
+    status, body, retry_after = trakt_sync.push_trakt(
+        {"client_id": "client"}, "token", {"movies": [], "shows": []}
+    )
+
+    assert status == 429
+    assert body == {"error": "rate limited"}
+    assert retry_after == 300
+    assert len(calls) == 1
+
+
+def test_watcher_uses_provider_retry_after():
+    watcher = TraktSyncWatcher(retry_seconds=120)
+
+    delay = watcher._retry_delay(
+        trakt_sync.SyncResult(False, "rate limited", retry_after=300)
+    )
+
+    assert delay == 300
+
+
 def test_collect_history_events_uses_watch_events_not_aggregate_fields():
     history = [
         {
@@ -206,6 +283,26 @@ def test_unmatched_event_is_saved_and_retried_after_marker_advances(tmp_path, mo
     assert second.ok is True
     assert pushed["payload"]["shows"][0]["seasons"][0]["number"] == 2
     assert saved["pending"] == []
+
+
+def test_trakt_state_recovers_backup_and_preserves_corrupt_primary(
+    tmp_path, monkeypatch
+):
+    state_file = tmp_path / "trakt_sync_state.json"
+    backup_file = tmp_path / "trakt_sync_state.json.bak"
+    expected = {
+        "synced_through": "2026-07-15T14:00:00.000Z",
+        "pending": [{"kind": "movie", "watched_at": "2026-07-15T15:00:00.000Z"}],
+    }
+    state_file.write_text("{broken", encoding="utf-8")
+    backup_file.write_text(json.dumps(expected), encoding="utf-8")
+    monkeypatch.setattr(trakt_sync, "STATE_FILE", state_file)
+
+    recovered = trakt_sync.load_state({})
+
+    assert recovered == expected
+    assert json.loads(state_file.read_text(encoding="utf-8")) == expected
+    assert list(tmp_path.glob("trakt_sync_state.json.corrupt-*"))
 
 
 def test_sync_health_records_response_and_builds_secret_safe_report(tmp_path, monkeypatch):
@@ -320,3 +417,37 @@ def test_failed_response_is_visible_in_health_without_replacing_last_success(
     assert saved["health"]["last_http_status"] == 503
     assert saved["health"]["last_pending"] == 1
     assert saved["health"]["last_success_at"] == "2026-07-15T14:30:00.000Z"
+
+
+def test_fribb_map_reloads_when_cache_appears(tmp_path, monkeypatch):
+    cache = tmp_path / "anime-list-full.json"
+    monkeypatch.setattr(trakt_sync, "FRIBB_FILE", cache)
+    monkeypatch.setattr(trakt_sync, "_FRIBB", None)
+
+    assert trakt_sync._fribb_map() == {}
+
+    cache.write_text(
+        '[{"simkl_id":529392,"tvdb_id":291630,"season":{"tvdb":2}}]',
+        encoding="utf-8",
+    )
+
+    assert trakt_sync._fribb_map()[529392]["season"] == 2
+
+
+def test_watcher_retries_failed_sync_without_another_history_change(monkeypatch):
+    watcher = TraktSyncWatcher(poll_seconds=0.01, debounce_seconds=0.01, retry_seconds=0.03)
+    calls = []
+
+    def fake_sync_now():
+        calls.append(len(calls))
+        if len(calls) >= 2:
+            watcher._stop.set()
+            return trakt_sync.SyncResult(True, "recovered")
+        return trakt_sync.SyncResult(False, "network failed", pending=1)
+
+    monkeypatch.setattr(watcher, "sync_now", fake_sync_now)
+    monkeypatch.setattr(watcher, "_mtime", lambda: 0.0)
+
+    watcher._watch_loop()
+
+    assert len(calls) == 2

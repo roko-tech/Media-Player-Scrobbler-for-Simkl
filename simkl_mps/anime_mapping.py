@@ -41,16 +41,23 @@ def _cache_path():
 
 
 def _download(path):
+    tmp = path.with_suffix(".tmp")
     try:
         r = requests.get(_URL, timeout=60)
         r.raise_for_status()
-        tmp = path.with_suffix(".tmp")
         tmp.write_bytes(r.content)
+        downloaded = json.loads(tmp.read_text(encoding="utf-8"))
+        if not isinstance(downloaded, list):
+            raise ValueError("mapping root is not a JSON array")
         tmp.replace(path)
         logger.info(f"anime-lists: downloaded {len(r.content) // 1024} KB to {path}")
         return True
     except Exception as e:
         logger.warning(f"anime-lists: download failed: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         return False
 
 

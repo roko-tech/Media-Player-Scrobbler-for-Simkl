@@ -6,6 +6,12 @@ its local `watch_history.json` and immediately sends it to Trakt. Startup and
 file polling remain as recovery paths. Events Trakt cannot match are retained in
 `trakt_sync_state.json` and retried later.
 
+The local watch history, Simkl backlog, and Trakt state are written with atomic
+file replacement and last-known-good backups. A corrupt primary file is
+preserved with a `.corrupt-*` suffix before recovery. Completed backlog events
+have unique keys, so two offline episodes from the same show cannot overwrite
+one another, and events are not deleted after an arbitrary retry count.
+
 ## One-time setup
 
 1. Create a Trakt API application at <https://trakt.tv/oauth/applications>.
@@ -44,6 +50,12 @@ pending counts, the last Trakt HTTP response, added/not-found counts, and the
 last attempt and success times. **Copy Safe Diagnostics** omits media titles,
 service IDs, file paths, and credentials so its output can be shared safely.
 
+The watcher retries pending work on a timer even when `watch_history.json` does
+not change again. Trakt `429` responses honor the official `Retry-After` delay;
+temporary `502`, `503`, and `504` responses are retried after 30 seconds. If a
+batch is only partly matched, echoed watch timestamps are used to retain only
+the rejected events, avoiding duplicate rewatch records for successful items.
+
 Automatic syncing starts with the normal Simkl tray; no second watcher process
 or tray icon is required.
 
@@ -58,7 +70,9 @@ precedence over folder overrides, and the nearest matching folder wins. Use
 
 ## Letterboxd
 
-Letterboxd exposes write endpoints only to approved API clients. Its API access
-form says private/personal projects are not currently accepted, so this project
-does not include an unsupported browser-scraping login. The old CSV importer can
-remain as a separate manual archive if needed.
+Letterboxd documents write endpoints, but access is available by request and its
+current [API access policy](https://letterboxd.com/api-beta/access/) says private
+or personal projects are not currently accepted. This project therefore does
+not automate a browser login or scrape the website. An official OAuth adapter
+can be added if Letterboxd grants API access; until then, its supported
+import/export tools are the safe option.

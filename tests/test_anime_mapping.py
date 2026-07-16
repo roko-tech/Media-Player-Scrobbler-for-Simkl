@@ -29,3 +29,21 @@ def test_existing_anime_map_is_available_on_first_lookup(tmp_path, monkeypatch):
     monkeypatch.setattr(anime_mapping, "_loading", False)
 
     assert anime_mapping.resolve_split_season(431548, 2) == 529392
+
+
+def test_invalid_download_keeps_last_known_good_map(tmp_path, monkeypatch):
+    cache = tmp_path / "anime-list-full.json"
+    original = '[{"simkl_id": 431548, "tvdb_id": 291630, "season": {"tvdb": 1}}]'
+    cache.write_text(original, encoding="utf-8")
+
+    class Response:
+        content = b"not-json"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    monkeypatch.setattr(anime_mapping.requests, "get", lambda *args, **kwargs: Response())
+
+    assert anime_mapping._download(cache) is False
+    assert cache.read_text(encoding="utf-8") == original

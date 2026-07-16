@@ -14,7 +14,6 @@ from logging.handlers import TimedRotatingFileHandler
 from simkl_mps.monitor import Monitor
 from simkl_mps.credentials import get_credentials
 from simkl_mps.config_manager import get_app_data_dir, initialize_paths, get_setting, APP_NAME
-from simkl_mps.watch_history_manager import WatchHistoryManager # Added import
 from simkl_mps.trakt_watcher import TraktSyncWatcher
 
 # Import platform-specific tray implementation
@@ -161,8 +160,8 @@ class SimklScrobbler:
 
         # Initialize Watch History Manager early
         try:
-            self.watch_history_manager = WatchHistoryManager(APP_DATA_DIR)
-            self.monitor.scrobbler.watch_history.set_on_saved(
+            self.watch_history_manager = self.monitor.scrobbler.watch_history
+            self.watch_history_manager.set_on_saved(
                 self.trakt_watcher.notify_history_saved
             )
             logger.info("Watch History Manager initialized.")

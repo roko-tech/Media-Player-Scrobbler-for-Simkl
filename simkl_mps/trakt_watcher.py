@@ -2,6 +2,7 @@
 
 import logging
 import threading
+import time
 
 from simkl_mps import trakt_sync
 
@@ -10,9 +11,10 @@ logger = logging.getLogger(__name__)
 
 
 class TraktSyncWatcher:
-    def __init__(self, poll_seconds=10, debounce_seconds=5):
+    def __init__(self, poll_seconds=10, debounce_seconds=5, retry_seconds=120):
         self.poll_seconds = poll_seconds
         self.debounce_seconds = debounce_seconds
+        self.retry_seconds = retry_seconds
         self._stop = threading.Event()
         self._history_saved = threading.Event()
         self._sync_lock = threading.Lock()
@@ -95,6 +97,8 @@ class TraktSyncWatcher:
                     f"Not found: {health.get('last_not_found', 0)}",
                 ]
             )
+        if health.get("last_retry_after"):
+            lines.append(f"Retry after: {health['last_retry_after']} second(s)")
         lines.extend(
             [
                 f"Pending retries: {snapshot.get('pending', 0)}",
@@ -160,25 +164,44 @@ class TraktSyncWatcher:
         except OSError:
             return None
 
+    def _retry_delay(self, result):
+        return max(self.retry_seconds, int(result.retry_after or 0))
+
+    def _next_retry(self, result):
+        if result.ok and not result.pending:
+            return None
+        return time.monotonic() + self._retry_delay(result)
+
     def _watch_loop(self):
         last_mtime = self._mtime() or 0.0
-        self.sync_now()  # catch up and retry pending events after startup
+        result = self.sync_now()  # catch up and retry pending events after startup
+        next_retry = self._next_retry(result)
         while not self._stop.is_set():
-            notified = self._history_saved.wait(self.poll_seconds)
+            wait_seconds = self.poll_seconds
+            if next_retry is not None:
+                wait_seconds = min(wait_seconds, max(0.0, next_retry - time.monotonic()))
+            notified = self._history_saved.wait(wait_seconds)
             if self._stop.is_set():
                 return
             if notified:
                 self._history_saved.clear()
                 last_mtime = self._mtime() or last_mtime
                 logger.info("Trakt sync: completed-watch event saved; syncing now")
-                self.sync_now()
+                result = self.sync_now()
+                next_retry = self._next_retry(result)
                 continue
 
             current_mtime = self._mtime()
-            if current_mtime is None or current_mtime == last_mtime:
+            if current_mtime is not None and current_mtime != last_mtime:
+                if self._stop.wait(self.debounce_seconds):
+                    return
+                last_mtime = self._mtime() or current_mtime
+                logger.info("Trakt sync: watch_history.json changed; syncing exact local events")
+                result = self.sync_now()
+                next_retry = self._next_retry(result)
                 continue
-            if self._stop.wait(self.debounce_seconds):
-                return
-            last_mtime = self._mtime() or current_mtime
-            logger.info("Trakt sync: watch_history.json changed; syncing exact local events")
-            self.sync_now()
+
+            if next_retry is not None and time.monotonic() >= next_retry:
+                logger.info("Trakt sync: retrying a failed or pending sync without a new history change")
+                result = self.sync_now()
+                next_retry = self._next_retry(result)

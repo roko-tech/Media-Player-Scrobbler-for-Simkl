@@ -1,7 +1,7 @@
 # 🎬 Media Player Scrobbler for Simkl
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue.svg)]()
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ByteTrix/Media-Player-Scrobbler-for-Simkl)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/roko-tech/Media-Player-Scrobbler-for-Simkl)
 <div align="center">
   <img src="simkl_mps/assets/simkl-mps.png" alt="SIMKL MPS Logo" width="120"/>
   <br/>
@@ -14,7 +14,7 @@
 - 🌐 **Cross-Platform** – Windows, macOS, Linux
 - 🖥️ **Native Executable** – System tray, auto-update, and background service (Windows)
 - 📈 **Accurate Position Tracking** – For supported players (configure via [Media Players Guide](docs/media-players.md))
-- 🔌 **Offline Support** – Queues updates when offline
+- 🔌 **Durable Offline Support** – Queues distinct completed-watch events until they succeed
 - 🧠 **Smart Media Detection** – Intelligent filename parsing
 - 🍿 **Media-Focused** – Optimized for every type of media (Movies,TV Shows and Anime)
 - ✅ **Optional Trakt Sync** – Pushes the same completed watches from local history to Trakt
@@ -33,16 +33,29 @@ To keep Trakt current from the same tray process, see the [Automatic Trakt Sync 
 ## 🔍 How It Works
 
 ```mermaid
-graph LR
-    A[Media Player] -->|Player Title| B[Simkl Scrobbler]
-    B -->|Parse Title| C[Media Identification]
-    C -->|Track Progress| D[Simkl API]
-    D -->|Mark as Watched| E[Simkl Profile]
-    D -->|Completed local event| F[Trakt History]
-    
+flowchart LR
+    A["Media player"] --> B["Playback monitor"]
+    B --> C["Identification"]
+    O["File and folder overrides"] --> C
+    F["Fribb anime mapping"] --> C
+    C --> D["Completion threshold"]
+    D --> E["Simkl API"]
+    D --> Q["Durable backlog"]
+    Q --> E
+    E --> H["Atomic local watch event"]
+    Q --> H
+    H --> T["Trakt watcher"]
+    T --> R["Trakt API"]
+
     style A fill:#d5f5e3,stroke:#333,stroke-width:2px
     style E fill:#d5f5e3,stroke:#333,stroke-width:2px
+    style R fill:#d5f5e3,stroke:#333,stroke-width:2px
 ```
+
+Completed events use atomic JSON replacement and last-known-good backups. Offline
+events have unique keys, are never discarded after a retry count, and retain
+their original watch timestamp. Trakt retries unmatched or failed events without
+requiring another playback event; rate-limited requests honor `Retry-After`.
 
 ## 🚦 Performance Notes
 
@@ -76,6 +89,7 @@ Just a little reminder! If you enjoy what I create, you can support me at https:
 ## 🙏 Acknowledgments
 
 - [Simkl](https://simkl.com) – API platform
+- [ByteTrix](https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl) – Original project
 - [guessit](https://github.com/guessit-io/guessit) – Filename parsing
 - [iamkroot's Trakt Scrobbler](https://github.com/iamkroot/trakt-scrobbler/) – Inspiration
 - [Masyk](https://github.com/masyk), [Ichika](https://github.com/ekleop) – Logo and technical guidance (SIMKL Devs)
@@ -92,9 +106,9 @@ These tools can help organize and rename media files automatically, which can im
 <div align="center">
   <p>Made with ❤️ by <a href="https://github.com/itskavin">kavin</a></p>
   <p>
-    <a href="https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/stargazers">⭐ Star us on GitHub</a> •
-    <a href="https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/issues">🐞 Report Bug</a> •
-    <a href="https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/issues">✨ Request Feature</a>
+    <a href="https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl/stargazers">⭐ Star us on GitHub</a> •
+    <a href="https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl/issues">🐞 Report Bug</a> •
+    <a href="https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl/issues">✨ Request Feature</a>
   </p>
 </div>
 

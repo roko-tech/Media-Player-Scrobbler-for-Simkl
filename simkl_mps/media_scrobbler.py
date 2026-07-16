@@ -58,9 +58,6 @@ class MediaScrobbler:
     - Supports multiple media types (movies, episodes, anime)
     """
     
-    # Class constants
-    MAX_BACKLOG_ATTEMPTS = 5  # Maximum retry attempts for backlog items
-
     def __init__(self, app_data_dir, client_id=None, access_token=None, testing_mode=False):
         self.app_data_dir = pathlib.Path(app_data_dir) # Ensure it's a Path object
         self.client_id = client_id
@@ -1684,6 +1681,13 @@ class MediaScrobbler:
 
         return added_count, not_found_count
 
+    def _simkl_history_result_accepted(self, sync_result):
+        """Return True only when Simkl accepted the single history payload."""
+        if not sync_result:
+            return False
+        _, not_found_count = self._get_sync_counts(sync_result)
+        return not_found_count == 0
+
 
     def _attempt_add_to_history(self):
         """
@@ -1713,11 +1717,12 @@ class MediaScrobbler:
         if not self.client_id or not self.access_token:
             logger.error(f"Cannot add '{display_title}' to history: missing API credentials.")
             if self.simkl_id: # If we have an ID, we can backlog it
-                self._add_to_backlog_due_to_issue(
+                queued = self._add_to_backlog_due_to_issue(
                     self.simkl_id, display_title, "missing_credentials",
                     {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode}
                 )
-                self._send_notification("Auth Error", f"'{display_title}' needs sync (missing creds). Added to backlog.", critical=True)
+                if queued:
+                    self._send_notification("Auth Error", f"'{display_title}' needs sync (missing creds). Added to backlog.", critical=True)
             return False
 
         # --- Identification Check ---
@@ -1738,8 +1743,9 @@ class MediaScrobbler:
                     "original_filepath": self.current_filepath, # Critical for later re-identification
                     "source": "guessit_for_backlog"
                 }
-                self._add_to_backlog_due_to_issue(backlog_key, guessit_title_for_backlog, "guessit_fallback", backlog_data)
-                self._send_notification("Offline: Added to Backlog (Filename Data)", f"'{guessit_title_for_backlog}' needs sync.", offline_only=True)
+                queued = self._add_to_backlog_due_to_issue(backlog_key, guessit_title_for_backlog, "guessit_fallback", backlog_data)
+                if queued:
+                    self._send_notification("Offline: Added to Backlog (Filename Data)", f"'{guessit_title_for_backlog}' needs sync.", offline_only=True)
             elif not is_internet_connected():
                 # Offline, no Simkl ID, no guessit fallback suitable for backlog
                 import uuid
@@ -1754,8 +1760,9 @@ class MediaScrobbler:
                     "original_filepath": self.current_filepath,
                     "source": "temp_id_offline_unidentified"
                 }
-                self._add_to_backlog_due_to_issue(temp_id, display_title, "temp_id_offline", backlog_data)
-                self._send_notification("Offline: Added to Backlog (Temp ID)", f"'{display_title}' needs sync.", offline_only=True)
+                queued = self._add_to_backlog_due_to_issue(temp_id, display_title, "temp_id_offline", backlog_data)
+                if queued:
+                    self._send_notification("Offline: Added to Backlog (Temp ID)", f"'{display_title}' needs sync.", offline_only=True)
             else: # Online, but no Simkl ID and no suitable fallback
                 logger.info(f"Cannot add '{display_title}' to history yet: Simkl ID unknown and no suitable fallback. Will retry identification.")
             return False # Return false whether backlogged or just waiting for ID
@@ -1768,11 +1775,12 @@ class MediaScrobbler:
             if self.is_pro_or_vip():
                 allow_rewatch = get_setting('allow_rewatch', True)
             
-            self._add_to_backlog_due_to_issue(
+            queued = self._add_to_backlog_due_to_issue(
                 self.simkl_id, display_title, "offline_with_id",
                 {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode, "allow_rewatch": allow_rewatch}
             )
-            self._send_notification("Offline: Added to Backlog", f"'{display_title}' will sync when online.", offline_only=True)
+            if queued:
+                self._send_notification("Offline: Added to Backlog", f"'{display_title}' will sync when online.", offline_only=True)
             return False
 
         # --- Ensure Season/Episode for Shows/Anime (Simkl Type) ---
@@ -1811,14 +1819,41 @@ class MediaScrobbler:
                 is_rewatch = self._is_local_rewatch(self.simkl_id, self.media_type, self.season, self.episode)
 
             result = add_to_history(payload, self.client_id, self.access_token, allow_rewatch=allow_rewatch)
-            if result:
+            if self._simkl_history_result_accepted(result):
                 self.completed = True
                 self._log_playback_event("added_to_history_success", {"simkl_id": self.simkl_id, "type": self.media_type})
-                self._store_in_watch_history(
+                history_saved = self._store_in_watch_history(
                     self.simkl_id, self.currently_tracking, self.movie_name, # Raw, Official
                     media_type=self.media_type, season=self.season, episode=self.episode,
                     original_filepath=self.current_filepath
                 )
+                if not history_saved:
+                    logger.critical(
+                        "Simkl accepted %s, but the durable local watch event could not be saved.",
+                        log_item_desc,
+                    )
+                    queued = self.backlog_cleaner.add(
+                        self.simkl_id,
+                        display_title,
+                        additional_data={
+                            "simkl_id": self.simkl_id,
+                            "title": display_title,
+                            "type": self.media_type,
+                            "season": self.season,
+                            "episode": self.episode,
+                            "original_filepath": self.current_filepath,
+                            "watched_at": watched_at,
+                            "simkl_synced": True,
+                            "last_error": "Local watch-history write failed",
+                        },
+                        unique_event=True,
+                    )
+                    message = (
+                        f"'{display_title}' is on Simkl; local history and Trakt will retry."
+                        if queued
+                        else f"'{display_title}' is on Simkl, but local recovery storage also failed."
+                    )
+                    self._send_notification("Local History Pending", message, critical=True)
                 media_label = (self.media_type or 'media').capitalize()
                 added_count, not_found_count = self._get_sync_counts(result)
                 if added_count == 0 and not_found_count == 0:
@@ -1838,29 +1873,32 @@ class MediaScrobbler:
                 if cache_key_for_cooldown in self.last_backlog_attempt_time:
                     del self.last_backlog_attempt_time[cache_key_for_cooldown]
                 return True
-            else: # API call made, but returned failure (e.g., Simkl error)
-                logger.warning(f"Failed to add {log_item_desc} to Simkl history (API indicated failure). Adding to backlog.")
-                self._add_to_backlog_due_to_issue(
+            else: # API call failed or explicitly reported the item as not found
+                logger.warning(f"Failed to add {log_item_desc} to Simkl history (API rejected or did not match it). Adding to backlog.")
+                queued = self._add_to_backlog_due_to_issue(
                     self.simkl_id, display_title, "api_sync_fail",
                     {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode, "error": "API_FAIL"}
                 )
-                self._send_notification("Online Sync Failed", f"'{display_title}' couldn't sync. Added to backlog.")
+                if queued:
+                    self._send_notification("Online Sync Failed", f"'{display_title}' couldn't sync. Added to backlog.")
                 return False
         except RequestException as e: # Network errors
             logger.warning(f"Network error adding {log_item_desc} to history: {e}. Adding to backlog.")
-            self._add_to_backlog_due_to_issue(
+            queued = self._add_to_backlog_due_to_issue(
                 self.simkl_id, display_title, "api_network_error",
                 {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode, "error": str(e)}
             )
-            self._send_notification("Sync Network Error", f"'{display_title}' couldn't sync. Added to backlog.")
+            if queued:
+                self._send_notification("Sync Network Error", f"'{display_title}' couldn't sync. Added to backlog.")
             return False
         except Exception as e: # Other unexpected errors
             logger.error(f"Unexpected error adding {log_item_desc} to history: {e}", exc_info=True)
-            self._add_to_backlog_due_to_issue(
+            queued = self._add_to_backlog_due_to_issue(
                 self.simkl_id, display_title, "api_exception",
                 {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode, "error": str(e)}
             )
-            self._send_notification("Sync Error", f"Error syncing '{display_title}'. Added to backlog.")
+            if queued:
+                self._send_notification("Sync Error", f"Error syncing '{display_title}'. Added to backlog.")
             return False
 
     def _add_to_backlog_due_to_issue(self, item_key_for_backlog, title_for_backlog, reason_code, backlog_data_payload):
@@ -1876,7 +1914,25 @@ class MediaScrobbler:
                 watched_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
             backlog_data_payload['watched_at'] = watched_at
 
-        self.backlog_cleaner.add(item_key_for_backlog, title_for_backlog, additional_data=backlog_data_payload)
+        item_key = self.backlog_cleaner.add(
+            item_key_for_backlog,
+            title_for_backlog,
+            additional_data=backlog_data_payload,
+            unique_event=True,
+        )
+
+        if not item_key:
+            logger.critical(
+                "Could not durably queue completed watch '%s'; playback will remain eligible for retry.",
+                title_for_backlog,
+            )
+            self._send_notification(
+                "Backlog Save Failed",
+                f"Could not safely queue '{title_for_backlog}'. Playback will retry.",
+                critical=True,
+            )
+            self._log_playback_event(f"backlog_save_failed_{reason_code}", backlog_data_payload)
+            return False
         
         # Use a consistent cache key for cooldown, based on current filepath or raw title
         cooldown_key = (
@@ -1888,6 +1944,7 @@ class MediaScrobbler:
         
         self.completed = True # Mark as "handled" for this playback session
         self._log_playback_event(f"added_to_backlog_{reason_code}", backlog_data_payload)
+        return True
 
 
     def _resolve_missing_season_episode(self, cache_key):
@@ -1995,7 +2052,8 @@ class MediaScrobbler:
 
     def _store_in_watch_history(self, simkl_id, original_title, resolved_title=None,
                                 media_type=None, season=None, episode=None,
-                                original_filepath=None, api_details_to_use=None):
+                                original_filepath=None, api_details_to_use=None,
+                                watched_at=None):
         """Stores watched media in local history, enriching with API details if needed."""
         if not hasattr(self, 'watch_history'): # Should be initialized in __init__
             self.watch_history = WatchHistoryManager(self.app_data_dir)
@@ -2019,7 +2077,8 @@ class MediaScrobbler:
             'type': media_type or 'movie',          # Simkl type ('movie', 'show', 'anime')
             'season': season,
             'episode': episode,
-            'watched_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            'watched_at': watched_at or getattr(self, 'watched_at', None)
+                          or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
             'ids': {'simkl': simkl_id} # Ensure base 'ids' with simkl_id
         }
         if media_file_path_for_history:
@@ -2123,65 +2182,42 @@ class MediaScrobbler:
 
         try:
             logger.debug(f"Adding to local watch history: ID {simkl_id}, Title: '{history_entry['title']}', Type: {history_entry['type']}")
-            self.watch_history.add_entry(history_entry, media_file_path=media_file_path_for_history)
+            return self.watch_history.add_entry(
+                history_entry,
+                media_file_path=media_file_path_for_history,
+            )
         except Exception as e:
             logger.error(f"Error storing in local watch history (ID: {simkl_id}): {e}", exc_info=True)
+            return False
 
-
-    def remove_failed_backlog_items(self):
-        """
-        Remove backlog items that have permanently failed (exceeded MAX_BACKLOG_ATTEMPTS).
-        Returns the number of items removed.
-        """
-        removed_count = 0
-        
-        pending_items_dict = self.backlog_cleaner.get_pending()
-        items_to_remove = []
-        
-        for item_key, item_data in pending_items_dict.items():
-            attempt_count = item_data.get("attempt_count", 0)
-            if attempt_count >= self.MAX_BACKLOG_ATTEMPTS:
-                items_to_remove.append((item_key, item_data))
-        
-        for item_key, item_data in items_to_remove:
-            title = item_data.get("title", item_key)
-            attempt_count = item_data.get("attempt_count", 0)
-            logger.info(f"[Backlog] Removing permanently failed item: '{title}' (Key: {item_key}, Attempts: {attempt_count})")
-            self.backlog_cleaner.remove(item_key)
-            # Clean up any notification throttle data for this item
-            self._backlog_notification_throttle.pop(item_key, None)
-            removed_count += 1
-        
-        if removed_count > 0:
-            logger.info(f"[Backlog] Removed {removed_count} permanently failed items from backlog.")
-        
-        return removed_count
 
     def process_backlog(self):
         """Processes pending backlog items: identifies, resolves, and syncs to Simkl."""
         BASE_RETRY_DELAY_SECONDS = 60 # 1 minute
 
-        if not self.client_id or not self.access_token:
-            logger.warning("[Backlog] Missing credentials. Cannot process.")
-            self._send_notification("Simkl Backlog Sync", "Missing API credentials to process backlog.")
-            return {'processed': 0, 'attempted': 0, 'failed': True, 'reason': 'Missing credentials'}
-
-        if not is_internet_connected():
-            logger.info("[Backlog] No internet. Sync deferred.")
-            return {'processed': 0, 'attempted': 0, 'failed': False, 'reason': 'Offline'}
-
         pending_items_dict = self.backlog_cleaner.get_pending()
         if not pending_items_dict:
             return {'processed': 0, 'attempted': 0, 'failed': False, 'reason': 'No items'}
 
-        # Clean up items that have permanently failed before processing
-        removed_count = self.remove_failed_backlog_items()
-        if removed_count > 0:
-            # Refresh the pending items after cleanup
-            pending_items_dict = self.backlog_cleaner.get_pending()
-            if not pending_items_dict:
-                logger.info(f"[Backlog] All {removed_count} items were permanently failed and removed. Nothing left to process.")
-                return {'processed': 0, 'attempted': 0, 'failed': False, 'reason': 'All items permanently failed'}
+        local_only_pending = any(
+            isinstance(item, dict) and item.get('simkl_synced')
+            for item in pending_items_dict.values()
+        )
+        remote_pending = any(
+            not (isinstance(item, dict) and item.get('simkl_synced'))
+            for item in pending_items_dict.values()
+        )
+        has_credentials = bool(self.client_id and self.access_token)
+        online = is_internet_connected()
+
+        if remote_pending and not has_credentials:
+            logger.warning("[Backlog] Missing credentials. Remote Simkl sync is deferred.")
+            self._send_notification("Simkl Backlog Sync", "Missing API credentials to process backlog.")
+        if remote_pending and not online:
+            logger.info("[Backlog] No internet. Remote Simkl sync is deferred.")
+        if not local_only_pending and (not has_credentials or not online):
+            reason = 'Missing credentials' if not has_credentials else 'Offline'
+            return {'processed': 0, 'attempted': 0, 'failed': not has_credentials, 'reason': reason}
 
         logger.info(f"[Backlog] Processing {len(pending_items_dict)} items...")
         # Send start notification - simplified message
@@ -2214,18 +2250,45 @@ class MediaScrobbler:
                 attempt_count = item_data.get("attempt_count", 0)
                 last_attempt_ts = item_data.get("last_attempt_timestamp")
 
-                if attempt_count >= self.MAX_BACKLOG_ATTEMPTS:
-                    # This should rarely happen now since we remove failed items at the start
-                    logger.debug(f"[Backlog] Item '{display_title}' (Key: {item_key}) max attempts reached. Removing permanently.")
-                    self.backlog_cleaner.remove(item_key)
-                    self._backlog_notification_throttle.pop(item_key, None)
-                    continue
-
                 if last_attempt_ts:
                     retry_delay = BASE_RETRY_DELAY_SECONDS * (2 ** min(attempt_count, 6)) # Cap exponential backoff
                     if current_time - last_attempt_ts < retry_delay:
                         logger.debug(f"[Backlog] Item '{display_title}' (Key: {item_key}) in retry cooldown. Skipping.")
                         continue
+
+                if item_data.get('simkl_synced'):
+                    attempted_this_cycle += 1
+                    logger.info(
+                        "[Backlog] Retrying durable local event for '%s' (Key: %s, Attempt: %s)",
+                        display_title,
+                        item_key,
+                        attempt_count + 1,
+                    )
+                    local_saved = self._store_in_watch_history(
+                        item_data.get('simkl_id'),
+                        item_data.get('original_title', display_title),
+                        item_data.get('title', display_title),
+                        media_type=item_data.get('type'),
+                        season=item_data.get('season'),
+                        episode=item_data.get('episode'),
+                        original_filepath=item_data.get('original_filepath'),
+                        api_details_to_use=item_data.get('_api_details_for_history'),
+                        watched_at=item_data.get('watched_at'),
+                    )
+                    if local_saved:
+                        success_count += 1
+                        self.backlog_cleaner.remove(item_key)
+                    else:
+                        self.backlog_cleaner.update_item(item_key, {
+                            'attempt_count': attempt_count + 1,
+                            'last_attempt_timestamp': current_time,
+                            'last_error': "Local watch-history write failed",
+                        })
+                        failure_this_cycle = True
+                    continue
+
+                if not has_credentials or not online:
+                    continue
                 
                 attempted_this_cycle += 1
                 logger.info(f"[Backlog] Attempting item '{display_title}' (Key: {item_key}, Attempt: {attempt_count + 1})")
@@ -2306,9 +2369,8 @@ class MediaScrobbler:
                     allow_rewatch_intent = item_data.get('allow_rewatch', get_setting('allow_rewatch', True))
                     
                     sync_result = add_to_history(payload, self.client_id, self.access_token, allow_rewatch=allow_rewatch_intent)                    
-                    if sync_result:                        
-                        success_count += 1
-                        logger.info(f"[Backlog] Successfully synced '{title_to_sync}'. Removing from backlog.")
+                    if self._simkl_history_result_accepted(sync_result):
+                        logger.info(f"[Backlog] Successfully synced '{title_to_sync}' to Simkl.")
 
                         # After successful sync, fetch and cache additional details
                         cache_key_for_update = (os.path.basename(original_filepath_from_backlog).lower()
@@ -2324,7 +2386,7 @@ class MediaScrobbler:
                         # Store in local watch history with potentially enriched details
                         # item_data should have the resolved title, type, S/E from _resolve_backlog_item_identity
                         # and cache should now be updated with full details
-                        self._store_in_watch_history(
+                        local_saved = self._store_in_watch_history(
                             simkl_id_to_sync,
                             item_data.get('original_title', title_to_sync), # original detected title
                             title_to_sync, # resolved title
@@ -2332,11 +2394,22 @@ class MediaScrobbler:
                             season=season_to_sync,
                             episode=episode_to_sync,
                             original_filepath=original_filepath_from_backlog,
-                            api_details_to_use=item_data.get('_api_details_for_history') # Pass if _resolve fetched them
+                            api_details_to_use=item_data.get('_api_details_for_history'), # Pass if _resolve fetched them
+                            watched_at=watched_at_to_sync,
                         )
-                        self.backlog_cleaner.remove(item_key)
+                        if local_saved:
+                            success_count += 1
+                            self.backlog_cleaner.remove(item_key)
+                        else:
+                            self.backlog_cleaner.update_item(item_key, {
+                                'simkl_synced': True,
+                                'attempt_count': attempt_count + 1,
+                                'last_attempt_timestamp': current_time,
+                                'last_error': "Local watch-history write failed",
+                            })
+                            failure_this_cycle = True
                     else:
-                        sync_api_error = "Simkl API add_to_history call failed (returned False/None)."
+                        sync_api_error = "Simkl API add_to_history call failed or reported not_found."
                 except RequestException as e:
                     sync_api_error = f"Network error during Simkl sync: {e}"
                 except Exception as e:
@@ -2666,6 +2739,13 @@ class MediaScrobbler:
 
         # --- Simkl ID based consolidation and merging ---
         existing_key_for_id, existing_info = self.media_cache.get_by_simkl_id(simkl_id)
+        if existing_info and media_type in ['show', 'anime'] and season is not None and episode is not None:
+            same_episode = (
+                existing_info.get('season') == season
+                and existing_info.get('episode') == episode
+            )
+            if not same_episode:
+                existing_key_for_id, existing_info = None, None
 
         if existing_info: # An entry with this simkl_id already exists
             logger.info(f"Simkl ID {simkl_id} ('{display_name or existing_info.get('movie_name')}') already cached under key '{existing_key_for_id}'. Merging new data.")

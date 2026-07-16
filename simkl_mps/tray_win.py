@@ -27,6 +27,32 @@ from simkl_mps.main import APP_DATA_DIR # Keep for log/config paths
 
 logger = logging.getLogger(__name__)
 
+_ERROR_ALREADY_EXISTS = 183
+_INSTANCE_MUTEX_NAME = "Local\\MediaPlayerScrobblerForSimkl-7f2c0b63"
+_instance_mutex = None
+
+
+def _acquire_single_instance():
+    """Hold one tray instance per Windows login session."""
+    global _instance_mutex
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    handle = kernel32.CreateMutexW(None, False, _INSTANCE_MUTEX_NAME)
+    if not handle:
+        raise ctypes.WinError()
+    if kernel32.GetLastError() == _ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return False
+    _instance_mutex = handle
+    return True
+
+
+def _release_single_instance():
+    global _instance_mutex
+    if _instance_mutex:
+        ctypes.windll.kernel32.CloseHandle(_instance_mutex)
+        _instance_mutex = None
+
 
 class TrayAppWin(TrayAppBase):
     """Windows System tray application for simkl-mps using pystray"""
@@ -703,6 +729,9 @@ Tips:
 
 def run_tray_app():
     """Run the Windows tray application"""
+    if not _acquire_single_instance():
+        logger.warning("Another MPS tray instance is already running; exiting duplicate launch.")
+        return 0
     try:
         app = TrayAppWin()
         app.run()
@@ -725,6 +754,8 @@ def run_tray_app():
                 except KeyboardInterrupt:
                     scrobbler.stop()
                     print("Stopped monitoring.")
+    finally:
+        _release_single_instance()
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, 

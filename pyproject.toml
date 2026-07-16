@@ -11,8 +11,8 @@ keywords = [
     "simkl",
     "scrobbler",
 ]
-homepage = "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl"
-repository = "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl"
+homepage = "https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl"
+repository = "https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: End Users/Desktop",
@@ -64,7 +64,7 @@ markers = "sys_platform == 'linux' and python_version >= '3.9' and python_versio
 
 [tool.poetry.urls]
 "Linux System Dependencies" = "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/wiki/Installation#linux-installation"
-"Bug Reports" = "https://github.com/ByteTrix/media-player-scrobbler-for-simkl/issues"
+"Bug Reports" = "https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl/issues"
 Documentation = "https://github.com/ByteTrix/media-player-scrobbler-for-simkl/wiki"
 
 [tool.poetry.group.dev.dependencies]

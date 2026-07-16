@@ -23,6 +23,7 @@ USER_AGENT = f"{APP_NAME}/{__version__} (Python {PY_VER}; {OS_NAME})"
 logger = logging.getLogger(__name__)
 
 SIMKL_API_BASE_URL = 'https://api.simkl.com'
+DEFAULT_API_TIMEOUT = 30
 
 
 def is_internet_connected():
@@ -125,7 +126,10 @@ def search_movie(title, client_id, access_token, file_path=None):
             'app-name': APP_NAME,
             'app-version': __version__
         }
-        response = requests.get(f'{SIMKL_API_BASE_URL}/search/movie', headers=headers, params=params)
+        response = requests.get(
+            f'{SIMKL_API_BASE_URL}/search/movie', headers=headers, params=params,
+            timeout=DEFAULT_API_TIMEOUT
+        )
 
         if response.status_code == 200:
             results_json = response.json()
@@ -175,7 +179,10 @@ def search_movie(title, client_id, access_token, file_path=None):
             'app-name': APP_NAME,
             'app-version': __version__
         }
-        response = requests.get(f'{SIMKL_API_BASE_URL}/search/anime', headers=headers, params=params)
+        response = requests.get(
+            f'{SIMKL_API_BASE_URL}/search/anime', headers=headers, params=params,
+            timeout=DEFAULT_API_TIMEOUT
+        )
 
         if response.status_code == 200:
             results_json = response.json()
@@ -242,7 +249,10 @@ def search_file(file_path, client_id, part=None):
             'app-name': APP_NAME,
             'app-version': __version__
         }
-        response = requests.post(f'{SIMKL_API_BASE_URL}/search/file', headers=headers, json=data, params=params)
+        response = requests.post(
+            f'{SIMKL_API_BASE_URL}/search/file', headers=headers, json=data,
+            params=params, timeout=DEFAULT_API_TIMEOUT
+        )
 
         if response.status_code != 200:
             error_details = ""
@@ -414,7 +424,10 @@ def add_to_history(payload, client_id, access_token, allow_rewatch=False):
             params['allow_rewatch'] = 'yes'
             logger.info("Simkl API: Rewatch support enabled for this request.")
 
-        response = requests.post(f'{SIMKL_API_BASE_URL}/sync/history', headers=headers, json=payload, params=params)
+        response = requests.post(
+            f'{SIMKL_API_BASE_URL}/sync/history', headers=headers, json=payload,
+            params=params, timeout=DEFAULT_API_TIMEOUT
+        )
 
         if 200 <= response.status_code < 300:
             logger.info(f"Simkl API: Successfully added {item_description} to history.")
@@ -471,7 +484,10 @@ def get_movie_details(simkl_id, client_id, access_token):
     }
     try:
         logger.info(f"Simkl API: Fetching details for movie ID {simkl_id}...")
-        response = requests.get(f'{SIMKL_API_BASE_URL}/movies/{simkl_id}', headers=headers, params=params)
+        response = requests.get(
+            f'{SIMKL_API_BASE_URL}/movies/{simkl_id}', headers=headers, params=params,
+            timeout=DEFAULT_API_TIMEOUT
+        )
         response.raise_for_status()
         movie_details = response.json()
         if movie_details:
@@ -540,7 +556,10 @@ def get_show_details(simkl_id, client_id, access_token):
     }
     try:
         logger.info(f"Simkl API: Fetching details for show/anime ID {simkl_id}...")
-        response = requests.get(f'{SIMKL_API_BASE_URL}/tv/{simkl_id}', headers=headers, params=params)
+        response = requests.get(
+            f'{SIMKL_API_BASE_URL}/tv/{simkl_id}', headers=headers, params=params,
+            timeout=DEFAULT_API_TIMEOUT
+        )
         response.raise_for_status()
         show_details = response.json()
         if show_details:
