@@ -287,15 +287,15 @@ def search_show_by_title(title, year, client_id, is_anime=False):
             if response.status_code != 200:
                 continue
             for item in (response.json() or []):
-                iy = item.get('year')
+                item_year = item.get('year')
                 try:
-                    if iy and abs(int(iy) - int(year)) <= 1:
+                    if item_year and abs(int(item_year) - int(year)) <= 1:
                         ids = dict(item.get('ids') or {})
                         if 'simkl_id' in ids and 'simkl' not in ids:
                             ids['simkl'] = ids.pop('simkl_id')
                         logger.info(f"Simkl title search (/search/{ep}): '{title}' ({year}) -> "
-                                    f"'{item.get('title')}' ({iy}), simkl={ids.get('simkl')}")
-                        return {'title': item.get('title'), 'year': iy, 'ids': ids}
+                                    f"'{item.get('title')}' ({item_year}), simkl={ids.get('simkl')}")
+                        return {'title': item.get('title'), 'year': item_year, 'ids': ids}
                 except (ValueError, TypeError):
                     continue
         except requests.exceptions.RequestException as e:

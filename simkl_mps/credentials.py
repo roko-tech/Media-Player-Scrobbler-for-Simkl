@@ -83,18 +83,6 @@ def _load_secure_env(path, migrate=True):
     return config
 
 
-SIMKL_ACCESS_TOKEN = None
-if ENV_FILE_PATH.exists():
-    logger.debug(f"Loading access token from {ENV_FILE_PATH}")
-    config = _load_secure_env(ENV_FILE_PATH)
-    SIMKL_ACCESS_TOKEN = config.get("SIMKL_ACCESS_TOKEN")
-    if not SIMKL_ACCESS_TOKEN:
-        logger.warning(f"Found env file at {ENV_FILE_PATH}, but SIMKL_ACCESS_TOKEN key is missing or empty.")
-else:
-    logger.debug(f"Env file not found at {ENV_FILE_PATH}")
-
-
-
 def get_credentials():
     """
     Retrieves the Simkl API credentials.
