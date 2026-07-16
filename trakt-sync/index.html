@@ -560,6 +560,11 @@ Simkl. After Simkl accepts a completed watch, the app reads the exact event from
 its local <code>watch_history.json</code> and immediately sends it to Trakt. Startup and
 file polling remain as recovery paths. Events Trakt cannot match are retained in
 <code>trakt_sync_state.json</code> and retried later.</p>
+<p>The local watch history, Simkl backlog, and Trakt state are written with atomic
+file replacement and last-known-good backups. A corrupt primary file is
+preserved with a <code>.corrupt-*</code> suffix before recovery. Completed backlog events
+have unique keys, so two offline episodes from the same show cannot overwrite
+one another, and events are not deleted after an arbitrary retry count.</p>
 <h2 id="one-time-setup">One-time setup<a class="headerlink" href="#one-time-setup" title="Permanent link">&para;</a></h2>
 <ol>
 <li>Create a Trakt API application at <a href="https://trakt.tv/oauth/applications">https://trakt.tv/oauth/applications</a>.</li>
@@ -590,6 +595,11 @@ Sync Health shows the latest Simkl-accepted watch, separate Simkl and Trakt
 pending counts, the last Trakt HTTP response, added/not-found counts, and the
 last attempt and success times. <strong>Copy Safe Diagnostics</strong> omits media titles,
 service IDs, file paths, and credentials so its output can be shared safely.</p>
+<p>The watcher retries pending work on a timer even when <code>watch_history.json</code> does
+not change again. Trakt <code>429</code> responses honor the official <code>Retry-After</code> delay;
+temporary <code>502</code>, <code>503</code>, and <code>504</code> responses are retried after 30 seconds. If a
+batch is only partly matched, echoed watch timestamps are used to retain only
+the rejected events, avoiding duplicate rewatch records for successful items.</p>
 <p>Automatic syncing starts with the normal Simkl tray; no second watcher process
 or tray icon is required.</p>
 <h2 id="correcting-a-media-match">Correcting a media match<a class="headerlink" href="#correcting-a-media-match" title="Permanent link">&para;</a></h2>
@@ -600,10 +610,12 @@ split-cour title that Simkl stores as season 1. Exact-file overrides take
 precedence over folder overrides, and the nearest matching folder wins. Use
 <strong>Remove Current Override</strong> to return to automatic matching.</p>
 <h2 id="letterboxd">Letterboxd<a class="headerlink" href="#letterboxd" title="Permanent link">&para;</a></h2>
-<p>Letterboxd exposes write endpoints only to approved API clients. Its API access
-form says private/personal projects are not currently accepted, so this project
-does not include an unsupported browser-scraping login. The old CSV importer can
-remain as a separate manual archive if needed.</p>
+<p>Letterboxd documents write endpoints, but access is available by request and its
+current <a href="https://letterboxd.com/api-beta/access/">API access policy</a> says private
+or personal projects are not currently accepted. This project therefore does
+not automate a browser login or scrape the website. An official OAuth adapter
+can be added if Letterboxd grants API access; until then, its supported
+import/export tools are the safe option.</p>
 
 
 
@@ -626,7 +638,7 @@ remain as a separate manual archive if needed.</p>
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="July 16, 2026 11:15:05 UTC">July 16, 2026</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="July 16, 2026 12:08:01 UTC">July 16, 2026</span>
   </span>
 
     
