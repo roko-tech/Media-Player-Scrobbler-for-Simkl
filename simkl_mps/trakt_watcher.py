@@ -19,6 +19,7 @@ class TraktSyncWatcher:
         self._history_saved = threading.Event()
         self._sync_lock = threading.Lock()
         self._thread = None
+        self._result_callback = None
         self.last_summary = "not configured"
 
     @property
@@ -139,6 +140,26 @@ class TraktSyncWatcher:
         """Wake the watcher after a completed-watch event is safely on disk."""
         self._history_saved.set()
 
+    def set_result_callback(self, callback):
+        """Set a callback that receives the exact Trakt result and latest event."""
+        self._result_callback = callback
+
+    def _latest_event(self):
+        history = trakt_sync.load_json(trakt_sync.HISTORY_FILE, []) or []
+        events = trakt_sync.collect_history_events(history, None)
+        return events[-1] if events else None
+
+    def _emit_result(self, result):
+        if not self._result_callback:
+            return
+        event = self._latest_event()
+        if not event:
+            return
+        try:
+            self._result_callback(result, event)
+        except Exception:
+            logger.exception("Trakt sync result callback failed")
+
     def sync_now(self):
         if not self.configured:
             self.last_summary = "not configured"
@@ -188,6 +209,7 @@ class TraktSyncWatcher:
                 last_mtime = self._mtime() or last_mtime
                 logger.info("Trakt sync: completed-watch event saved; syncing now")
                 result = self.sync_now()
+                self._emit_result(result)
                 next_retry = self._next_retry(result)
                 continue
 
@@ -198,10 +220,12 @@ class TraktSyncWatcher:
                 last_mtime = self._mtime() or current_mtime
                 logger.info("Trakt sync: watch_history.json changed; syncing exact local events")
                 result = self.sync_now()
+                self._emit_result(result)
                 next_retry = self._next_retry(result)
                 continue
 
             if next_retry is not None and time.monotonic() >= next_retry:
                 logger.info("Trakt sync: retrying a failed or pending sync without a new history change")
                 result = self.sync_now()
+                self._emit_result(result)
                 next_retry = self._next_retry(result)

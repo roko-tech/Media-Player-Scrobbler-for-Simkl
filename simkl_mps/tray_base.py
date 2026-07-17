@@ -57,6 +57,49 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
     def show_notification(self, title, message):
         """Show a desktop notification - must be implemented by platform-specific classes"""
         pass
+
+    def handle_identification_receipt(self, receipt):
+        """Store an identification receipt for platforms without a custom overlay."""
+        self._last_receipt = dict(receipt)
+        year = f" ({receipt['year']})" if receipt.get("year") else ""
+        self.show_notification(
+            "Media Identified",
+            f"{receipt.get('title', 'Unknown media')}{year} via {receipt.get('match_method', 'Simkl')}",
+        )
+
+    def handle_trakt_sync_result(self, result, event):
+        """Store the final Simkl/Trakt state for platforms without an overlay."""
+        receipt = {
+            "kind": "completion",
+            "title": event.get("title") or "Unknown media",
+            "media_type": "anime" if event.get("is_anime") else event.get("kind"),
+            "season": event.get("season"),
+            "episode": event.get("episode"),
+            "simkl_status": "Accepted",
+            "trakt_status": "Accepted" if result.ok and result.pending == 0 else "Pending retry",
+            "summary": result.summary,
+            "simkl_id": event.get("simkl_id"),
+        }
+        self._last_receipt = receipt
+        self.show_notification(
+            "Watch Sync Receipt",
+            f"Simkl: {receipt['simkl_status']} | Trakt: {receipt['trakt_status']}",
+        )
+
+    def show_last_receipt(self, _=None):
+        """Show the last identification or sync receipt."""
+        if not self._last_receipt:
+            self.show_notification("Watch Sync Receipt", "No media receipt is available yet.")
+            return
+        receipt = self._last_receipt
+        if receipt.get("kind") == "completion":
+            message = (
+                f"{receipt.get('title', 'Unknown media')}\n"
+                f"Simkl: {receipt.get('simkl_status')} | Trakt: {receipt.get('trakt_status')}"
+            )
+        else:
+            message = f"{receipt.get('title', 'Unknown media')} via {receipt.get('match_method', 'Simkl')}"
+        self.show_notification("Watch Sync Receipt", message)
         
     @abc.abstractmethod
     def show_about(self, _=None):
@@ -172,6 +215,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         self.status = "stopped"
         self.status_details = ""
         self.last_scrobbled = None
+        self._last_receipt = None
         self.config_path = APP_DATA_DIR / ".simkl_mps.env"
         self.log_path = APP_DATA_DIR / "simkl_mps.log"
         
@@ -819,14 +863,21 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                     return False
                     
             if hasattr(self.scrobbler, 'monitor') and hasattr(self.scrobbler.monitor, 'scrobbler'):
-                self.scrobbler.monitor.scrobbler.set_notification_callback(self.show_notification)
+                media_scrobbler = self.scrobbler.monitor.scrobbler
+                media_scrobbler.set_notification_callback(self.show_notification)
+                if hasattr(media_scrobbler, "set_identification_callback"):
+                    media_scrobbler.set_identification_callback(self.handle_identification_receipt)
                 # Register menu refresh callback so UI updates when account type changes
                 if hasattr(self.scrobbler.monitor.scrobbler, 'set_menu_refresh_callback'):
                     try:
                         self.scrobbler.monitor.scrobbler.set_menu_refresh_callback(self.update_icon)
                     except Exception as e:
                         logger.debug(f"Failed to set menu refresh callback: {e}")
-                
+
+            trakt_watcher = self._get_trakt_watcher()
+            if trakt_watcher and hasattr(trakt_watcher, "set_result_callback"):
+                trakt_watcher.set_result_callback(self.handle_trakt_sync_result)
+
             try:
                 started = self.scrobbler.start()
                 if started:
@@ -1335,6 +1386,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                 checked=lambda item: get_setting('disable_notifications', False)
             ),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Show Last Receipt", self.show_last_receipt),
             pystray.MenuItem("Open Local Watch History", self.open_watch_history),
         )))
         menu_items.append(pystray.Menu.SEPARATOR)

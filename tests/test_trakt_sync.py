@@ -310,14 +310,17 @@ def test_sync_health_records_response_and_builds_secret_safe_report(tmp_path, mo
     token_file = tmp_path / "trakt_token.json"
     state_file = tmp_path / "trakt_sync_state.json"
     history_file = tmp_path / "watch_history.json"
+    backlog_file = tmp_path / "backlog.json"
     for name, value in (
         ("CONFIG_FILE", config_file),
         ("TOKEN_FILE", token_file),
         ("STATE_FILE", state_file),
         ("HISTORY_FILE", history_file),
+        ("SIMKL_BACKLOG_FILE", backlog_file),
     ):
         monkeypatch.setattr(trakt_sync, name, value)
 
+    backlog_file.write_text("{}", encoding="utf-8")
     config_file.write_text(
         '{"client_id":"private-client-id","client_secret":"private-secret"}',
         encoding="utf-8",
@@ -451,3 +454,38 @@ def test_watcher_retries_failed_sync_without_another_history_change(monkeypatch)
     watcher._watch_loop()
 
     assert len(calls) == 2
+
+
+def test_history_saved_sync_emits_exact_completion_receipt(monkeypatch):
+    watcher = TraktSyncWatcher(poll_seconds=0.01, debounce_seconds=0.01)
+    results = [
+        trakt_sync.SyncResult(True, "startup"),
+        trakt_sync.SyncResult(True, "Trakt: +1 episode(s)", pushed=True),
+    ]
+    event = {
+        "kind": "episode",
+        "title": "Example",
+        "simkl_id": 100,
+        "season": 2,
+        "episode": 3,
+        "watched_at": "2026-07-17T10:00:00Z",
+        "is_anime": False,
+    }
+    receipts = []
+
+    monkeypatch.setattr(watcher, "sync_now", lambda: results.pop(0))
+    monkeypatch.setattr(watcher, "_mtime", lambda: 1.0)
+    monkeypatch.setattr(watcher, "_latest_event", lambda: event)
+
+    def on_result(result, latest_event):
+        receipts.append((result, latest_event))
+        watcher._stop.set()
+
+    watcher.set_result_callback(on_result)
+    watcher._history_saved.set()
+    watcher._watch_loop()
+
+    assert len(receipts) == 1
+    assert receipts[0][0].ok is True
+    assert receipts[0][0].pushed is True
+    assert receipts[0][1] == event

@@ -342,3 +342,59 @@ def test_episode_cache_keeps_distinct_files_for_same_show(tmp_path):
 
     assert scrobbler.media_cache.get("example-s02e07.mkv")["episode"] == 7
     assert scrobbler.media_cache.get("example-s02e08.mkv")["episode"] == 8
+
+
+def test_identification_receipt_contains_visual_match_details():
+    scrobbler = MediaScrobbler.__new__(MediaScrobbler)
+    scrobbler.currently_tracking = "The Heroic Legend of Arslan (2015) S02E06"
+    scrobbler.current_filepath = "The Heroic Legend of Arslan (2015) - S02E06.mkv"
+    scrobbler.movie_name = "Arslan Senki: Fuujin Ranbu"
+    scrobbler.simkl_id = 529392
+    scrobbler.media_type = "anime"
+    scrobbler.season = 1
+    scrobbler.episode = 6
+    scrobbler.display_season = 2
+    scrobbler.display_episode = 6
+    scrobbler.identification_callback = None
+    scrobbler._last_identification_receipt_key = None
+    scrobbler.identification_rejected = False
+    receipts = []
+
+    scrobbler.set_identification_callback(receipts.append)
+    emitted = scrobbler._emit_identification_receipt(
+        {
+            "year": 2016,
+            "poster_url": "1234/abc567",
+            "source": "simkl_search_file",
+        }
+    )
+
+    assert emitted is True
+    assert receipts == [
+        {
+            "kind": "identification",
+            "title": "Arslan Senki: Fuujin Ranbu",
+            "year": 2016,
+            "media_type": "anime",
+            "season": 1,
+            "episode": 6,
+            "display_season": 2,
+            "display_episode": 6,
+            "simkl_id": 529392,
+            "poster_url": "1234/abc567",
+            "match_method": "Simkl file match",
+        }
+    ]
+
+
+def test_rejected_identification_blocks_history_submission():
+    scrobbler = MediaScrobbler.__new__(MediaScrobbler)
+    scrobbler.currently_tracking = "Example (2020)"
+    scrobbler.movie_name = "Example"
+    scrobbler.identification_rejected = False
+    scrobbler._identification_block_logged = False
+    scrobbler.completed = False
+
+    assert scrobbler.reject_current_identification() is True
+    assert scrobbler._attempt_add_to_history() is False
+    assert scrobbler.completed is False

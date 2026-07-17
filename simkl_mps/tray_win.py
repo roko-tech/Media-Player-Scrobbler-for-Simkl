@@ -3,7 +3,9 @@ Windows-specific System tray implementation for Media Player Scrobbler for SIMKL
 Uses pystray and tkinter for the UI elements.
 """
 
+import io
 import os
+import re
 import sys
 import time
 import threading
@@ -15,6 +17,7 @@ from pathlib import Path
 from PIL import Image # Keep PIL.Image for loading
 from PIL import ImageTk
 import pystray
+import requests
 from plyer import notification
 import ctypes # Added for native Windows dialogs
 import tkinter as tk
@@ -30,6 +33,52 @@ logger = logging.getLogger(__name__)
 _ERROR_ALREADY_EXISTS = 183
 _INSTANCE_MUTEX_NAME = "Local\\MediaPlayerScrobblerForSimkl-7f2c0b63"
 _instance_mutex = None
+
+
+_SIMKL_POSTER_ID = re.compile(r"^[A-Za-z0-9]+/[A-Za-z0-9]+$")
+_SIMKL_POSTER_PREFIX = "https://simkl.in/posters/"
+_MAX_POSTER_BYTES = 5 * 1024 * 1024
+
+
+def _resolve_poster_url(poster):
+    """Resolve only trusted Simkl poster references."""
+    if not isinstance(poster, str):
+        return None
+    value = poster.strip()
+    if _SIMKL_POSTER_ID.fullmatch(value):
+        return f"{_SIMKL_POSTER_PREFIX}{value}_m.webp"
+    if value.startswith(_SIMKL_POSTER_PREFIX) and ".." not in value:
+        return value
+    return None
+
+
+def _cache_poster(app_data_dir, poster, simkl_id):
+    """Download and validate a Simkl poster into the local display cache."""
+    url = _resolve_poster_url(poster)
+    if not url or simkl_id is None:
+        return None
+
+    cache_dir = Path(app_data_dir) / "poster-cache"
+    cache_path = cache_dir / f"{simkl_id}.webp"
+    if cache_path.is_file():
+        return cache_path
+
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        content = response.content
+        if not content or len(content) > _MAX_POSTER_BYTES:
+            raise ValueError("poster response is empty or too large")
+        with Image.open(io.BytesIO(content)) as image:
+            image.verify()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = cache_path.with_suffix(".tmp")
+        temp_path.write_bytes(content)
+        temp_path.replace(cache_path)
+        return cache_path
+    except Exception as exc:
+        logger.warning("Could not cache Simkl poster for receipt: %s", exc)
+        return None
 
 
 def _acquire_single_instance():
@@ -65,6 +114,10 @@ class TrayAppWin(TrayAppBase):
         self._tk_queue: "queue.Queue[tuple[callable, queue.Queue]] | None" = None
         self._tk_thread: threading.Thread | None = None
         self._tk_root: tk.Tk | None = None
+        self._receipt_window: tk.Toplevel | None = None
+        self._receipt_after_id = None
+        self._receipt_photo = None
+        self._receipt_generation = 0
         self._setup_auto_update_if_needed() # Run platform-specific setup
         self._init_tk_thread()
         self.setup_icon()
@@ -246,6 +299,273 @@ class TrayAppWin(TrayAppBase):
         except Exception as exc:
             logger.error(f"Tkinter dialog execution failed: {exc}", exc_info=True)
             return default
+
+    def handle_identification_receipt(self, receipt):
+        self._last_receipt = dict(receipt)
+        self._show_receipt_async(self._last_receipt)
+
+    def handle_trakt_sync_result(self, result, event):
+        media_info = {}
+        media_scrobbler = self._get_media_scrobbler()
+        if media_scrobbler and event.get("simkl_id"):
+            _, media_info = media_scrobbler.media_cache.get_by_simkl_id(event["simkl_id"])
+            media_info = media_info or {}
+
+        receipt = {
+            "kind": "completion",
+            "title": event.get("title") or media_info.get("movie_name") or "Unknown media",
+            "year": media_info.get("year"),
+            "media_type": "anime" if event.get("is_anime") else event.get("kind"),
+            "season": event.get("season"),
+            "episode": event.get("episode"),
+            "display_season": media_info.get("season_display") or event.get("season"),
+            "display_episode": media_info.get("episode_display") or event.get("episode"),
+            "simkl_id": event.get("simkl_id"),
+            "poster_url": media_info.get("poster_url") or media_info.get("poster"),
+            "simkl_status": "Accepted",
+            "trakt_status": "Accepted" if result.ok and result.pending == 0 else "Pending retry",
+            "summary": result.summary,
+        }
+        self._last_receipt = receipt
+        self._show_receipt_async(receipt)
+
+    def show_last_receipt(self, _=None):
+        if not self._last_receipt:
+            self.show_notification("Watch Sync Receipt", "No media receipt is available yet.")
+            return
+        self._show_receipt_async(dict(self._last_receipt))
+
+    def _show_receipt_async(self, receipt):
+        self._receipt_generation += 1
+        generation = self._receipt_generation
+        threading.Thread(
+            target=self._prepare_and_show_receipt,
+            args=(receipt, generation),
+            name="receipt-poster-loader",
+            daemon=True,
+        ).start()
+
+    def _prepare_and_show_receipt(self, receipt, generation):
+        poster_path = _cache_poster(
+            APP_DATA_DIR,
+            receipt.get("poster_url"),
+            receipt.get("simkl_id"),
+        )
+        if generation != self._receipt_generation:
+            return
+        prepared = dict(receipt)
+        prepared["poster_path"] = poster_path
+        self._run_on_tk_thread(lambda: self._render_receipt(prepared, generation))
+
+    @staticmethod
+    def _episode_code(season, episode):
+        if season is None or episode is None:
+            return None
+        try:
+            return f"S{int(season):02d}E{int(episode):02d}"
+        except (TypeError, ValueError):
+            return None
+
+    def _episode_mapping_text(self, receipt):
+        if receipt.get("media_type") in ("movie", None):
+            return "Movie"
+        display_code = self._episode_code(
+            receipt.get("display_season"), receipt.get("display_episode")
+        )
+        tracker_code = self._episode_code(receipt.get("season"), receipt.get("episode"))
+        if display_code and tracker_code and display_code != tracker_code:
+            return f"File: {display_code}   Simkl: {tracker_code}"
+        return display_code or tracker_code or "Episode"
+
+    def _dismiss_receipt(self):
+        if self._receipt_after_id and self._tk_root:
+            try:
+                self._tk_root.after_cancel(self._receipt_after_id)
+            except tk.TclError:
+                pass
+        self._receipt_after_id = None
+        if self._receipt_window:
+            try:
+                self._receipt_window.destroy()
+            except tk.TclError:
+                pass
+        self._receipt_window = None
+        self._receipt_photo = None
+
+    def _accept_receipt(self):
+        media_scrobbler = self._get_media_scrobbler()
+        if media_scrobbler:
+            media_scrobbler.accept_current_identification()
+        self._dismiss_receipt()
+
+    def _reject_receipt(self):
+        media_scrobbler = self._get_media_scrobbler()
+        rejected = bool(media_scrobbler and media_scrobbler.reject_current_identification())
+        self._dismiss_receipt()
+        if rejected:
+            threading.Thread(
+                target=self.set_current_file_override,
+                name="receipt-match-correction",
+                daemon=True,
+            ).start()
+
+    def _render_receipt(self, receipt, generation):
+        if generation != self._receipt_generation or not self._tk_root:
+            return
+        self._dismiss_receipt()
+
+        window = tk.Toplevel(self._tk_root)
+        self._receipt_window = window
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        window.configure(background="#334155")
+
+        width, height = 480, 236
+        screen_width = window.winfo_screenwidth()
+        window.geometry(f"{width}x{height}+{max(12, screen_width - width - 24)}+24")
+
+        body = tk.Frame(window, bg="#111827", padx=10, pady=10)
+        body.pack(fill="both", expand=True, padx=1, pady=1)
+
+        poster_frame = tk.Frame(body, width=128, height=192, bg="#1f2937")
+        poster_frame.pack(side="left", fill="y")
+        poster_frame.pack_propagate(False)
+        poster_path = receipt.get("poster_path")
+        if poster_path:
+            try:
+                with Image.open(poster_path) as source:
+                    poster = source.convert("RGB")
+                    poster.thumbnail((128, 192), Image.Resampling.LANCZOS)
+                self._receipt_photo = ImageTk.PhotoImage(poster)
+                tk.Label(poster_frame, image=self._receipt_photo, bg="#1f2937").pack(
+                    expand=True
+                )
+            except Exception as exc:
+                logger.warning("Could not display cached receipt poster: %s", exc)
+        if self._receipt_photo is None:
+            tk.Label(
+                poster_frame,
+                text="NO\nPOSTER",
+                fg="#94a3b8",
+                bg="#1f2937",
+                font=("Segoe UI", 10, "bold"),
+            ).pack(expand=True)
+
+        details = tk.Frame(body, bg="#111827", padx=14)
+        details.pack(side="left", fill="both", expand=True)
+        heading = "IDENTIFIED" if receipt.get("kind") == "identification" else "WATCH SYNC RECEIPT"
+        tk.Label(
+            details,
+            text=heading,
+            fg="#60a5fa",
+            bg="#111827",
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+
+        year = f" ({receipt['year']})" if receipt.get("year") else ""
+        tk.Label(
+            details,
+            text=f"{receipt.get('title', 'Unknown media')}{year}",
+            fg="#f8fafc",
+            bg="#111827",
+            font=("Segoe UI Semibold", 13),
+            wraplength=300,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", pady=(5, 3))
+        tk.Label(
+            details,
+            text=self._episode_mapping_text(receipt),
+            fg="#cbd5e1",
+            bg="#111827",
+            font=("Segoe UI", 10),
+            anchor="w",
+        ).pack(fill="x")
+
+        if receipt.get("kind") == "identification":
+            tk.Label(
+                details,
+                text=f"Matched by: {receipt.get('match_method', 'Simkl')}",
+                fg="#94a3b8",
+                bg="#111827",
+                font=("Segoe UI", 9),
+                anchor="w",
+            ).pack(fill="x", pady=(7, 0))
+            tk.Label(
+                details,
+                text="Playback and syncing continue if untouched.",
+                fg="#64748b",
+                bg="#111827",
+                font=("Segoe UI", 8),
+                anchor="w",
+            ).pack(fill="x", pady=(2, 8))
+            buttons = tk.Frame(details, bg="#111827")
+            buttons.pack(side="bottom", fill="x")
+            tk.Button(
+                buttons,
+                text="Looks Right",
+                command=self._accept_receipt,
+                bg="#166534",
+                fg="white",
+                activebackground="#15803d",
+                activeforeground="white",
+                relief="flat",
+                padx=12,
+            ).pack(side="left")
+            tk.Button(
+                buttons,
+                text="Wrong Match",
+                command=self._reject_receipt,
+                bg="#7f1d1d",
+                fg="white",
+                activebackground="#991b1b",
+                activeforeground="white",
+                relief="flat",
+                padx=12,
+            ).pack(side="left", padx=(8, 0))
+        else:
+            accepted = receipt.get("trakt_status") == "Accepted"
+            tk.Label(
+                details,
+                text=f"Simkl: {receipt.get('simkl_status', 'Unknown')}",
+                fg="#4ade80",
+                bg="#111827",
+                font=("Segoe UI Semibold", 10),
+                anchor="w",
+            ).pack(fill="x", pady=(10, 1))
+            tk.Label(
+                details,
+                text=f"Trakt: {receipt.get('trakt_status', 'Unknown')}",
+                fg="#4ade80" if accepted else "#fbbf24",
+                bg="#111827",
+                font=("Segoe UI Semibold", 10),
+                anchor="w",
+            ).pack(fill="x")
+            tk.Label(
+                details,
+                text=receipt.get("summary") or "",
+                fg="#94a3b8",
+                bg="#111827",
+                font=("Segoe UI", 8),
+                wraplength=300,
+                justify="left",
+                anchor="w",
+            ).pack(fill="x", pady=(5, 0))
+            tk.Button(
+                details,
+                text="Dismiss",
+                command=self._dismiss_receipt,
+                bg="#334155",
+                fg="white",
+                activebackground="#475569",
+                activeforeground="white",
+                relief="flat",
+                padx=12,
+            ).pack(side="bottom", anchor="w")
+
+        self._receipt_after_id = self._tk_root.after(8000, self._dismiss_receipt)
+        window.lift()
 
     def _show_info_dialog(self, title, message):
         """Windows override: show informational dialog via Tk thread."""

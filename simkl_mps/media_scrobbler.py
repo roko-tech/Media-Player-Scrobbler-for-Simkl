@@ -66,6 +66,10 @@ class MediaScrobbler:
         self.currently_tracking = None
         self.track_start_time = None
         self.notification_callback = None
+        self.identification_callback = None
+        self.identification_rejected = False
+        self._identification_block_logged = False
+        self._last_identification_receipt_key = None
         self._processing_backlog_items = set() # Tracks items currently being processed by process_backlog
         self._processing_lock = threading.Lock() # Lock for accessing _processing_backlog_items
 
@@ -243,6 +247,74 @@ class MediaScrobbler:
     def set_notification_callback(self, callback):
         """Set a callback function for notifications"""
         self.notification_callback = callback
+
+    def set_identification_callback(self, callback):
+        """Set a callback for structured media-identification receipts."""
+        self.identification_callback = callback
+
+    def accept_current_identification(self):
+        """Allow the current identification to be submitted to watch history."""
+        self.identification_rejected = False
+        self._identification_block_logged = False
+
+    def reject_current_identification(self):
+        """Block history submission for the current media until it is corrected."""
+        if not getattr(self, "currently_tracking", None):
+            return False
+        self.identification_rejected = True
+        self._identification_block_logged = False
+        return True
+
+    @staticmethod
+    def _match_method_label(source):
+        labels = {
+            "manual_file_override": "Manual file override",
+            "manual_folder_override": "Manual folder override",
+            "simkl_search_file": "Simkl file match",
+            "simkl_search_movie": "Simkl title search",
+        }
+        return labels.get(source, "Simkl match")
+
+    def _emit_identification_receipt(self, media_info):
+        """Report the resolved title and poster without exposing local file paths."""
+        source = media_info.get("source")
+        receipt = {
+            "kind": "identification",
+            "title": self.movie_name,
+            "year": media_info.get("year"),
+            "media_type": self.media_type,
+            "season": self.season,
+            "episode": self.episode,
+            "display_season": self.display_season,
+            "display_episode": self.display_episode,
+            "simkl_id": self.simkl_id,
+            "poster_url": media_info.get("poster_url") or media_info.get("poster"),
+            "match_method": self._match_method_label(source),
+        }
+        receipt_key = (
+            getattr(self, "current_filepath", None),
+            self.simkl_id,
+            self.season,
+            self.episode,
+            source,
+        )
+        if receipt_key == self._last_identification_receipt_key:
+            return False
+        self._last_identification_receipt_key = receipt_key
+
+        if self.identification_callback:
+            try:
+                self.identification_callback(receipt)
+                return True
+            except Exception as exc:
+                logger.error("Identification receipt callback failed: %s", exc)
+
+        year_suffix = f" ({receipt['year']})" if receipt["year"] else ""
+        self._send_notification(
+            "Media Identified",
+            f"{receipt['title']}{year_suffix} via {receipt['match_method']}",
+        )
+        return True
 
     def set_menu_refresh_callback(self, callback):
         """Set a callback to be invoked when menu should refresh (e.g., account type changed)."""
@@ -629,6 +701,9 @@ class MediaScrobbler:
         self._episode_guess_from_filename = None
         self.display_season = None
         self.display_episode = None
+        self.identification_rejected = False
+        self._identification_block_logged = False
+        self._last_identification_receipt_key = None
 
         if guessit_info and isinstance(guessit_info, dict):
             self._season_guess_from_filename = guessit_info.get('season')
@@ -771,22 +846,8 @@ class MediaScrobbler:
             self.estimated_duration = self.total_duration_seconds
             logger.info(f"Set duration from cache for '{self.movie_name or self.currently_tracking}' from {self.total_duration_seconds}s")
         
-        # Send notification for cached identification if actively tracking this item
         if self.currently_tracking and self.movie_name and self.simkl_id:
-            display_text = f"Playing: '{self.movie_name}'"
-            if self.media_type in ['show', 'anime']:
-                suffix = self._build_episode_display_suffix()
-                if suffix:
-                    display_text += suffix
-            elif self.media_type == 'movie' and cached_info.get('year'):
-                display_text += f" ({cached_info.get('year')})"
-            
-            media_label = (self.media_type or 'media').capitalize()
-            self._send_notification(
-                f"{media_label} Identified (Cache)",
-                display_text,
-                online_only=True # Notifications for confirmed IDs are online-only
-            )
+            self._emit_identification_receipt(cached_info)
 
     def _start_new_movie(self, movie_title):
         """Deprecated. Use _start_new_media_item instead."""
@@ -1524,19 +1585,15 @@ class MediaScrobbler:
             _api_full_details=final_api_full_details_for_cache # This now passes the richer details
         )
         
-        # Notification logic: cache_media_info handles notifications if it updates the *currently tracked* item's state.
-        # The existing notification below might be slightly delayed if cache_media_info updates self.movie_name etc.
-        # For now, let's keep it to ensure a notification is sent.
-        display_text = f"Playing: '{self.movie_name}'" # self.movie_name might have been updated by cache_media_info
-        if self.media_type in ['show', 'anime']: # self.media_type might have been updated
-            suffix = self._build_episode_display_suffix()
-            if suffix:
-                display_text += suffix
-        elif self.media_type == 'movie' and final_year_for_cache:
-            display_text += f" ({final_year_for_cache})" # Use potentially updated year
-
-        media_label = (self.media_type or 'media').capitalize()
-        self._send_notification(f"{media_label} Identified", display_text, online_only=True)
+        if source_description.startswith("manual_"):
+            self.accept_current_identification()
+        self._emit_identification_receipt(
+            {
+                "year": final_year_for_cache,
+                "poster_url": final_poster_url_for_cache,
+                "source": source_description,
+            }
+        )
         self._clear_backlog_entry_if_temp_identified()
 
     def _identify_movie(self, title_to_search):
@@ -1695,6 +1752,15 @@ class MediaScrobbler:
         Sets self.completed on success or when added to backlog.
         """
         display_title = self.movie_name or self.currently_tracking # Use official name if known
+        if getattr(self, "identification_rejected", False):
+            if not getattr(self, "_identification_block_logged", False):
+                logger.warning(
+                    "History submission blocked for '%s': identification was rejected.",
+                    display_title,
+                )
+                self._identification_block_logged = True
+            return False
+
         # Cache key for cooldown tracking: prefer filepath, fallback to raw title
         cache_key_for_cooldown = (
             os.path.basename(self.current_filepath).lower()

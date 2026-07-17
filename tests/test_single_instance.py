@@ -91,3 +91,49 @@ def test_exit_app_marks_intent_before_stopping_monitor(monkeypatch):
 
     assert app.exit_app() == 0
     assert events == ["monitor stopped", "icon stopped"]
+
+
+def test_simkl_poster_id_resolves_to_supported_image_url():
+    from simkl_mps import tray_win
+
+    assert (
+        tray_win._resolve_poster_url("1234/abc567")
+        == "https://simkl.in/posters/1234/abc567_m.webp"
+    )
+    assert (
+        tray_win._resolve_poster_url("https://simkl.in/posters/1234/abc567_m.webp")
+        == "https://simkl.in/posters/1234/abc567_m.webp"
+    )
+    assert tray_win._resolve_poster_url("https://example.com/poster.webp") is None
+
+
+def test_poster_download_is_validated_and_cached(monkeypatch, tmp_path):
+    from io import BytesIO
+
+    from PIL import Image
+
+    from simkl_mps import tray_win
+
+    image_bytes = BytesIO()
+    Image.new("RGB", (8, 12), "#334155").save(image_bytes, format="WEBP")
+    calls = []
+
+    class Response:
+        content = image_bytes.getvalue()
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    def fake_get(url, timeout):
+        calls.append((url, timeout))
+        return Response()
+
+    monkeypatch.setattr(tray_win.requests, "get", fake_get)
+
+    first = tray_win._cache_poster(tmp_path, "1234/abc567", 42)
+    second = tray_win._cache_poster(tmp_path, "1234/abc567", 42)
+
+    assert first == second
+    assert first.is_file()
+    assert len(calls) == 1
