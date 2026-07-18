@@ -2286,8 +2286,6 @@ class MediaScrobbler:
             return {'processed': 0, 'attempted': 0, 'failed': not has_credentials, 'reason': reason}
 
         logger.info(f"[Backlog] Processing {len(pending_items_dict)} items...")
-        # Send start notification - simplified message
-        self._send_notification("Simkl Backlog Sync", f"{len(pending_items_dict)} items ready to sync")
         success_count = 0
         attempted_this_cycle = 0
         failure_this_cycle = False

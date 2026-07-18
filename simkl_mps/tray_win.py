@@ -311,17 +311,35 @@ class TrayAppWin(TrayAppBase):
             _, media_info = media_scrobbler.media_cache.get_by_simkl_id(event["simkl_id"])
             media_info = media_info or {}
 
+        previous = self._last_receipt or {}
+        same_identification = (
+            previous.get("kind") == "identification"
+            and str(previous.get("simkl_id")) == str(event.get("simkl_id"))
+            and (
+                event.get("kind") == "movie"
+                or (
+                    str(previous.get("season")) == str(event.get("season"))
+                    and str(previous.get("episode")) == str(event.get("episode"))
+                )
+            )
+        )
+        identification = previous if same_identification else {}
+
         receipt = {
             "kind": "completion",
             "title": event.get("title") or media_info.get("movie_name") or "Unknown media",
-            "year": media_info.get("year"),
+            "year": identification.get("year") or media_info.get("year"),
             "media_type": "anime" if event.get("is_anime") else event.get("kind"),
             "season": event.get("season"),
             "episode": event.get("episode"),
-            "display_season": media_info.get("season_display") or event.get("season"),
-            "display_episode": media_info.get("episode_display") or event.get("episode"),
+            "display_season": identification.get("display_season") or event.get("season"),
+            "display_episode": identification.get("display_episode") or event.get("episode"),
             "simkl_id": event.get("simkl_id"),
-            "poster_url": media_info.get("poster_url") or media_info.get("poster"),
+            "poster_url": (
+                identification.get("poster_url")
+                or media_info.get("poster_url")
+                or media_info.get("poster")
+            ),
             "simkl_status": "Accepted",
             "trakt_status": "Accepted" if result.ok and result.pending == 0 else "Pending retry",
             "summary": result.summary,

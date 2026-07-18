@@ -223,6 +223,38 @@ def test_backlog_retries_past_old_five_attempt_limit(monkeypatch):
     assert backlog.updated[1]["attempt_count"] == 6
 
 
+def test_backlog_cooldown_does_not_repeat_ready_notification(monkeypatch):
+    item = {
+        "simkl_id": 100,
+        "title": "Example",
+        "type": "show",
+        "season": 1,
+        "episode": 2,
+        "attempt_count": 3,
+        "last_attempt_timestamp": 10**20,
+    }
+
+    class Backlog:
+        @staticmethod
+        def get_pending():
+            return {"event": item}
+
+    notifications = []
+    scrobbler = MediaScrobbler.__new__(MediaScrobbler)
+    scrobbler.client_id = "configured"
+    scrobbler.access_token = "configured"
+    scrobbler.backlog_cleaner = Backlog()
+    scrobbler._processing_lock = threading.Lock()
+    scrobbler._processing_backlog_items = set()
+    scrobbler._send_notification = lambda *args, **kwargs: notifications.append(args)
+    monkeypatch.setattr("simkl_mps.media_scrobbler.is_internet_connected", lambda: True)
+
+    result = scrobbler.process_backlog()
+
+    assert result["attempted"] == 0
+    assert notifications == []
+
+
 def test_simkl_not_found_response_is_not_accepted():
     scrobbler = MediaScrobbler.__new__(MediaScrobbler)
 

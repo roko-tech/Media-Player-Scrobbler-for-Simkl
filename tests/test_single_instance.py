@@ -137,3 +137,58 @@ def test_poster_download_is_validated_and_cached(monkeypatch, tmp_path):
     assert first == second
     assert first.is_file()
     assert len(calls) == 1
+
+
+def test_completion_receipt_keeps_the_exact_episode_from_identification():
+    from simkl_mps.tray_win import TrayAppWin
+
+    class Cache:
+        @staticmethod
+        def get_by_simkl_id(_simkl_id):
+            return "episode-3.mkv", {
+                "movie_name": "The Husband",
+                "year": 2026,
+                "season": 1,
+                "episode": 3,
+                "season_display": 1,
+                "episode_display": 3,
+                "poster_url": "20/example",
+            }
+
+    class MediaScrobbler:
+        media_cache = Cache()
+
+    class Result:
+        ok = True
+        pending = 0
+        summary = "Trakt: +1 episode(s)"
+
+    app = TrayAppWin.__new__(TrayAppWin)
+    app._last_receipt = {
+        "kind": "identification",
+        "simkl_id": 2914731,
+        "season": 1,
+        "episode": 4,
+        "display_season": 1,
+        "display_episode": 4,
+        "poster_url": "20/example",
+        "year": 2026,
+    }
+    rendered = []
+    app._get_media_scrobbler = lambda: MediaScrobbler()
+    app._show_receipt_async = rendered.append
+
+    app.handle_trakt_sync_result(
+        Result(),
+        {
+            "kind": "episode",
+            "title": "The Husband",
+            "simkl_id": 2914731,
+            "season": 1,
+            "episode": 4,
+            "is_anime": False,
+        },
+    )
+
+    assert rendered[0]["episode"] == 4
+    assert rendered[0]["display_episode"] == 4
