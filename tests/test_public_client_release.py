@@ -209,6 +209,7 @@ def test_release_promotion_happens_only_after_draft_assets_and_pypi():
 
     assert "--draft" in create_release
     assert "--draft=false" not in create_release
+    assert "--discussion-category" not in create_release
     assert create_release.index("gh release create") < create_release.index("gh release upload")
     assert "build-python-package:" in build
     assert "publish-pypi:" in build

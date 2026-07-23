@@ -315,7 +315,6 @@ jobs:
               --title "Release $VERSION" \
               --generate-notes \
               --notes-file "$VERIFICATION_BLOCK_FILE" \
-              --discussion-category "Releases" \
               --draft
             gh release view "$TAG_NAME" --json body --jq .body > "$EXISTING_BODY_FILE"
           fi

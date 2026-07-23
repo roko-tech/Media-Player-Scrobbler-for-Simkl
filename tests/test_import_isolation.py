@@ -50,6 +50,23 @@ def test_package_import_is_passive(tmp_path):
     assert sentinel.read_text(encoding="utf-8") == "unchanged"
 
 
+def test_version_flag_does_not_require_a_subcommand(tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+
+    result = subprocess.run(
+        [sys.executable, "-m", "simkl_mps.cli", "--version"],
+        cwd=tmp_path,
+        env=_profile_environment(profile),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "simkl-mps v" in result.stdout
+
+
 def test_legacy_entrypoint_exports_remain_available(tmp_path):
     profile = tmp_path / "profile"
     profile.mkdir()

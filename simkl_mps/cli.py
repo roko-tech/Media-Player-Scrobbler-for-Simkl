@@ -562,8 +562,13 @@ def create_parser():
         formatter_class=argparse.RawTextHelpFormatter # Preserve help text formatting
     )
 
-    parser.add_argument("--version", "-v", action="store_true", 
-                       help="Display version information and exit")
+    parser.add_argument(
+        "--version",
+        "-v",
+        action="version",
+        version=f"simkl-mps v{VERSION}",
+        help="Display version information and exit",
+    )
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug logging in console output.")
                        
