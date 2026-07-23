@@ -196,30 +196,97 @@ def test_windows_runtime_and_installer_share_canonical_registry_owner():
     assert "canonical_key_path" in migration_text
 
 
-def test_release_promotion_happens_only_after_draft_assets_and_pypi():
+def test_release_promotion_is_github_only_and_waits_for_verified_assets():
     build = (REPO_ROOT / ".github" / "workflows" / "build.yml").read_text(
         encoding="utf-8"
     )
     create_release = (
         REPO_ROOT / ".github" / "workflows" / "create-release.yml"
     ).read_text(encoding="utf-8")
-    publish_pypi = (
+    package_workflow = (
         REPO_ROOT / ".github" / "workflows" / "publish-pypi.yml"
     ).read_text(encoding="utf-8")
+
+    def job_body(name):
+        match = re.search(
+            rf"(?ms)^  {re.escape(name)}:\n.*?(?=^  [A-Za-z0-9_-]+:\n|\Z)", build
+        )
+        assert match, f"Missing workflow job: {name}"
+        return match.group(0)
+
+    package_job = job_body("build-python-package")
+    promotion_job = job_body("publish-github-release")
 
     assert "--draft" in create_release
     assert "--draft=false" not in create_release
     assert "--discussion-category" not in create_release
     assert create_release.index("gh release create") < create_release.index("gh release upload")
-    assert "build-python-package:" in build
-    assert "publish-pypi:" in build
-    assert "publish-github-release:" in build
-    assert "needs: [prepare-release, create-github-release]" in build
-    assert "needs: [prepare-release, create-github-release, publish-pypi]" in build
-    assert "gh release edit" in build and "--draft=false" in build
-    assert "actions/upload-artifact" in publish_pypi
-    assert "actions/download-artifact" in publish_pypi
-    assert "poetry lock" not in publish_pypi
+    assert "name: Build and Publish GitHub Release" in build
+    assert "publish-pypi:" not in build
+    assert "PYPI_API_TOKEN" not in build
+    assert "uses: ./.github/workflows/publish-pypi.yml" in package_job
+    assert "build: true" in package_job and "publish: false" in package_job
+    assert "needs: [prepare-release, create-github-release]" in promotion_job
+    assert "publish-pypi" not in promotion_job
+    assert "name: python-package" in promotion_job
+    assert "path: expected-python-package" in promotion_job
+    assert 'verify_release_asset "$EXPECTED_INSTALLER"' in promotion_job
+    assert 'verify_release_asset "$EXPECTED_WHEEL"' in promotion_job
+    assert 'verify_release_asset "$EXPECTED_SDIST"' in promotion_job
+    assert 'verify_checksum_row "$EXPECTED_WHEEL"' in promotion_job
+    assert 'verify_checksum_row "$EXPECTED_SDIST"' in promotion_job
+
+    first_draft_check = promotion_job.index("IS_DRAFT=$(gh release view")
+    second_draft_check = promotion_job.rindex("IS_DRAFT=$(gh release view")
+    publication = promotion_job.index(
+        'gh release edit "$TAG_NAME" --repo "$REPOSITORY" --draft=false'
+    )
+    for protected_check in (
+        'verify_release_asset "$EXPECTED_WHEEL"',
+        'verify_release_asset "$EXPECTED_SDIST"',
+        'verify_checksum_row "$EXPECTED_WHEEL"',
+        'verify_checksum_row "$EXPECTED_SDIST"',
+    ):
+        assert (
+            first_draft_check
+            < promotion_job.index(protected_check)
+            < second_draft_check
+        )
+    assert second_draft_check < publication
+
+    for expected in (
+        "artifacts/python-package",
+        '[ "${#PYTHON_PACKAGES[@]}" -ne 2 ]',
+        '[ "${#WHEELS[@]}" -ne 1 ]',
+        '[ "${#SDISTS[@]}" -ne 1 ]',
+        'EXPECTED_WHEEL_FILENAME="simkl_mps-${RELEASE_VERSION}-py3-none-any.whl"',
+        'EXPECTED_SDIST_FILENAME="simkl_mps-${RELEASE_VERSION}.tar.gz"',
+        "wheel_path=",
+        "sdist_path=",
+        "wheel_hash=",
+        "sdist_hash=",
+        '--pattern "$WHEEL_FILENAME"',
+        '--pattern "$SDIST_FILENAME"',
+        'gh release upload "$TAG_NAME" "$WHEEL_PATH" "$SDIST_PATH" --clobber',
+        'verify_uploaded_asset "$WHEEL_PATH"',
+        'verify_uploaded_asset "$SDIST_PATH"',
+        "**Distribution:** GitHub-only.",
+    ):
+        assert expected in create_release
+
+    package_upload = create_release.index(
+        'gh release upload "$TAG_NAME" "$WHEEL_PATH" "$SDIST_PATH" --clobber'
+    )
+    package_download = create_release.index(
+        'gh release download "$TAG_NAME" "${DOWNLOAD_ARGS[@]}"'
+    )
+    wheel_verification = create_release.index('verify_uploaded_asset "$WHEEL_PATH"')
+    sdist_verification = create_release.index('verify_uploaded_asset "$SDIST_PATH"')
+    assert package_upload < package_download < wheel_verification
+    assert package_upload < package_download < sdist_verification
+
+    assert "actions/upload-artifact" in package_workflow
+    assert "poetry lock" not in package_workflow
     assert "poetry lock" not in (
         REPO_ROOT / ".github" / "workflows" / "windows-build.yml"
     ).read_text(encoding="utf-8")
@@ -318,7 +385,10 @@ def test_release_runs_are_serialized_and_promotion_reverifies_assets():
     assert "cancel-in-progress: false" in build
     assert "name: windows-installer" in build
     assert "Reverify and publish fully assembled release" in build
-    assert 'cmp --silent "$EXPECTED_INSTALLER"' in build
+    assert 'cmp --silent "$EXPECTED_PATH"' in build
+    assert 'verify_release_asset "$EXPECTED_INSTALLER"' in build
+    assert 'verify_release_asset "$EXPECTED_WHEEL"' in build
+    assert 'verify_release_asset "$EXPECTED_SDIST"' in build
     assert 'cosign verify-blob \\' in build
     assert "<!-- simkl-mps-source-sha:$SOURCE_SHA -->" in build
     assert "EXPECTED_ROW=" in build

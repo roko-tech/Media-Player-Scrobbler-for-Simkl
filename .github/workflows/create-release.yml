@@ -33,6 +33,8 @@ jobs:
 
       - name: List downloaded artifacts and prepare paths
         id: prep_paths
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
           echo "Listing downloaded artifacts..."
           find artifacts -type f | sort
@@ -40,6 +42,9 @@ jobs:
           # Find the specific files needed
           INSTALLER_PATH=$(find artifacts/windows-installer -name "*.exe" -type f | head -n 1)
           BUILD_INFO_PATH=$(find artifacts/build-info -name "build_info.json" -type f | head -n 1)
+          mapfile -t PYTHON_PACKAGES < <(find artifacts/python-package -type f -print)
+          mapfile -t WHEELS < <(find artifacts/python-package -type f -name "*.whl" -print)
+          mapfile -t SDISTS < <(find artifacts/python-package -type f -name "*.tar.gz" -print)
 
           if [ -z "$INSTALLER_PATH" ]; then
             echo "::error::Windows installer (.exe) not found in artifacts/windows-installer"
@@ -49,14 +54,36 @@ jobs:
             echo "::error::build_info.json not found in artifacts/build-info"
             exit 1
           fi
+          if [ "${#PYTHON_PACKAGES[@]}" -ne 2 ] ||
+             [ "${#WHEELS[@]}" -ne 1 ] ||
+             [ "${#SDISTS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one wheel and one source distribution in artifacts/python-package."
+            exit 1
+          fi
+
+          WHEEL_PATH="${WHEELS[0]}"
+          SDIST_PATH="${SDISTS[0]}"
+          EXPECTED_WHEEL_FILENAME="simkl_mps-${RELEASE_VERSION}-py3-none-any.whl"
+          EXPECTED_SDIST_FILENAME="simkl_mps-${RELEASE_VERSION}.tar.gz"
+          if [ "$(basename "$WHEEL_PATH")" != "$EXPECTED_WHEEL_FILENAME" ] ||
+             [ "$(basename "$SDIST_PATH")" != "$EXPECTED_SDIST_FILENAME" ]; then
+            echo "::error::Python package filenames do not match release version $RELEASE_VERSION."
+            exit 1
+          fi
 
           echo "Found Installer: $INSTALLER_PATH"
           echo "Found Build Info: $BUILD_INFO_PATH"
+          echo "Found Wheel: $WHEEL_PATH"
+          echo "Found Source Distribution: $SDIST_PATH"
 
           echo "installer_path=$INSTALLER_PATH" >> $GITHUB_OUTPUT
           echo "build_info_path=$BUILD_INFO_PATH" >> $GITHUB_OUTPUT
+          echo "wheel_path=$WHEEL_PATH" >> $GITHUB_OUTPUT
+          echo "sdist_path=$SDIST_PATH" >> $GITHUB_OUTPUT
           echo "installer_filename=$(basename "$INSTALLER_PATH")" >> $GITHUB_OUTPUT
           echo "build_info_filename=$(basename "$BUILD_INFO_PATH")" >> $GITHUB_OUTPUT
+          echo "wheel_filename=$(basename "$WHEEL_PATH")" >> $GITHUB_OUTPUT
+          echo "sdist_filename=$(basename "$SDIST_PATH")" >> $GITHUB_OUTPUT
 
       - name: Verify immutable release source
         env:
@@ -101,11 +128,20 @@ jobs:
         env:
           INSTALLER_PATH: ${{ steps.prep_paths.outputs.installer_path }}
           BUILD_INFO_PATH: ${{ steps.prep_paths.outputs.build_info_path }}
+          WHEEL_PATH: ${{ steps.prep_paths.outputs.wheel_path }}
+          SDIST_PATH: ${{ steps.prep_paths.outputs.sdist_path }}
         run: |
           echo "Calculating SHA256 for $INSTALLER_PATH..."
           EXE_HASH=$(sha256sum "$INSTALLER_PATH" | awk '{print $1}')
           echo "exe_hash=$EXE_HASH" >> $GITHUB_OUTPUT
           echo "Calculated EXE hash: $EXE_HASH"
+
+          WHEEL_HASH=$(sha256sum "$WHEEL_PATH" | awk '{print $1}')
+          SDIST_HASH=$(sha256sum "$SDIST_PATH" | awk '{print $1}')
+          echo "wheel_hash=$WHEEL_HASH" >> $GITHUB_OUTPUT
+          echo "sdist_hash=$SDIST_HASH" >> $GITHUB_OUTPUT
+          echo "Calculated wheel hash: $WHEEL_HASH"
+          echo "Calculated source distribution hash: $SDIST_HASH"
           
           if [ -n "$BUILD_INFO_PATH" ]; then
             echo "Calculating SHA256 for $BUILD_INFO_PATH..."
@@ -254,8 +290,14 @@ jobs:
           INSTALLER_SIG_PATH: ${{ steps.sign_installer.outputs.signature_path }}
           INSTALLER_BUNDLE_PATH: ${{ steps.sign_installer.outputs.bundle_path }}
           BUILD_INFO_FILENAME: ${{ steps.prep_paths.outputs.build_info_filename }}
+          WHEEL_PATH: ${{ steps.prep_paths.outputs.wheel_path }}
+          SDIST_PATH: ${{ steps.prep_paths.outputs.sdist_path }}
+          WHEEL_FILENAME: ${{ steps.prep_paths.outputs.wheel_filename }}
+          SDIST_FILENAME: ${{ steps.prep_paths.outputs.sdist_filename }}
           EXE_HASH: ${{ steps.calc_hashes.outputs.exe_hash }}
           BUILD_INFO_HASH: ${{ steps.calc_hashes.outputs.build_info_hash }}
+          WHEEL_HASH: ${{ steps.calc_hashes.outputs.wheel_hash }}
+          SDIST_HASH: ${{ steps.calc_hashes.outputs.sdist_hash }}
         run: |
           set -euo pipefail
 
@@ -273,11 +315,15 @@ jobs:
 
           **Source commit:** \`$SOURCE_SHA\`
 
+          **Distribution:** GitHub-only. Python packages are attached to this release and are not published to PyPI.
+
           **Checksums:**
 
           | File                 | SHA256 Checksum                                  |
           |----------------------|--------------------------------------------------|
           | \`$INSTALLER_FILENAME\` | \`$EXE_HASH\`    |
+          | \`$WHEEL_FILENAME\` | \`$WHEEL_HASH\`    |
+          | \`$SDIST_FILENAME\` | \`$SDIST_HASH\`    |
           | \`$BUILD_INFO_FILENAME\` | \`$BUILD_INFO_HASH\`    |
 
           **Build Info:**
@@ -348,6 +394,7 @@ jobs:
 
           echo "Uploading artifacts..."
           gh release upload "$TAG_NAME" "$INSTALLER_PATH" --clobber
+          gh release upload "$TAG_NAME" "$WHEEL_PATH" "$SDIST_PATH" --clobber
           if [ -n "$INSTALLER_SIG_PATH" ] && [ -f "$INSTALLER_SIG_PATH" ]; then
             gh release upload "$TAG_NAME" "$INSTALLER_SIG_PATH" --clobber
           else
@@ -360,6 +407,8 @@ jobs:
           DOWNLOAD_ARGS=(
             --dir "$VERIFY_DIR"
             --pattern "$INSTALLER_FILENAME"
+            --pattern "$WHEEL_FILENAME"
+            --pattern "$SDIST_FILENAME"
             --pattern "$(basename "$INSTALLER_BUNDLE_PATH")"
             --pattern "$(basename "$VERIFY_DOC_PATH")"
           )
@@ -383,6 +432,8 @@ jobs:
           }
 
           verify_uploaded_asset "$INSTALLER_PATH"
+          verify_uploaded_asset "$WHEEL_PATH"
+          verify_uploaded_asset "$SDIST_PATH"
           verify_uploaded_asset "$INSTALLER_BUNDLE_PATH"
           verify_uploaded_asset "$VERIFY_DOC_PATH"
           if [ -n "$INSTALLER_SIG_PATH" ] && [ -f "$INSTALLER_SIG_PATH" ]; then

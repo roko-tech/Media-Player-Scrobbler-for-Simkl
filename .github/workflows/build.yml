@@ -1,4 +1,4 @@
-name: Build and Publish
+name: Build and Publish GitHub Release
 
 on:
   workflow_dispatch:
@@ -115,19 +115,8 @@ jobs:
     secrets:
       RELEASE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  publish-pypi:
-    needs: [prepare-release, create-github-release]
-    uses: ./.github/workflows/publish-pypi.yml
-    with:
-      version: ${{ needs.prepare-release.outputs.version }}
-      source_sha: ${{ needs.prepare-release.outputs.source_sha }}
-      build: false
-      publish: true
-    secrets:
-      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-
   publish-github-release:
-    needs: [prepare-release, create-github-release, publish-pypi]
+    needs: [prepare-release, create-github-release]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout verified release source
@@ -141,6 +130,12 @@ jobs:
         with:
           name: windows-installer
           path: expected-installer
+
+      - name: Download expected Python packages
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package
+          path: expected-python-package
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v4.1.2
@@ -166,8 +161,22 @@ jobs:
             echo "::error::Expected exactly one Windows installer artifact, found ${#EXPECTED_INSTALLERS[@]}."
             exit 1
           fi
+          mapfile -t EXPECTED_PACKAGES < <(find expected-python-package -type f -print)
+          mapfile -t EXPECTED_WHEELS < <(find expected-python-package -type f -name '*.whl' -print)
+          mapfile -t EXPECTED_SDISTS < <(find expected-python-package -type f -name '*.tar.gz' -print)
+          if [ "${#EXPECTED_PACKAGES[@]}" -ne 2 ] ||
+             [ "${#EXPECTED_WHEELS[@]}" -ne 1 ] ||
+             [ "${#EXPECTED_SDISTS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one wheel and one source distribution."
+            exit 1
+          fi
+
           EXPECTED_INSTALLER="${EXPECTED_INSTALLERS[0]}"
+          EXPECTED_WHEEL="${EXPECTED_WHEELS[0]}"
+          EXPECTED_SDIST="${EXPECTED_SDISTS[0]}"
           INSTALLER_FILENAME=$(basename "$EXPECTED_INSTALLER")
+          WHEEL_FILENAME=$(basename "$EXPECTED_WHEEL")
+          SDIST_FILENAME=$(basename "$EXPECTED_SDIST")
           BUNDLE_FILENAME="${INSTALLER_FILENAME}.sigstore.bundle"
           CERT_IDENTITY="https://github.com/$REPOSITORY/.github/workflows/create-release.yml@refs/tags/$TAG_NAME"
           CERT_ISSUER="https://token.actions.githubusercontent.com"
@@ -183,30 +192,52 @@ jobs:
             --repo "$REPOSITORY" \
             --dir "$VERIFY_DIR" \
             --pattern "$INSTALLER_FILENAME" \
+            --pattern "$WHEEL_FILENAME" \
+            --pattern "$SDIST_FILENAME" \
             --pattern "$BUNDLE_FILENAME" \
             --pattern "verify.md"
 
-          if ! cmp --silent "$EXPECTED_INSTALLER" "$VERIFY_DIR/$INSTALLER_FILENAME"; then
-            echo "::error::Draft release installer differs from this run's verified build artifact."
-            exit 1
-          fi
+          verify_release_asset() {
+            EXPECTED_PATH="$1"
+            DOWNLOADED_PATH="$VERIFY_DIR/$(basename "$EXPECTED_PATH")"
+            if [ ! -f "$DOWNLOADED_PATH" ] ||
+               ! cmp --silent "$EXPECTED_PATH" "$DOWNLOADED_PATH"; then
+              echo "::error::Draft release asset $(basename "$EXPECTED_PATH") differs from this run's verified build artifact."
+              exit 1
+            fi
+          }
+
+          verify_release_asset "$EXPECTED_INSTALLER"
+          verify_release_asset "$EXPECTED_WHEEL"
+          verify_release_asset "$EXPECTED_SDIST"
+
           cosign verify-blob \
             --bundle "$VERIFY_DIR/$BUNDLE_FILENAME" \
             --certificate-identity "$CERT_IDENTITY" \
             --certificate-oidc-issuer "$CERT_ISSUER" \
             "$VERIFY_DIR/$INSTALLER_FILENAME"
 
-          EXPECTED_HASH=$(sha256sum "$EXPECTED_INSTALLER" | awk '{print $1}')
-          EXPECTED_ROW=$(printf '| `%s` | `%s`' "$INSTALLER_FILENAME" "$EXPECTED_HASH")
           RELEASE_BODY=$(gh release view "$TAG_NAME" --repo "$REPOSITORY" --json body --jq .body)
           if ! grep -Fq "<!-- simkl-mps-source-sha:$SOURCE_SHA -->" <<< "$RELEASE_BODY"; then
             echo "::error::Draft release notes are not bound to the verified source SHA."
             exit 1
           fi
-          if ! grep -Fq "$EXPECTED_ROW" <<< "$RELEASE_BODY"; then
-            echo "::error::Draft release notes do not contain the verified installer checksum."
-            exit 1
-          fi
+
+          verify_checksum_row() {
+            EXPECTED_PATH="$1"
+            EXPECTED_FILENAME=$(basename "$EXPECTED_PATH")
+            EXPECTED_HASH=$(sha256sum "$EXPECTED_PATH" | awk '{print $1}')
+            EXPECTED_ROW=$(printf '| `%s` | `%s`' "$EXPECTED_FILENAME" "$EXPECTED_HASH")
+            if ! grep -Fq "$EXPECTED_ROW" <<< "$RELEASE_BODY"; then
+              echo "::error::Draft release notes do not contain the verified checksum for $EXPECTED_FILENAME."
+              exit 1
+            fi
+          }
+
+          verify_checksum_row "$EXPECTED_INSTALLER"
+          verify_checksum_row "$EXPECTED_WHEEL"
+          verify_checksum_row "$EXPECTED_SDIST"
+
           if ! grep -Fq -- "--certificate-identity \"$CERT_IDENTITY\"" "$VERIFY_DIR/verify.md" ||
              ! grep -Fq -- "--certificate-oidc-issuer \"$CERT_ISSUER\"" "$VERIFY_DIR/verify.md"; then
             echo "::error::Draft verification guide is not bound to the expected signer."
