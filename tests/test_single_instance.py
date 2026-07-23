@@ -192,3 +192,38 @@ def test_completion_receipt_keeps_the_exact_episode_from_identification():
 
     assert rendered[0]["episode"] == 4
     assert rendered[0]["display_episode"] == 4
+
+
+def test_clear_pending_trakt_syncs_confirms_and_uses_watcher(monkeypatch):
+    from simkl_mps import tray_base
+    from simkl_mps.tray_win import TrayAppWin
+
+    class Watcher:
+        def __init__(self):
+            self.calls = 0
+
+        def dismiss_pending_events(self):
+            self.calls += 1
+            return 2
+
+    class ImmediateThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    watcher = Watcher()
+    notifications = []
+    app = TrayAppWin.__new__(TrayAppWin)
+    app._show_confirmation_dialog = lambda *_args: True
+    app._get_trakt_watcher = lambda: watcher
+    app.show_notification = lambda *args: notifications.append(args)
+    app.update_icon = lambda: None
+    monkeypatch.setattr(tray_base.threading, "Thread", ImmediateThread)
+
+    result = app.clear_pending_trakt_syncs()
+
+    assert result == 0
+    assert watcher.calls == 1
+    assert notifications == [("Trakt Sync", "Dismissed 2 pending Trakt events.")]

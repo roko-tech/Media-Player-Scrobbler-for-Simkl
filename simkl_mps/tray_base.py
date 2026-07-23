@@ -836,6 +836,43 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         threading.Thread(target=run_sync, name="trakt-sync-manual", daemon=True).start()
         return 0
 
+    def clear_pending_trakt_syncs(self, _=None):
+        """Let the user permanently dismiss the current Trakt retry queue."""
+        if not self._show_confirmation_dialog(
+            "Clear Pending Trakt Syncs",
+            "Stop retrying every currently pending Trakt event?\n\n"
+            "Your local watch history will be kept. The dismissed events will not be sent "
+            "to Trakt unless you watch them again.",
+        ):
+            return 0
+
+        watcher = self._get_trakt_watcher()
+
+        def clear_pending():
+            try:
+                if watcher:
+                    count = watcher.dismiss_pending_events()
+                else:
+                    from simkl_mps import trakt_sync
+
+                    count = trakt_sync.dismiss_pending_events()
+                if count:
+                    message = f"Dismissed {count} pending Trakt event{'s' if count != 1 else ''}."
+                else:
+                    message = "No pending Trakt events to dismiss."
+                self.show_notification("Trakt Sync", message)
+                self.update_icon()
+            except Exception as exc:
+                logger.exception("Could not dismiss pending Trakt events")
+                self.show_notification("Trakt Sync Error", f"Could not dismiss pending events: {exc}")
+
+        threading.Thread(
+            target=clear_pending,
+            name="trakt-dismiss-pending",
+            daemon=True,
+        ).start()
+        return 0
+
     def open_trakt(self, _=None):
         webbrowser.open("https://trakt.tv/")
         return 0
@@ -1418,6 +1455,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                 self.sync_trakt_now,
                 enabled=bool(trakt_watcher and trakt_watcher.configured),
             ),
+            pystray.MenuItem("Clear Pending Syncs...", self.clear_pending_trakt_syncs),
             pystray.MenuItem("Copy Safe Diagnostics", self.copy_sync_diagnostics),
             pystray.MenuItem("Open Website", self.open_trakt),
         )))

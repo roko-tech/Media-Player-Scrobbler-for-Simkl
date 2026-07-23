@@ -20,6 +20,7 @@ class TraktSyncWatcher:
         self._sync_lock = threading.Lock()
         self._thread = None
         self._result_callback = None
+        self._last_emitted_receipt_key = None
         self.last_summary = "not configured"
 
     @property
@@ -155,10 +156,23 @@ class TraktSyncWatcher:
         event = self._latest_event()
         if not event:
             return
+        receipt_key = (
+            event.get("kind"),
+            event.get("simkl_id"),
+            event.get("season"),
+            event.get("episode"),
+            event.get("watched_at"),
+            bool(result.ok and result.pending == 0),
+        )
+        if receipt_key == self._last_emitted_receipt_key:
+            logger.debug("Trakt sync receipt unchanged; suppressing duplicate overlay")
+            return
         try:
             self._result_callback(result, event)
         except Exception:
             logger.exception("Trakt sync result callback failed")
+        else:
+            self._last_emitted_receipt_key = receipt_key
 
     def sync_now(self):
         if not self.configured:
@@ -176,6 +190,11 @@ class TraktSyncWatcher:
             return trakt_sync.SyncResult(False, self.last_summary)
         finally:
             self._sync_lock.release()
+
+    def dismiss_pending_events(self):
+        """Serialize pending-event dismissal against any active Trakt sync."""
+        with self._sync_lock:
+            return trakt_sync.dismiss_pending_events()
 
     def _mtime(self):
         try:
@@ -227,5 +246,4 @@ class TraktSyncWatcher:
             if next_retry is not None and time.monotonic() >= next_retry:
                 logger.info("Trakt sync: retrying a failed or pending sync without a new history change")
                 result = self.sync_now()
-                self._emit_result(result)
                 next_retry = self._next_retry(result)

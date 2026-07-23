@@ -357,6 +357,23 @@ def _event_key(event):
     )
 
 
+def dismiss_pending_events():
+    """Stop retrying every currently pending Trakt event without deleting watch history."""
+    state = load_state({}) or {}
+    pending_events = state.get("pending") or []
+    if not pending_events:
+        return 0
+
+    dismissed_keys = set(state.get("dismissed_event_keys") or [])
+    dismissed_keys.update(_event_key(event) for event in pending_events)
+    state["pending"] = []
+    state["dismissed_event_keys"] = sorted(dismissed_keys)
+    summary = f"Trakt: dismissed {len(pending_events)} pending event(s)."
+    _record_health(state, summary, True, pending=0)
+    logger.info(summary)
+    return len(pending_events)
+
+
 def collect_history_events(history, since_dt):
     """Flatten local history entries into exact movie/episode watch events."""
     events = []
@@ -664,6 +681,8 @@ def sync_history(since=None, dry_run=False):
     new_events = collect_history_events(history, marker)
     pending_events = [] if since else (state.get("pending") or [])
     events = _deduplicate(pending_events + new_events)
+    dismissed_keys = set(state.get("dismissed_event_keys") or [])
+    events = [event for event in events if _event_key(event) not in dismissed_keys]
     logger.info(
         "Trakt sync: local window after %s | %d new event(s), %d pending",
         iso(marker),

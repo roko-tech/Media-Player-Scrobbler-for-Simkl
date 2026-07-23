@@ -285,6 +285,66 @@ def test_unmatched_event_is_saved_and_retried_after_marker_advances(tmp_path, mo
     assert saved["pending"] == []
 
 
+def test_dismiss_pending_events_prevents_same_history_event_from_returning(tmp_path, monkeypatch):
+    state_file = tmp_path / "trakt_sync_state.json"
+    history_file = tmp_path / "watch_history.json"
+    pending_event = {
+        "kind": "episode",
+        "title": "Wrong Match",
+        "simkl_id": 99,
+        "season": 1,
+        "episode": 1,
+        "watched_at": "2026-07-23T02:56:12.725Z",
+        "ids": {},
+        "is_anime": True,
+    }
+    state_file.write_text(
+        json.dumps(
+            {
+                "synced_through": "2026-07-23T02:56:12.725Z",
+                "pending": [pending_event],
+            }
+        ),
+        encoding="utf-8",
+    )
+    history_file.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "anime",
+                    "title": "Wrong Match",
+                    "simkl_id": 99,
+                    "season": 1,
+                    "episode": 1,
+                    "watch_events": [
+                        {
+                            "season": 1,
+                            "episode": 1,
+                            "watched_at": "2026-07-23T02:56:12.725794Z",
+                        }
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(trakt_sync, "STATE_FILE", state_file)
+    monkeypatch.setattr(trakt_sync, "HISTORY_FILE", history_file)
+
+    dismissed = trakt_sync.dismiss_pending_events()
+    saved = json.loads(state_file.read_text(encoding="utf-8"))
+
+    assert dismissed == 1
+    assert saved["pending"] == []
+    assert saved["dismissed_event_keys"] == [trakt_sync._event_key(pending_event)]
+
+    result = trakt_sync.sync_history()
+
+    assert result.ok is True
+    assert result.pending == 0
+    assert "nothing new" in result.summary
+
+
 def test_trakt_state_recovers_backup_and_preserves_corrupt_primary(
     tmp_path, monkeypatch
 ):
@@ -440,6 +500,7 @@ def test_fribb_map_reloads_when_cache_appears(tmp_path, monkeypatch):
 def test_watcher_retries_failed_sync_without_another_history_change(monkeypatch):
     watcher = TraktSyncWatcher(poll_seconds=0.01, debounce_seconds=0.01, retry_seconds=0.03)
     calls = []
+    receipts = []
 
     def fake_sync_now():
         calls.append(len(calls))
@@ -450,10 +511,17 @@ def test_watcher_retries_failed_sync_without_another_history_change(monkeypatch)
 
     monkeypatch.setattr(watcher, "sync_now", fake_sync_now)
     monkeypatch.setattr(watcher, "_mtime", lambda: 0.0)
+    monkeypatch.setattr(
+        watcher,
+        "_latest_event",
+        lambda: {"kind": "episode", "simkl_id": 100, "season": 1, "episode": 1},
+    )
+    watcher.set_result_callback(lambda result, event: receipts.append((result, event)))
 
     watcher._watch_loop()
 
     assert len(calls) == 2
+    assert receipts == []
 
 
 def test_history_saved_sync_emits_exact_completion_receipt(monkeypatch):
@@ -489,3 +557,29 @@ def test_history_saved_sync_emits_exact_completion_receipt(monkeypatch):
     assert receipts[0][0].ok is True
     assert receipts[0][0].pushed is True
     assert receipts[0][1] == event
+
+
+def test_repeated_trakt_retry_emits_receipt_only_when_outcome_changes(monkeypatch):
+    watcher = TraktSyncWatcher()
+    event = {
+        "kind": "episode",
+        "title": "Example",
+        "simkl_id": 100,
+        "season": 2,
+        "episode": 3,
+        "watched_at": "2026-07-17T10:00:00Z",
+    }
+    receipts = []
+
+    monkeypatch.setattr(watcher, "_latest_event", lambda: event)
+    watcher.set_result_callback(lambda result, latest_event: receipts.append((result, latest_event)))
+
+    pending = trakt_sync.SyncResult(False, "still pending", pending=1)
+    accepted = trakt_sync.SyncResult(True, "recovered")
+    watcher._emit_result(pending)
+    watcher._emit_result(pending)
+    watcher._emit_result(accepted)
+    watcher._emit_result(accepted)
+
+    assert [result for result, _event in receipts] == [pending, accepted]
+    assert [latest_event for _result, latest_event in receipts] == [event, event]

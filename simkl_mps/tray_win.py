@@ -582,7 +582,7 @@ class TrayAppWin(TrayAppBase):
                 padx=12,
             ).pack(side="bottom", anchor="w")
 
-        self._receipt_after_id = self._tk_root.after(8000, self._dismiss_receipt)
+        self._receipt_after_id = self._tk_root.after(5000, self._dismiss_receipt)
         window.lift()
 
     def _show_info_dialog(self, title, message):
