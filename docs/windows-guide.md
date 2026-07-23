@@ -24,7 +24,7 @@ flowchart LR
     style J fill:#fbbc05,stroke:#333,stroke-width:2px,color:#fff
 ```
 
-1. [Download the latest installer](https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/releases/latest)
+1. [Download the latest installer](https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl/releases/latest)
 2. **Right-click** the installer and select **"Run as administrator"** (recommended)
 3. Follow the setup wizard:
    - Accept the license agreement
@@ -144,9 +144,9 @@ To change startup behavior later:
 
 ### Windows-Specific File Locations
 
-- **Configuration file**: `%%USERPROFILE%\kavin\simkl-mps\.simkl_mps.env`
+- **Configuration file**: `%USERPROFILE%\kavin\simkl-mps\.simkl_mps.env`
 - **Log files**: `%USERPROFILE%\kavin\simkl-mps\simkl_mps.log`
-- **Backlog**: `%USERPROFILE%\kavin\simkl-mps\backlog.json`
+- **Completion queue and audit trail**: `%USERPROFILE%\kavin\simkl-mps\completion_ledger.sqlite3`
 
 ## 🔄 Windows Update System
 

@@ -142,97 +142,54 @@ class MPCIntegration:
             # Always raise so the notification logic in media_scrobbler.py is triggered
             raise
     
+    def _iter_candidate_vars(self):
+        """Yield responses from every candidate, raising only if all connections fail."""
+        ports = []
+        for port in [self.working_port, *self.default_ports]:
+            if port is not None and port not in ports:
+                ports.append(port)
+
+        last_error = None
+        received_response = False
+        for port in ports:
+            try:
+                variables = self.get_vars(port)
+                received_response = True
+                yield port, variables
+            except requests.RequestException as exc:
+                last_error = exc
+                logger.debug("MPC candidate port %s failed: %s", port, exc)
+
+        if not received_response and last_error:
+            raise last_error
+
     def get_position_duration(self, process_name=None):
-        """
-        Get current position and duration from MPC player.
-        
-        Args:
-            process_name: Process name (ignored, used for consistency with other integrations)
-            
-        Returns:
-            tuple: (position_seconds, duration_seconds) or (None, None) if unavailable
-        """
-        # First try the working port if we have one
-        if self.working_port:
-            variables = self.get_vars(self.working_port)
+        """Get position and duration, trying every configured MPC port."""
+        for port, variables in self._iter_candidate_vars():
             if variables and variables.get('duration', '0') != '0':
-                position = int(variables.get('position', 0)) / 1000.0  # MPC reports in milliseconds
+                position = int(variables.get('position', 0)) / 1000.0
                 duration = int(variables.get('duration', 0)) / 1000.0
+                if port != self.working_port:
+                    logger.info("Successfully connected to MPC web interface on port %s", port)
+                    self.working_port = port
                 return position, duration
-                
-        # If no working port or it failed, try all default ports
-        for port in self.default_ports:
-            if port == self.working_port:
-                continue  # Already tried this one
-                
-            variables = self.get_vars(port)
-            if variables and variables.get('duration', '0') != '0':
-                position = int(variables.get('position', 0)) / 1000.0  # MPC reports in milliseconds
-                duration = int(variables.get('duration', 0)) / 1000.0
-                logger.info(f"Successfully connected to MPC web interface on port {port}")
-                self.working_port = port  # Remember this working port
-                return position, duration
-                
         return None, None  # Failed to get position/duration
         
     def is_paused(self):
-        """
-        Check if MPC playback is paused
-        
-        Returns:
-            bool: True if paused, False if playing, None if unknown
-        """
-        # Try working port first
-        if self.working_port:
-            variables = self.get_vars(self.working_port)
+        """Return the pause state from the first responsive MPC candidate."""
+        for _, variables in self._iter_candidate_vars():
             if variables:
-                state = variables.get('state', '')
-                return state == '2'  # MPC state 2 = paused
-        
-        # If no working port or it failed, try all default ports
-        for port in self.default_ports:
-            if port == self.working_port:
-                continue  # Already tried this one
-                
-            variables = self.get_vars(port)
-            if variables:
-                state = variables.get('state', '')
-                return state == '2'  # MPC state 2 = paused
-                
+                return variables.get('state', '') == '2'
         return None  # Couldn't determine pause state
 
     def get_current_filepath(self, process_name=None):
-        """
-        Get the filepath of the currently playing file in MPC.
-        
-        Args:
-            process_name: Optional process name for consistency with other integrations
-            
-        Returns:
-            str: Filepath of the current media, or None if unavailable
-        """
-        # First try the working port if we have one
-        if self.working_port:
-            variables = self.get_vars(self.working_port)
-            if variables and 'filepath' in variables:
-                filepath = variables.get('filepath', '')
-                if filepath:
-                    logger.debug(f"Retrieved filepath from MPC: {filepath}")
-                    return filepath
-                
-        # If no working port or it failed, try all default ports
-        for port in self.default_ports:
-            if port == self.working_port:
-                continue  # Already tried this one
-                
-            variables = self.get_vars(port)
-            if variables and 'filepath' in variables:
-                filepath = variables.get('filepath', '')
-                if filepath:
-                    logger.debug(f"Retrieved filepath from MPC on port {port}: {filepath}")
-                    self.working_port = port  # Remember this working port
-                    return filepath
-                    
+        """Get the current filepath, trying every configured MPC port."""
+        for port, variables in self._iter_candidate_vars():
+            filepath = variables.get('filepath', '') if variables else ''
+            if filepath:
+                logger.debug("Retrieved filepath from MPC on port %s: %s", port, filepath)
+                self.working_port = port
+                return filepath
         logger.debug("Couldn't get filepath from MPC")
         return None
 

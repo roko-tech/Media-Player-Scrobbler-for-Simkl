@@ -94,3 +94,22 @@ def unprotect_secret(value):
         return _unprotect_bytes(protected).decode("utf-8")
     except (binascii.Error, ValueError, UnicodeError) as exc:
         raise SecretProtectionError("Invalid DPAPI secret data.") from exc
+
+
+def ensure_private_file(path):
+    """Restrict a secret-bearing file to its owner on POSIX systems."""
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+
+
+def open_private_text_file(path, encoding="utf-8"):
+    """Open a file for replacement while enforcing a POSIX owner-only mode."""
+    if os.name == "nt":
+        return open(path, "w", encoding=encoding)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.chmod(path, 0o600)
+        return os.fdopen(descriptor, "w", encoding=encoding)
+    except Exception:
+        os.close(descriptor)
+        raise

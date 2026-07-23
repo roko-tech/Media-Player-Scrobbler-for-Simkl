@@ -9,8 +9,6 @@ on:
     secrets:
       RELEASE_TOKEN:
         required: true
-      GPG_PUBLIC_KEY:
-        required: true
 
 jobs:
   release:
@@ -235,7 +233,12 @@ jobs:
 
           # Check if release already exists
           if gh release view "$TAG_NAME" --json id --jq .id &>/dev/null; then
-            echo "Release $TAG_NAME already exists. Updating notes and uploading artifacts."
+            IS_DRAFT=$(gh release view "$TAG_NAME" --json isDraft --jq .isDraft)
+            if [ "$IS_DRAFT" != "true" ]; then
+              echo "::error::Release $TAG_NAME is already public; refusing to replace published assets."
+              exit 1
+            fi
+            echo "Draft release $TAG_NAME already exists. Updating notes and uploading artifacts."
             EXISTING_BODY=$(gh release view "$TAG_NAME" --json body --jq .body)
             # Simple strategy: Replace the whole body if it exists, otherwise use generated notes + hash table
             # More sophisticated: Find a marker and replace only the verification section
@@ -256,13 +259,13 @@ jobs:
               --title "Release $VERSION" \
               --generate-notes \
               --discussion-category "Releases" \
+              --draft
             # Get the body of the draft (which includes generated notes)
             DRAFT_BODY=$(gh release view "$TAG_NAME" --json body --jq .body)
             # Construct the final body for the new release
             NEW_BODY=$(printf "%s\n\n---\n\n%s" "$DRAFT_BODY" "$HASH_TABLE")
-            # Update the draft release with the full body and publish it
-            echo "Updating draft release with full notes and publishing..."
-            gh release edit "$TAG_NAME" --notes "$NEW_BODY" --draft=false
+            echo "Updating draft release with full notes..."
+            gh release edit "$TAG_NAME" --notes "$NEW_BODY"
           fi
 
           # Upload all required artifacts, overwriting if they exist
@@ -276,10 +279,3 @@ jobs:
           gh release upload "$TAG_NAME" "$INSTALLER_BUNDLE_PATH" --clobber
           gh release upload "$TAG_NAME" "$VERIFY_DOC_PATH" --clobber
           # Note: Not uploading the build_info.json file as requested
-
-      # Optional: Keep or remove the delete-artifact step as needed
-      - name: Delete build artifacts
-        uses: geekyeggo/delete-artifact@v6
-        with:
-          name: |
-            python-package

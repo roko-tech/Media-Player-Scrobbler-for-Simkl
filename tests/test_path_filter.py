@@ -2,18 +2,14 @@
 file (config_manager.py): bracket folders, empty-list leak, CWD-relative paths.
 Run with pytest or `python3 test_path_filter.py`."""
 
+import importlib.util
 import json
 import os
 import sys
 import tempfile
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _HERE)
-
-# Load these two stdlib-only modules straight from disk; importing the full package would
-# run app startup and touch the real settings.json.
-import importlib.util
-
 
 def _load(name, relpath):
     spec = importlib.util.spec_from_file_location(name, os.path.join(_HERE, relpath))

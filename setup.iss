@@ -1,15 +1,15 @@
 #define MyAppName "Media Player Scrobbler for SIMKL"
 #define MyAppShortName "MPS for SIMKL"
-#define MyAppPublisher "ByteTrix"
-#define MyAppURL "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl"
+#define MyAppPublisher "roko-tech"
+#define MyAppURL "https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl"
 #define MyAppExeName "MPSS"
 #define MyAppTrayName "MPS for Simkl"
 #define MyAppVersion "2.4.1"
 #define MyAppDescription "Automatically track and scrobble media you watch to SIMKL"
 #define MyAppCopyright "Copyright (C) 2025 kavin"
-#define MyAppUpdateURL "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/releases"
-#define MyAppReadmeURL "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl#readme"
-#define MyAppIssuesURL "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/issues"
+#define MyAppUpdateURL "https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl/releases"
+#define MyAppReadmeURL "https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl#readme"
+#define MyAppIssuesURL "https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl/issues"
 #define MyLicense "GNU GPL v3"
 
 [Setup]
@@ -125,7 +125,7 @@ Root: HKCU; Subkey: "Software\{#MyAppPublisher}\{#MyAppName}"; ValueType: string
 Root: HKCU; Subkey: "Software\{#MyAppPublisher}\{#MyAppName}"; ValueType: string; ValueName: "License"; ValueData: "{#MyLicense}"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\{#MyAppPublisher}\{#MyAppName}"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\{#MyAppPublisher}\{#MyAppName}"; ValueType: dword; ValueName: "CheckUpdates"; ValueData: "1"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\{#MyAppPublisher}\{#MyAppName}"; ValueType: dword; ValueName: "FirstRun"; ValueData: "0"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\{#MyAppPublisher}\{#MyAppName}"; ValueType: dword; ValueName: "FirstRun"; ValueData: "0"; Flags: createvalueifdoesntexist uninsdeletekey
 
 ; Admin installation - HKLM registry keys only for admin installs
 Root: HKLM; Subkey: "Software\{#MyAppPublisher}\{#MyAppName}"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey; Check: IsAdminInstallMode

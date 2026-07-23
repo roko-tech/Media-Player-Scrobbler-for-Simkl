@@ -6,17 +6,19 @@ on:
       version:
         required: true
         type: string
+      build:
+        required: false
+        type: boolean
+        default: true
       publish:
         required: false
         type: boolean
         default: true
     secrets:
       SIMKL_CLIENT_ID:
-        required: true
-      SIMKL_CLIENT_SECRET:
-        required: true
+        required: false
       PYPI_API_TOKEN:
-        required: true
+        required: false
   workflow_dispatch:
     inputs:
       version:
@@ -25,6 +27,11 @@ on:
         type: string
       publish:
         description: 'PyPI publish'
+        required: true
+        type: boolean
+        default: true
+      build:
+        description: 'Build the package artifact'
         required: true
         type: boolean
         default: true
@@ -50,55 +57,64 @@ jobs:
           python -m pip install --upgrade pip
           pip install poetry
           poetry --version
-          poetry lock
 
-      - name: Validate project metadata
+      - name: Validate project metadata and release version
+        if: ${{ inputs.build }}
         run: poetry check
-
-
-      - name: Set version in pyproject.toml
-        run: poetry version ${{ inputs.version }}
-
       
-      - name: Inject Simkl Credentials into Code
+      - name: Validate release version
+        if: ${{ inputs.build }}
+        run: python scripts/validate_release_version.py ${{ inputs.version }}
+
+      - name: Validate build inputs
+        if: ${{ inputs.build }}
         env:
           SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
-          SIMKL_CLIENT_SECRET: ${{ secrets.SIMKL_CLIENT_SECRET }}
         run: |
-          # Check if secrets are available
           if [ -z "$SIMKL_CLIENT_ID" ]; then
             echo "::error::SIMKL_CLIENT_ID secret is not set."
             exit 1
           fi
-          if [ -z "$SIMKL_CLIENT_SECRET" ]; then
-            echo "::error::SIMKL_CLIENT_SECRET secret is not set."
-            exit 1
-          fi
 
-          # Inject Client ID
-          echo "Injecting SIMKL_CLIENT_ID into credentials.py"
-          # Use a different delimiter for sed in case the secret contains slashes
+      - name: Inject public Simkl Client ID
+        if: ${{ inputs.build }}
+        env:
+          SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
+        run: |
           sed -i "s|SIMKL_CLIENT_ID_PLACEHOLDER|${SIMKL_CLIENT_ID}|g" simkl_mps/credentials.py
 
-          # Inject Client Secret
-          echo "Injecting SIMKL_CLIENT_SECRET into credentials.py"
-          sed -i "s|SIMKL_CLIENT_SECRET_PLACEHOLDER|${SIMKL_CLIENT_SECRET}|g" simkl_mps/credentials.py
-
-          echo "✅ Credentials successfully injected into simkl_mps/credentials.py"
-
       - name: Build package
+        if: ${{ inputs.build }}
         run: |
           poetry build
           ls -la dist/
         env:
           VERSION: ${{ inputs.version }}
 
-      # - name: Upload Python package artifacts
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: python-package
-      #     path: dist/
-      #     retention-days: 1
+      - name: Upload Python package artifacts
+        if: ${{ inputs.build }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-package
+          path: dist/
+          retention-days: 3
+
+      - name: Download previously built package artifacts
+        if: ${{ !inputs.build }}
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package
+          path: dist/
+
+      - name: Validate publish token
+        if: ${{ inputs.publish }}
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "$PYPI_API_TOKEN" ]; then
+            echo "::error::PYPI_API_TOKEN secret is not set."
+            exit 1
+          fi
 
       - name: Publish to PyPI (skip existing)
         if: ${{ inputs.publish }}

@@ -1,4 +1,12 @@
 document.addEventListener('DOMContentLoaded', () => {
+    const OFFLINE_POSTER = "data:image/svg+xml;charset=utf-8," +
+        encodeURIComponent(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="450">' +
+            '<rect width="100%" height="100%" fill="#1f2937"/>' +
+            '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" ' +
+            'fill="#d1d5db" font-family="sans-serif" font-size="22">No poster</text></svg>'
+        );
+
     // DOM elements
     const historyContainer = document.getElementById('history-container');
     const emptyHistory = document.getElementById('empty-history');
@@ -58,23 +66,9 @@ document.addEventListener('DOMContentLoaded', () => {
         dashboard.style.display = 'block';
     }
 
-    // Apply proxy only to Simkl poster URLs, not to placeholder images
+    // The local viewer never resolves remote artwork. Provider links remain click-only.
     function getProxiedImageUrl(url) {
-        // If no URL is provided, return a default placeholder
-        if (!url) {
-            return `https://via.placeholder.com/150x225.webp?text=No+Poster`;
-        }
-        
-
-        
-        // Check if it's a Simkl poster URL (contains simkl.in/posters)
-        if (url.includes('https://simkl.in/posters/')) {
-            // Use direct URL without proxy - wsrv.nl is causing issues
-           
-            return url;
-        }
-
-        return url;
+        return OFFLINE_POSTER;
     }
 
     // Load watch history data
@@ -252,7 +246,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Create or update the watch trend chart with enhanced visuals
     function createWatchTrendChart() {
-        if (typeof Chart === 'undefined') return;
+        if (typeof Chart === 'undefined') {
+            document.getElementById('watch-trend-chart')?.closest('.chart-container')?.remove();
+            return;
+        }
         
         // Get the chart canvas
         const chartCanvas = document.getElementById('watch-trend-chart');
@@ -512,7 +509,10 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Create media type distribution chart (pie/doughnut chart)
     function createMediaTypeDistribution() {
-        if (typeof Chart === 'undefined') return;
+        if (typeof Chart === 'undefined') {
+            document.getElementById('media-type-chart')?.closest('.chart-container')?.remove();
+            return;
+        }
         
         const chartCanvas = document.getElementById('media-type-chart');
         if (!chartCanvas) return;
@@ -598,7 +598,10 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Create viewing times chart (by hour of day)
     function createViewingTimesChart() {
-        if (typeof Chart === 'undefined') return;
+        if (typeof Chart === 'undefined') {
+            document.getElementById('viewing-times-chart')?.closest('.chart-container')?.remove();
+            return;
+        }
         
         const chartCanvas = document.getElementById('viewing-times-chart');
         if (!chartCanvas) return;
@@ -1761,17 +1764,10 @@ document.addEventListener('DOMContentLoaded', () => {
         link.className = 'external-link-btn';
         link.title = `View on ${text}`;
         
-        if (iconSrc && iconSrc.includes('http')) {
-            const icon = document.createElement('img');
-            icon.src = iconSrc;
-            icon.alt = text;
-            icon.className = 'icon';
-            link.appendChild(icon);
-        } else {
-            const icon = document.createElement('i');
-            icon.className = 'ph-duotone ph-link icon';
-            link.appendChild(icon);
-        }
+        const icon = document.createElement('span');
+        icon.className = 'icon';
+        icon.textContent = '↗';
+        link.appendChild(icon);
         
         const textSpan = document.createElement('span');
         textSpan.textContent = text;

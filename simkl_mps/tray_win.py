@@ -611,7 +611,7 @@ class TrayAppWin(TrayAppBase):
         """Show help information and fallback to native Windows dialog."""
         try:
             # Open documentation or show help dialog
-            help_url = "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/wiki"
+            help_url = "https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl/wiki"
             webbrowser.open(help_url)
         except Exception as e:
             logger.error(f"Error showing help: {e}")
@@ -874,7 +874,8 @@ Tips:
                 self.update_status("error", "Failed to start monitoring")
         else:
             self.update_status("error", "Failed to initialize")
-            
+
+        self._show_first_run_setup_if_needed()
         self._run_tray_loop()
 
     def _run_tray_loop(self, retry_delay=2):
@@ -1034,47 +1035,25 @@ Tips:
     # _setup_auto_update_if_needed remains platform-specific for now
 
     def check_first_run(self):
-        """Windows-specific check for first run using registry"""
+        """Track first-run completion in the canonical installer registry key."""
+        self.is_first_run = False
+        if sys.platform != "win32":
+            return
         try:
-            # Create a registry key to track app states on Windows
-            if sys.platform == 'win32':
-                import winreg
+            import winreg
+
+            registry_path = r"Software\roko-tech\Media Player Scrobbler for SIMKL"
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, registry_path) as key:
                 try:
-                    # Try to open the registry key
-                    registry_path = r"Software\kavin\Media Player Scrobbler for SIMKL"
-                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, registry_path, 0, 
-                                        winreg.KEY_READ | winreg.KEY_WRITE)
-                    
-                    # Check if this is the first run
-                    try:
-                        # If we can read the FirstRun value, it's not the first run
-                        first_run = winreg.QueryValueEx(key, "FirstRun")[0]
-                        self.is_first_run = False
-                    except FileNotFoundError:
-                        # If FirstRun value doesn't exist, this is the first run
-                        self.is_first_run = True
-                        winreg.SetValueEx(key, "FirstRun", 0, winreg.REG_DWORD, 1)
-                    except WindowsError:
-                        # If there's any other error, assume it's not first run
-                        self.is_first_run = False
-                        
-                    winreg.CloseKey(key)
-                    
+                    completed = int(winreg.QueryValueEx(key, "FirstRun")[0])
                 except FileNotFoundError:
-                    # If the key doesn't exist, create it and mark as first run
-                    key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, registry_path)
+                    completed = 0
+                self.is_first_run = completed == 0
+                if self.is_first_run:
                     winreg.SetValueEx(key, "FirstRun", 0, winreg.REG_DWORD, 1)
-                    winreg.CloseKey(key)
-                    self.is_first_run = True
-                except Exception as e:
-                    logger.warning(f"Error checking first run status in registry: {e}")
-                    # Assume not first run on error
-                    self.is_first_run = False
-            
-            logger.debug(f"First run check result: {self.is_first_run}")
-            
-        except Exception as e:
-            logger.error(f"Unexpected error in first run check: {e}")
+            logger.debug("First run check result: %s", self.is_first_run)
+        except Exception as exc:
+            logger.error("Unexpected error in first run check: %s", exc)
             self.is_first_run = False  # Default to not showing the notification on error
 
 def run_tray_app():

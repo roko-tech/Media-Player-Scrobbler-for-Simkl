@@ -5,11 +5,14 @@ Provides functions for searching movies, marking them as watched,
 retrieving details, and handling the OAuth device authentication flow.
 """
 import requests
+import os
 import time
 import logging
 import socket
 import platform
 import sys
+from dataclasses import dataclass
+from enum import Enum
 try:
     from simkl_mps import __version__
 except ImportError:
@@ -25,6 +28,55 @@ logger = logging.getLogger(__name__)
 SIMKL_API_BASE_URL = 'https://api.simkl.com'
 DEFAULT_API_TIMEOUT = 30
 
+
+
+
+class ProviderStatus(str, Enum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    INVALID_REQUEST = "invalid_request"
+    UNAUTHORIZED = "unauthorized"
+    FORBIDDEN = "forbidden"
+    NOT_FOUND = "not_found"
+    CONFLICT = "conflict"
+    PRECONDITION_FAILED = "precondition_failed"
+    RATE_LIMITED = "rate_limited"
+    SERVER_ERROR = "server_error"
+    NETWORK_ERROR = "network_error"
+
+
+@dataclass(frozen=True)
+class HistorySyncResult:
+    """Typed outcome for a single Simkl history delivery attempt."""
+
+    status: ProviderStatus
+    retryable: bool
+    payload: dict | None = None
+    status_code: int | None = None
+    error: str | None = None
+    retry_after: float | None = None
+
+    @property
+    def accepted(self):
+        return self.status == ProviderStatus.ACCEPTED
+
+    def __bool__(self):
+        return self.accepted
+
+
+@dataclass(frozen=True)
+class SearchCandidate:
+    """A normalized, user-selectable Simkl title-search result."""
+
+    title: str
+    year: int | None
+    simkl_id: int
+    media_type: str
+
+    @property
+    def label(self):
+        year = f" ({self.year})" if self.year else ""
+        return f"{self.title}{year} · {self.media_type.title()} · Simkl {self.simkl_id}"
 
 def is_internet_connected():
     """
@@ -84,6 +136,107 @@ def _normalize_simkl_ids(item_dict, item_type="item", title=""):
         return False
     
     return True  # Already has 'simkl' key or normalization not needed
+
+
+def search_media_candidates(query, client_id, access_token=None, media_kind="episode", limit=8):
+    """Return normalized title-search choices for guided media correction."""
+    query = str(query or "").strip()
+    if not query or not client_id or not is_internet_connected():
+        return []
+
+    if media_kind == "movie":
+        endpoints = ("movie", "anime")
+    elif media_kind == "anime":
+        endpoints = ("anime", "tv")
+    else:
+        endpoints = ("tv", "anime")
+
+    headers = {
+        "Content-Type": "application/json",
+        "simkl-api-key": client_id,
+        "User-Agent": USER_AGENT,
+    }
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    params = {
+        "q": query,
+        "extended": "full",
+        "client_id": client_id,
+        "app-name": APP_NAME,
+        "app-version": __version__,
+    }
+    candidate_limit = max(1, min(int(limit), 20))
+    candidates = []
+    seen_ids = set()
+
+    for endpoint in endpoints:
+        try:
+            response = requests.get(
+                f"{SIMKL_API_BASE_URL}/search/{endpoint}",
+                headers=headers,
+                params=params,
+                timeout=min(DEFAULT_API_TIMEOUT, 15),
+            )
+        except requests.exceptions.RequestException as exc:
+            logger.info("Simkl correction search /search/%s failed: %s", endpoint, exc)
+            continue
+
+        if response.status_code == 429:
+            logger.warning("Simkl correction search was rate limited.")
+            break
+        if response.status_code != 200:
+            logger.info(
+                "Simkl correction search /search/%s returned HTTP %s",
+                endpoint,
+                response.status_code,
+            )
+            continue
+        try:
+            items = response.json()
+        except ValueError:
+            logger.info("Simkl correction search /search/%s returned invalid JSON", endpoint)
+            continue
+        if not isinstance(items, list):
+            continue
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").lower()
+            if endpoint == "anime":
+                if media_kind == "movie" and item_type != "movie":
+                    continue
+                if media_kind != "movie" and item_type == "movie":
+                    continue
+            ids = item.get("ids") or {}
+            simkl_id = ids.get("simkl") or ids.get("simkl_id")
+            try:
+                simkl_id = int(simkl_id)
+            except (TypeError, ValueError):
+                continue
+            if simkl_id in seen_ids:
+                continue
+            title = str(item.get("title") or item.get("name") or "").strip()
+            if not title:
+                continue
+            try:
+                year = int(item["year"]) if item.get("year") else None
+            except (TypeError, ValueError):
+                year = None
+            media_type = "movie" if media_kind == "movie" else ("anime" if endpoint == "anime" else "show")
+            candidates.append(
+                SearchCandidate(
+                    title=title,
+                    year=year,
+                    simkl_id=simkl_id,
+                    media_type=media_type,
+                )
+            )
+            seen_ids.add(simkl_id)
+            if len(candidates) >= candidate_limit:
+                return candidates
+
+    return candidates
 
 def search_movie(title, client_id, access_token, file_path=None):
     """
@@ -373,85 +526,133 @@ def find_tvdb_season_entry(base_simkl_id, tvdb_season, client_id):
     return None
 
 def add_to_history(payload, client_id, access_token, allow_rewatch=False):
-    """
-    Adds items (movies, shows, episodes) to the user's Simkl watch history.
-
-    Args:
-        payload (dict): The data payload conforming to the Simkl /sync/history API.
-                        Example: {'movies': [...], 'shows': [...]}
-        client_id (str): Simkl API client ID.
-        access_token (str): Simkl API access token.
-        allow_rewatch (bool): If True, allows recording rewatches (Simkl Pro/VIP feature).
-
-    Returns:
-        dict | None: The parsed JSON response from Simkl on success, None otherwise.
-    """
+    """Add one completion payload to Simkl and return a typed outcome."""
     if not is_internet_connected():
-        logger.warning("Simkl API: Cannot add item to history, no internet connection.")
-        return None
+        logger.warning("Simkl API: Cannot add history while offline.")
+        return HistorySyncResult(
+            ProviderStatus.NETWORK_ERROR,
+            retryable=True,
+            error="No internet connection",
+        )
     if not client_id or not access_token:
-        logger.error("Simkl API: Missing Client ID or Access Token for adding to history.")
-        return None
+        logger.error("Simkl API: Missing Client ID or Access Token for history sync.")
+        return HistorySyncResult(
+            ProviderStatus.UNAUTHORIZED,
+            retryable=False,
+            error="Missing Client ID or Access Token",
+        )
     if not payload:
-        logger.error("Simkl API: Empty payload provided for adding to history.")
-        return None
-
-    headers = {
-        'Content-Type': 'application/json',
-        'simkl-api-key': client_id,
-        'Authorization': f'Bearer {access_token}'
-    }
-    headers = _add_user_agent(headers)
-
-    # Determine item type for logging (best effort)
-    item_description = "item(s)"
-    if 'movies' in payload and payload['movies']:
-        item_description = f"movie(s): {[m.get('ids', {}).get('simkl', 'N/A') for m in payload['movies']]}"
-    elif 'shows' in payload and payload['shows']:
-        item_description = f"show(s)/episode(s): {[s.get('ids', {}).get('simkl', 'N/A') for s in payload['shows']]}"
-    elif 'episodes' in payload and payload['episodes']:
-         item_description = f"episode(s): {[e.get('ids', {}).get('simkl', 'N/A') for e in payload['episodes']]}"
-
-
-    logger.info(f"Simkl API: Adding {item_description} to history...")
-    try:
-        params = {
-            'client_id': client_id,
-            'app-name': APP_NAME,
-            'app-version': __version__
-        }
-        if allow_rewatch:
-            params['allow_rewatch'] = 'yes'
-            logger.info("Simkl API: Rewatch support enabled for this request.")
-
-        response = requests.post(
-            f'{SIMKL_API_BASE_URL}/sync/history', headers=headers, json=payload,
-            params=params, timeout=DEFAULT_API_TIMEOUT
+        logger.error("Simkl API: Empty history payload.")
+        return HistorySyncResult(
+            ProviderStatus.INVALID_REQUEST,
+            retryable=False,
+            error="Empty payload",
         )
 
+    headers = _add_user_agent(
+        {
+            'Content-Type': 'application/json',
+            'simkl-api-key': client_id,
+            'Authorization': f'Bearer {access_token}',
+        }
+    )
+    params = {
+        'client_id': client_id,
+        'app-name': APP_NAME,
+        'app-version': __version__,
+    }
+    if allow_rewatch:
+        params['allow_rewatch'] = 'yes'
+
+    try:
+        response = requests.post(
+            f'{SIMKL_API_BASE_URL}/sync/history',
+            headers=headers,
+            json=payload,
+            params=params,
+            timeout=DEFAULT_API_TIMEOUT,
+        )
+        try:
+            response_payload = response.json()
+        except (requests.exceptions.JSONDecodeError, ValueError):
+            response_payload = None
+
         if 200 <= response.status_code < 300:
-            logger.info(f"Simkl API: Successfully added {item_description} to history.")
+            not_found = (response_payload or {}).get('not_found') or {}
+            not_found_count = sum(
+                len(value) if isinstance(value, list) else int(value or 0)
+                for value in not_found.values()
+                if isinstance(value, (list, int))
+            )
+            if not_found_count:
+                logger.error("Simkl API rejected %s history item(s) as not_found.", not_found_count)
+                return HistorySyncResult(
+                    ProviderStatus.REJECTED,
+                    retryable=False,
+                    payload=response_payload,
+                    status_code=response.status_code,
+                    error="Simkl did not match the submitted history item",
+                )
+            return HistorySyncResult(
+                ProviderStatus.ACCEPTED,
+                retryable=False,
+                payload=response_payload or {
+                    "status": "success",
+                    "message": "Non-JSON response with successful status",
+                },
+                status_code=response.status_code,
+            )
+
+        status_by_code = {
+            400: ProviderStatus.INVALID_REQUEST,
+            401: ProviderStatus.UNAUTHORIZED,
+            403: ProviderStatus.FORBIDDEN,
+            404: ProviderStatus.NOT_FOUND,
+            409: ProviderStatus.CONFLICT,
+            412: ProviderStatus.PRECONDITION_FAILED,
+            429: ProviderStatus.RATE_LIMITED,
+        }
+        status = status_by_code.get(
+            response.status_code,
+            ProviderStatus.SERVER_ERROR
+            if response.status_code >= 500
+            else ProviderStatus.REJECTED,
+        )
+        retryable = response.status_code == 429 or response.status_code >= 500
+        retry_after = None
+        if response.status_code == 429:
             try:
-                return response.json()
-            except requests.exceptions.JSONDecodeError:
-                 logger.warning("Simkl API: History update successful but response was not valid JSON.")
-                 return {"status": "success", "message": "Non-JSON response received but status code indicated success."} # Return a success indicator
-        else:
-            error_details = ""
-            try:
-                error_details = response.json()
-            except requests.exceptions.JSONDecodeError:
-                error_details = response.text
-            logger.error(f"Simkl API: Failed to add {item_description} to history. Status: {response.status_code}. Response: {error_details}")
-            # Don't raise_for_status here, allow caller to handle based on None return
-            return None
-    except requests.exceptions.ConnectionError as e:
-        logger.error(f"Simkl API: Connection error adding {item_description} to history: {e}")
-        logger.info(f"Simkl API: Item(s) {item_description} will be added to backlog for future syncing.")
-        return None # Indicate failure but allow backlog processing
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Simkl API: Error adding {item_description} to history: {e}", exc_info=True)
-        return None
+                retry_after = float(response.headers.get('Retry-After'))
+            except (TypeError, ValueError):
+                retry_after = None
+        error = response_payload if response_payload is not None else response.text
+        logger.error(
+            "Simkl history sync failed with HTTP %s: %s",
+            response.status_code,
+            error,
+        )
+        return HistorySyncResult(
+            status,
+            retryable=retryable,
+            payload=response_payload,
+            status_code=response.status_code,
+            error=str(error),
+            retry_after=retry_after,
+        )
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+        logger.error("Simkl history network error: %s", exc)
+        return HistorySyncResult(
+            ProviderStatus.NETWORK_ERROR,
+            retryable=True,
+            error=str(exc),
+        )
+    except requests.exceptions.RequestException as exc:
+        logger.error("Simkl history request error: %s", exc, exc_info=True)
+        return HistorySyncResult(
+            ProviderStatus.NETWORK_ERROR,
+            retryable=True,
+            error=str(exc),
+        )
 
 def get_movie_details(simkl_id, client_id, access_token):
     """
@@ -924,7 +1125,11 @@ def _save_access_token(env_path, access_token, user_id=None, account_type=None, 
     """
     try:
         from pathlib import Path
-        from simkl_mps.secure_store import protect_secret
+        from simkl_mps.secure_store import (
+            ensure_private_file,
+            open_private_text_file,
+            protect_secret,
+        )
         
         env_path = Path(env_path)
         env_dir = env_path.parent
@@ -972,14 +1177,19 @@ def _save_access_token(env_path, access_token, user_id=None, account_type=None, 
         if settings_all is not None and not settings_all_found:
             lines.append(f"SIMKL_SETTINGS_ALL={settings_all}\n")
         
-        with open(env_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-        
-        logger.info(f"Saved credentials to {env_path}")
+        temp_path = env_path.with_suffix(env_path.suffix + ".tmp")
+        with open_private_text_file(temp_path) as handle:
+            handle.writelines(lines)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(env_path)
+        ensure_private_file(env_path)
+
+        logger.info("Saved Simkl credentials in the application data directory")
         if user_id is not None:
-            logger.info(f"Saved user ID {user_id} to {env_path}")
+            logger.info("Saved Simkl user metadata")
         if account_type is not None:
-            logger.info(f"Saved account type '{account_type}' to {env_path}")
+            logger.info("Saved Simkl account metadata")
             
         return True
     except Exception as e:

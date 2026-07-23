@@ -26,6 +26,8 @@ from simkl_mps.simkl_api import (
     search_show_by_title,
     find_tvdb_season_entry,
     add_to_history,
+    HistorySyncResult,
+    ProviderStatus,
     search_movie
 )
 from simkl_mps.backlog_cleaner import BacklogCleaner
@@ -33,6 +35,9 @@ from simkl_mps.window_detection import parse_movie_title, parse_filename_from_pa
 from simkl_mps import anime_mapping
 from simkl_mps.media_cache import MediaCache
 from simkl_mps.media_overrides import MediaOverrides
+from simkl_mps.media_identity import cache_key_for_media, same_media_path
+from simkl_mps.player_snapshot import PlayerSnapshot
+from simkl_mps.completion_payload import build_completion_payload
 
 logger = logging.getLogger(__name__)
 try:
@@ -67,11 +72,15 @@ class MediaScrobbler:
         self.track_start_time = None
         self.notification_callback = None
         self.identification_callback = None
+        self.completion_callback = None
         self.identification_rejected = False
         self._identification_block_logged = False
         self._last_identification_receipt_key = None
         self._processing_backlog_items = set() # Tracks items currently being processed by process_backlog
         self._processing_lock = threading.Lock() # Lock for accessing _processing_backlog_items
+        self._backlog_run_lock = threading.Lock()
+        self._backlog_wakeup = threading.Event()
+        self._backlog_stop = threading.Event()
 
         self.playback_log_path = self.app_data_dir / "playback_log.jsonl"
 
@@ -251,6 +260,45 @@ class MediaScrobbler:
     def set_identification_callback(self, callback):
         """Set a callback for structured media-identification receipts."""
         self.identification_callback = callback
+
+    def set_completion_callback(self, callback):
+        """Set a callback for event-correlated completion receipts."""
+        self.completion_callback = callback
+
+    def _emit_completion_receipt(
+        self,
+        event_id,
+        title,
+        simkl_status,
+        local_status,
+        media_type=None,
+        season=None,
+        episode=None,
+        simkl_id=None,
+        detail=None,
+    ):
+        callback = getattr(self, "completion_callback", None)
+        if not callback:
+            return False
+        receipt = {
+            "kind": "completion",
+            "event_id": event_id,
+            "title": title,
+            "media_type": media_type,
+            "season": season,
+            "episode": episode,
+            "simkl_id": simkl_id,
+            "simkl_status": simkl_status,
+            "local_status": local_status,
+            "trakt_status": "Pending" if local_status == "Saved" else "Waiting for local history",
+            "detail": detail,
+        }
+        try:
+            callback(receipt)
+        except Exception:
+            logger.exception("Completion receipt callback failed")
+            return False
+        return True
 
     def accept_current_identification(self):
         """Allow the current identification to be submitted to watch history."""
@@ -539,37 +587,84 @@ class MediaScrobbler:
 
 
     def get_current_filepath(self, process_name):
-        """
-        Get the current filepath of the media being played from player integrations.
-        """
+        """Get the current filepath from a supported player integration."""
         if not process_name:
             return None
-        
-        process_name_lower = process_name.lower()
-        integration = self._get_player_integration(process_name_lower)
-        
-        if integration and hasattr(integration, 'get_current_filepath'):            
+
+        integration = self._get_player_integration(process_name.lower())
+        if integration and hasattr(integration, 'get_current_filepath'):
             try:
                 filepath = integration.get_current_filepath(process_name)
                 if filepath:
                     player_name = integration.__class__.__name__.replace("Integration", "")
-                    logger.debug(f"Retrieved filepath from {player_name}: {filepath}")
+                    logger.debug("Retrieved media file from %s: %s", player_name, os.path.basename(filepath))
                     return filepath
-            except requests.RequestException as e:
-                # Connection errors during player shutdown are expected (debug level)
-                logger.debug(f"Could not connect to {process_name} web interface for filepath. Error: {e}")
-                # Only log warnings and notify for persistent connection issues (throttled to once per 5 minutes)
+            except requests.RequestException as exc:
+                logger.debug(
+                    "Could not connect to %s web interface for filepath. Error: %s",
+                    process_name,
+                    exc,
+                )
                 now = time.time()
                 last_log_time = self._last_connection_error_log.get(process_name, 0)
-                if now - last_log_time > 300:  # Notify at most once per 5 minutes per player
-                    logger.warning(f"Persistent connection issue with {process_name} web interface. {str(e)[:100]}")
+                if now - last_log_time > 300:
+                    logger.warning(
+                        "Persistent connection issue with %s web interface. %s",
+                        process_name,
+                        str(exc)[:100],
+                    )
                     self._last_connection_error_log[process_name] = now
-            except Exception as e:
-                logger.error(f"Error getting filepath from {process_name} ({integration.__class__.__name__}): {e}", exc_info=True)
+            except Exception as exc:
+                logger.error(
+                    "Error getting filepath from %s (%s): %s",
+                    process_name,
+                    integration.__class__.__name__,
+                    exc,
+                    exc_info=True,
+                )
         return None
 
+    def get_player_snapshot(self, process_name):
+        """Capture one immutable player observation for a monitor cycle."""
+        if not process_name:
+            return None
+
+        integration = self._get_player_integration(process_name.lower())
+        if not integration or not hasattr(integration, 'get_current_filepath'):
+            return None
+
+        filepath = self.get_current_filepath(process_name)
+        position, duration = self.get_player_position_duration(process_name)
+        playback_state = None
+        observation_error = None
+        if hasattr(integration, 'is_paused'):
+            try:
+                paused = integration.is_paused()
+                if paused is True:
+                    playback_state = PAUSED
+                elif paused is False:
+                    playback_state = PLAYING
+            except Exception as exc:
+                observation_error = f"{type(exc).__name__}: {exc}"
+                logger.debug(
+                    "Could not determine pause state from %s: %s",
+                    integration.__class__.__name__,
+                    exc,
+                )
+
+        return PlayerSnapshot(
+            process_name=process_name,
+            filepath=filepath,
+            position_seconds=position,
+            duration_seconds=duration,
+            captured_at=time.time(),
+            playback_state=playback_state,
+            confidence="complete" if playback_state is not None else "partial",
+            error=observation_error,
+        )
+
     def set_credentials(self, client_id, access_token, account_type=None, settings_all=None):
-        """Set API credentials"""
+        """Set API credentials."""
         self.client_id = client_id
         self.access_token = access_token
         if account_type:
@@ -579,8 +674,8 @@ class MediaScrobbler:
         if not self._account_type and self.client_id and self.access_token and not self.testing_mode:
             self._refresh_account_type(force=True)
 
-    def process_window(self, window_info):
-        """Process the current window and update scrobbling state (advanced tracking only, no window title parsing)."""
+    def process_window(self, window_info, player_snapshot=None):
+        """Process one player window from a single immutable player snapshot."""
         self._last_window_info = window_info
 
         process_name = window_info.get('process_name')
@@ -590,16 +685,9 @@ class MediaScrobbler:
                 self.stop_tracking()
             return None
 
-        process_name_lower = process_name.lower()
-        integration = self._get_player_integration(process_name_lower)
-        if not integration or not hasattr(integration, 'get_current_filepath'):
-            # Not a supported player for advanced tracking
-            if self.currently_tracking:
-                logger.info("Media playback ended: Unsupported player or player closed.")
-                self.stop_tracking()
-            return None
-
-        filepath = self.get_current_filepath(process_name)
+        if player_snapshot is None:
+            player_snapshot = self.get_player_snapshot(process_name)
+        filepath = player_snapshot.filepath if player_snapshot else None
         if not filepath:
             if self.currently_tracking:
                 logger.info("Media playback ended: No file detected from supported player.")
@@ -608,18 +696,17 @@ class MediaScrobbler:
 
         self._refresh_dir_filters()
         if not is_path_allowed(filepath, self._allow_dirs, self._deny_dirs):
-            logger.info("Filepath excluded by directory filters: '%s'", filepath)
+            logger.info("Media file excluded by directory filters")
             if self.currently_tracking:
                 self.stop_tracking()
             return None
 
-        # Detect media switches even when guessit returns identical titles (e.g., sequential episodes)
-        if self.currently_tracking and self.current_filepath and filepath:
+        if self.currently_tracking and self.current_filepath:
             if self._has_media_file_changed(self.current_filepath, filepath):
                 logger.info(
                     "Media change detected via filepath switch: '%s' -> '%s'. Resetting tracking for new item.",
-                    self.current_filepath,
-                    filepath
+                    os.path.basename(self.current_filepath),
+                    os.path.basename(filepath),
                 )
                 self.stop_tracking()
 
@@ -627,59 +714,74 @@ class MediaScrobbler:
         detection_source = "filename"
         detection_details = os.path.basename(filepath)
 
-        identified_type_guessit = 'movie' # Default assumption
+        identified_type_guessit = 'movie'
         guessit_info = None
         string_to_parse_with_guessit = os.path.basename(filepath)
 
         if string_to_parse_with_guessit and guessit:
             try:
-                logger.debug(f"Attempting to parse with guessit: '{string_to_parse_with_guessit}'")
-                current_guessit_info = guessit.guessit(string_to_parse_with_guessit)
-                guessit_info = current_guessit_info # Store full info from guessit
-                identified_type_guessit = current_guessit_info.get('type', 'movie')
-                logger.debug(f"Guessit identified: '{identified_type_guessit}' from '{string_to_parse_with_guessit}'. Info: {guessit_info}")
-            except Exception as e:
-                logger.warning(f"Guessit failed to parse '{string_to_parse_with_guessit}': {e}")
+                logger.debug("Attempting to parse with guessit: '%s'", string_to_parse_with_guessit)
+                guessit_info = guessit.guessit(string_to_parse_with_guessit)
+                identified_type_guessit = guessit_info.get('type', 'movie')
+                logger.debug(
+                    "Guessit identified: '%s' from '%s'. Info: %s",
+                    identified_type_guessit,
+                    string_to_parse_with_guessit,
+                    guessit_info,
+                )
+            except Exception as exc:
+                logger.warning("Guessit failed to parse '%s': %s", string_to_parse_with_guessit, exc)
         elif not guessit:
             logger.debug("Guessit library not available. Skipping extended guessit parsing.")
 
         if self.currently_tracking and self.currently_tracking != detected_title:
-            logger.info(f"Media change detected: '{detected_title}' now playing (was '{self.currently_tracking}').")
+            logger.info(
+                "Media change detected: '%s' now playing (was '%s').",
+                detected_title,
+                self.currently_tracking,
+            )
             self.stop_tracking()
 
         if not self.currently_tracking:
-            log_prefix = f"Detected {identified_type_guessit}"
-            logger.info(f"{log_prefix} from filename: '{detected_title}' (from: {detection_details})")
-            self._start_new_media_item(detected_title, filepath, identified_type_guessit, guessit_info)
+            logger.info(
+                "Detected %s from filename: '%s' (from: %s)",
+                identified_type_guessit,
+                detected_title,
+                detection_details,
+            )
+            self._start_new_media_item(
+                detected_title,
+                filepath,
+                identified_type_guessit,
+                guessit_info,
+            )
 
-        self._update_tracking(window_info) # Update tracking state, position, etc.
+        self._update_tracking(window_info, player_snapshot=player_snapshot)
 
         return {
-            "title": detected_title, # Raw detected title
+            "title": detected_title,
             "simkl_id": self.simkl_id,
-            "movie_name": self.movie_name, # Simkl official title
+            "movie_name": self.movie_name,
             "source": detection_source,
-            "detection_details": detection_details
+            "detection_details": detection_details,
+            "filepath": filepath,
         }
 
     @staticmethod
     def _has_media_file_changed(previous_filepath, current_filepath):
-        """Case-insensitive comparison of media filenames to detect switches within the same player."""
+        """Compare canonical full paths so identical basenames remain distinct media."""
         if not previous_filepath or not current_filepath:
             return False
-
-        prev_name = os.path.basename(previous_filepath).lower()
-        curr_name = os.path.basename(current_filepath).lower()
-        return prev_name != curr_name
+        return not same_media_path(previous_filepath, current_filepath)
 
     def _start_new_media_item(self, raw_title, filepath, initial_media_type_guess, guessit_info=None):
-        """Starts tracking a new media item, sets initial state, and attempts identification."""
+        """Start tracking a new item and resolve its canonical identity."""
         if not raw_title or raw_title.lower() in ["audio", "video", "media", "no file"]:
-            logger.info(f"Ignoring generic title for tracking: '{raw_title}'")
+            logger.info("Ignoring generic title for tracking: '%s'", raw_title)
             return
 
-        logger.info(f"Starting media tracking for raw title: '{raw_title}'")
-        self.currently_tracking = raw_title # Store raw title
+        logger.info("Starting media tracking for raw title: '%s'", raw_title)
+        self.currently_tracking = raw_title
         self.current_filepath = filepath
         self.start_time = time.time()
         self.last_update_time = self.start_time
@@ -688,13 +790,12 @@ class MediaScrobbler:
         self.previous_state = STOPPED
         self.completed = False
         self.current_position_seconds = 0
-        self.total_duration_seconds = None # Will be updated by player or API
+        self.total_duration_seconds = None
         self.estimated_duration = None
 
-        # Reset Simkl-specific details for the new item
         self.simkl_id = None
-        self.movie_name = None # Official Simkl title
-        self.media_type = initial_media_type_guess # Initial guess, will be refined by Simkl
+        self.movie_name = None
+        self.media_type = initial_media_type_guess
         self.season = None
         self.episode = None
         self._season_guess_from_filename = None
@@ -712,31 +813,54 @@ class MediaScrobbler:
             self.display_episode = self._episode_guess_from_filename
 
         self._derive_display_season_episode()
+        self._send_notification(
+            "Tracking Started",
+            f"Tracking: '{raw_title}'",
+            offline_only=True,
+        )
 
-        self._send_notification("Tracking Started", f"Tracking: '{raw_title}'", offline_only=True)
+        if filepath and self.media_overrides.find(filepath):
+            self._identify_media_from_filepath(filepath, guessit_info)
+            return
 
-        # Attempt initial identification
-        cache_key = os.path.basename(filepath).lower() if filepath else raw_title.lower()
-        cached_info = self.media_cache.get(cache_key)
-
-        if cached_info and cached_info.get('simkl_id') and not str(cached_info.get('simkl_id')).startswith("temp_"):
-            logger.info(f"Found cached Simkl info for '{raw_title}': ID {cached_info['simkl_id']}")
+        cache_key = cache_key_for_media(filepath, raw_title)
+        cached_info = self.media_cache.get(cache_key) if cache_key else None
+        if (
+            cached_info
+            and cached_info.get('simkl_id')
+            and not str(cached_info.get('simkl_id')).startswith("temp_")
+        ):
+            logger.info(
+                "Found cached Simkl info for '%s': ID %s",
+                raw_title,
+                cached_info['simkl_id'],
+            )
             self._apply_cached_info_to_state(cached_info)
         elif is_internet_connected():
             if initial_media_type_guess == 'episode' and filepath:
-                logger.info(f"Attempting Simkl file search for episode: '{raw_title}' from '{filepath}'")
+                logger.info(
+                    "Attempting Simkl file search for episode: '%s' from '%s'",
+                    raw_title,
+                    filepath,
+                )
                 self._identify_media_from_filepath(filepath, guessit_info)
             elif initial_media_type_guess == 'movie':
-                logger.info(f"Attempting Simkl movie title search for: '{raw_title}'")
-                self._identify_movie(raw_title) # Pass raw_title for movie search
-            # If neither, it will be attempted in _update_tracking if still unidentified
-        else: # Offline
-            logger.info(f"Offline: Media identification deferred for '{raw_title}'. Will use guessit/filename info if available.")
-            if filepath: # Only cache if we have a filepath
-                self._cache_initial_offline_info(raw_title, filepath, initial_media_type_guess, guessit_info)
+                logger.info("Attempting Simkl movie title search for: '%s'", raw_title)
+                self._identify_movie(raw_title)
+        else:
+            logger.info(
+                "Offline: Media identification deferred for '%s'. Will use filename info if available.",
+                raw_title,
+            )
+            if filepath:
+                self._cache_initial_offline_info(
+                    raw_title,
+                    filepath,
+                    initial_media_type_guess,
+                    guessit_info,
+                )
             else:
                 logger.info("Offline: Cannot cache basic info - filepath not available.")
-
 
     def _derive_display_season_episode(self):
         """Determine display season/episode values using filename guesses when API returns generic numbering."""
@@ -785,7 +909,7 @@ class MediaScrobbler:
 
     def _cache_initial_offline_info(self, raw_title, filepath, media_type_guess, guessit_info):
         """Caches basic info when detected offline before full Simkl ID."""
-        offline_cache_key = os.path.basename(filepath).lower()
+        offline_cache_key = cache_key_for_media(filepath)
         
         year_for_cache = None
         if guessit_info and isinstance(guessit_info, dict) and 'year' in guessit_info:
@@ -856,121 +980,165 @@ class MediaScrobbler:
         logger.warning("_start_new_movie is deprecated. Called with: " + movie_title)
         # For safety, redirect to the new method with some defaults if called.
         self._start_new_media_item(movie_title, None, 'movie')
-    def _update_tracking(self, window_info=None):
-        """Update tracking for the current media, including position, duration, and state."""
+    def _update_tracking(self, window_info=None, player_snapshot=None):
+        """Update tracking from one player snapshot, including position and duration."""
         if not self.currently_tracking or not self.last_update_time:
             return None
 
         current_time = time.time()
-        elapsed_since_last_update = current_time - self.last_update_time
-        if elapsed_since_last_update < 0: elapsed_since_last_update = 0 # Clock drift?
-        
-        # Update filepath if it changed
+        elapsed_since_last_update = max(0, current_time - self.last_update_time)
         process_name = window_info.get('process_name') if window_info else None
-        if process_name:
-            try:
-                current_player_filepath = self.get_current_filepath(process_name)
-                if current_player_filepath and self.current_filepath != current_player_filepath:
-                    logger.info(f"Filepath changed from '{self.current_filepath}' to '{current_player_filepath}'")
-                    # This might indicate a new media item, but process_window handles new item detection.
-                    # Here, we just update it if it's for the *same* tracked raw_title.
-                    self.current_filepath = current_player_filepath
-            except Exception as e:
-                 logger.error(f"Error getting filepath during update: {e}", exc_info=False)
+        if player_snapshot is None and process_name:
+            player_snapshot = self.get_player_snapshot(process_name)
 
-        # Get position and duration from player
-        pos, dur = None, None
+        if player_snapshot and player_snapshot.filepath:
+            snapshot_filepath = player_snapshot.filepath
+            if self.current_filepath != snapshot_filepath:
+                logger.info(
+                    "Filepath changed from '%s' to '%s'",
+                    self.current_filepath,
+                    snapshot_filepath,
+                )
+                self.current_filepath = snapshot_filepath
+
+        pos = player_snapshot.position_seconds if player_snapshot else None
+        dur = player_snapshot.duration_seconds if player_snapshot else None
         position_updated_from_player = False
-        if process_name:
-            pos, dur = self.get_player_position_duration(process_name)
         if pos is not None and dur is not None and dur > 0:
             if self.total_duration_seconds is None or abs(self.total_duration_seconds - dur) > 2:
-                logger.info(f"Updating total duration for '{self.movie_name or self.currently_tracking}' from {self.total_duration_seconds}s to {dur}s via player.")
+                logger.info(
+                    "Updating total duration for '%s' from %ss to %ss via player.",
+                    self.movie_name or self.currently_tracking,
+                    self.total_duration_seconds,
+                    dur,
+                )
                 self.total_duration_seconds = dur
                 self.estimated_duration = dur
-            # Detect seeks
+
             if self.state == PLAYING and self.current_position_seconds is not None:
                 expected_pos_increase = elapsed_since_last_update
                 actual_pos_increase = pos - self.current_position_seconds
-                seek_threshold = 2.0
-                min_seek_display = 0.5
-                # Only log seek if significant and not a tiny/zero change
-                if abs(actual_pos_increase - expected_pos_increase) > seek_threshold and abs(actual_pos_increase) > min_seek_display and elapsed_since_last_update > 0.1:
-                    logger.info(f"Seek detected for '{self.movie_name or self.currently_tracking}': Position changed by {actual_pos_increase:.1f}s in {elapsed_since_last_update:.1f}s (Expected ~{expected_pos_increase:.1f}s).")
-                    self._log_playback_event("seek", {"previous_position_seconds": round(self.current_position_seconds, 2), "new_position_seconds": pos})
+                if (
+                    abs(actual_pos_increase - expected_pos_increase) > 2.0
+                    and abs(actual_pos_increase) > 0.5
+                    and elapsed_since_last_update > 0.1
+                ):
+                    logger.info(
+                        "Seek detected for '%s': Position changed by %.1fs in %.1fs (Expected ~%.1fs).",
+                        self.movie_name or self.currently_tracking,
+                        actual_pos_increase,
+                        elapsed_since_last_update,
+                        expected_pos_increase,
+                    )
+                    self._log_playback_event(
+                        "seek",
+                        {
+                            "previous_position_seconds": round(self.current_position_seconds, 2),
+                            "new_position_seconds": pos,
+                        },
+                    )
             self.current_position_seconds = pos
             position_updated_from_player = True
-        
-        # Determine current playback state (PLAYING or PAUSED)
-        new_state = PAUSED if self._detect_pause(window_info) else PLAYING
 
-        # Accumulate watch time if playing
+        if player_snapshot and player_snapshot.playback_state in (PLAYING, PAUSED):
+            new_state = player_snapshot.playback_state
+        else:
+            new_state = PAUSED if self._detect_pause(window_info) else PLAYING
         if self.state == PLAYING:
-            # Cap elapsed time to avoid huge jumps if app was suspended
-            # Useful if position_updated_from_player is False, otherwise current_position_seconds is more reliable
-            safe_elapsed = min(elapsed_since_last_update, 30.0) # Max 30s jump for accumulated time
-            self.watch_time += safe_elapsed
+            self.watch_time += min(elapsed_since_last_update, 30.0)
 
-        # Handle state changes
-        state_changed = (new_state != self.state)
+        state_changed = new_state != self.state
         if state_changed:
-            logger.info(f"Playback state for '{self.movie_name or self.currently_tracking}' changed: {self.state} -> {new_state}")
+            logger.info(
+                "Playback state for '%s' changed: %s -> %s",
+                self.movie_name or self.currently_tracking,
+                self.state,
+                new_state,
+            )
             self.previous_state = self.state
             self.state = new_state
-            self._log_playback_event("state_change", {"previous_state": self.previous_state})
+            self._log_playback_event(
+                "state_change",
+                {"previous_state": self.previous_state},
+            )
 
-        self.last_update_time = current_time        # Attempt identification if Simkl ID is still missing
+        self.last_update_time = current_time
         if not self.simkl_id and self.currently_tracking:
-            cache_key_for_lookup = os.path.basename(self.current_filepath).lower() if self.current_filepath else self.currently_tracking.lower()
-            cached_info = self.media_cache.get(cache_key_for_lookup)
-            if cached_info and cached_info.get('simkl_id') and not str(cached_info.get('simkl_id')).startswith("temp_"):
-                logger.info(f"Found cached Simkl info for '{self.currently_tracking}' during update: ID {cached_info['simkl_id']}")
-                self._apply_cached_info_to_state(cached_info) # This updates self.simkl_id, self.movie_name etc.
-            elif is_internet_connected():
-                if self.media_type == 'episode' and self.current_filepath: # media_type is initial guessit type
-                    self._identify_media_from_filepath(self.current_filepath)
-                elif self.media_type == 'movie': # media_type is initial guessit type
-                    self._identify_movie(self.currently_tracking) # Use raw title for movie search
-                # If guessit type was neither, or identification failed, it remains unknown for now.
-            # If identification was successful, self.simkl_id etc. are now set.
+            if self.current_filepath and self.media_overrides.find(self.current_filepath):
+                self._identify_media_from_filepath(self.current_filepath)
+            else:
+                cache_key = cache_key_for_media(
+                    self.current_filepath,
+                    self.currently_tracking,
+                )
+                cached_info = self.media_cache.get(cache_key) if cache_key else None
+                if (
+                    cached_info
+                    and cached_info.get('simkl_id')
+                    and not str(cached_info.get('simkl_id')).startswith("temp_")
+                ):
+                    logger.info(
+                        "Found cached Simkl info for '%s' during update: ID %s",
+                        self.currently_tracking,
+                        cached_info['simkl_id'],
+                    )
+                    self._apply_cached_info_to_state(cached_info)
+                elif is_internet_connected():
+                    if self.media_type == 'episode' and self.current_filepath:
+                        self._identify_media_from_filepath(self.current_filepath)
+                    elif self.media_type == 'movie':
+                        self._identify_movie(self.currently_tracking)
 
-        # Log progress periodically or on significant changes
-        # Use self.last_scrobble_time to track when the last "scrobble_update" event was logged
-        if state_changed or position_updated_from_player or (current_time - self.last_scrobble_time > DEFAULT_POLL_INTERVAL):
-            self._log_playback_event("progress_update") # Generic progress event
-            # self.last_scrobble_time = current_time # Update this only when returning scrobble data below        # Check completion threshold
-        if not self.completed and (current_time - self.last_progress_check > 5): # Check every 5s
-            completion_pct = self._calculate_percentage(use_position=position_updated_from_player)
+        if (
+            state_changed
+            or position_updated_from_player
+            or current_time - self.last_scrobble_time > DEFAULT_POLL_INTERVAL
+        ):
+            self._log_playback_event("progress_update")
+
+        if not self.completed and current_time - self.last_progress_check > 5:
+            completion_pct = self._calculate_percentage(
+                use_position=position_updated_from_player,
+            )
             threshold = self.completion_threshold
-            if completion_pct is not None and threshold is not None and float(completion_pct) >= float(threshold):
-                display_title_for_log = self.movie_name or self.currently_tracking
-                logger.info(f"Completion threshold ({self.completion_threshold}%) met for '{display_title_for_log}' at {completion_pct:.2f}%.")
+            if (
+                completion_pct is not None
+                and threshold is not None
+                and float(completion_pct) >= float(threshold)
+            ):
+                logger.info(
+                    "Completion threshold (%s%%) met for '%s' at %.2f%%.",
+                    self.completion_threshold,
+                    self.movie_name or self.currently_tracking,
+                    completion_pct,
+                )
                 self._log_playback_event("completion_threshold_reached")
-                self._attempt_add_to_history() # This handles setting self.completed
+                self._attempt_add_to_history()
             self.last_progress_check = current_time
 
-        # Determine if a scrobble update should be returned (e.g., for UI)
-        # This is different from just logging progress_update.
-        should_return_scrobble_data = state_changed or (current_time - self.last_scrobble_time > DEFAULT_POLL_INTERVAL)
+        should_return_scrobble_data = (
+            state_changed
+            or current_time - self.last_scrobble_time > DEFAULT_POLL_INTERVAL
+        )
         if should_return_scrobble_data:
-            self.last_scrobble_time = current_time # Update time of last returned scrobble data
-            # self._log_playback_event("scrobble_update_returned") # Optional: Differentiate logged progress from returned data
+            self.last_scrobble_time = current_time
             return {
                 "raw_title": self.currently_tracking,
-                "movie_name": self.movie_name, # Official Simkl title
+                "movie_name": self.movie_name,
                 "simkl_id": self.simkl_id,
-                "media_type": self.media_type, # Simkl media type
+                "media_type": self.media_type,
                 "season": self.season,
                 "episode": self.episode,
                 "state": self.state,
-                "progress": self._calculate_percentage(use_position=position_updated_from_player),
+                "progress": self._calculate_percentage(
+                    use_position=position_updated_from_player,
+                ),
                 "watched_seconds": round(self.watch_time, 2),
                 "current_position_seconds": self.current_position_seconds,
                 "total_duration_seconds": self.total_duration_seconds,
-                "estimated_duration_seconds": self.estimated_duration
+                "estimated_duration_seconds": self.estimated_duration,
             }
         return None
-
 
     def _calculate_percentage(self, use_position=False, use_accumulated=False):
         """Calculates completion percentage. Prefers position/duration if use_position is True and data is valid."""
@@ -1134,7 +1302,7 @@ class MediaScrobbler:
             self._process_simkl_search_result(
                 result,
                 filepath,
-                os.path.basename(filepath).lower(),
+                cache_key_for_media(filepath),
                 f"manual_{override['scope']}_override",
             )
             return
@@ -1143,7 +1311,7 @@ class MediaScrobbler:
             logger.warning("Cannot identify media from filepath: Missing Client ID.")
             return
 
-        cache_key = os.path.basename(filepath).lower()
+        cache_key = cache_key_for_media(filepath)
         cached_info = self.media_cache.get(cache_key)
 
         if cached_info and cached_info.get('simkl_id') and not str(cached_info.get('simkl_id')).startswith("temp_"):
@@ -1610,7 +1778,7 @@ class MediaScrobbler:
             logger.info(f"Skipping redundant title search for '{title_to_search}': Already identified as '{self.movie_name}' (ID: {self.simkl_id})")
             return
 
-        cache_key = title_to_search.lower() # Use raw title for this initial cache lookup
+        cache_key = cache_key_for_media(title=title_to_search)
         cached_info = self.media_cache.get(cache_key)
         if cached_info and cached_info.get('simkl_id') and not str(cached_info.get('simkl_id')).startswith("temp_"):
             logger.info(f"Using cached Simkl info for movie title '{title_to_search}': ID {cached_info['simkl_id']}")
@@ -1681,50 +1849,18 @@ class MediaScrobbler:
             logger.debug(f"No 'identification_pending' backlog entry found for '{original_title_lower}'.")
 
 
-    def _is_local_rewatch(self, simkl_id, media_type, season, episode):
-        """Best-effort check if this item already exists in local watch history."""
-        if not simkl_id or not media_type:
-            return False
-
-        if self.watch_history is None:
-            self.watch_history = WatchHistoryManager(self.app_data_dir)
-
-        entry = self.watch_history.get_entry(simkl_id, media_type=media_type)
-        if not entry:
-            return False
-
-        if media_type == 'movie':
-            return True
-
-        if media_type in ['show', 'anime']:
-            if episode is None:
-                return False
-
-            entry_season = entry.get('season')
-            entry_episode = entry.get('episode')
-            if entry_episode == episode and (season is None or entry_season == season):
-                return True
-
-            for watched_episode in entry.get('episodes', []):
-                if watched_episode.get('number') == episode and (
-                    season is None or watched_episode.get('season') == season
-                ):
-                    return True
-
-        return False
-
     @staticmethod
     def _get_sync_counts(sync_result):
         """Extract added/not_found counts from a /sync/history response payload."""
+        if isinstance(sync_result, HistorySyncResult):
+            sync_result = sync_result.payload
         if not isinstance(sync_result, dict):
             return None, None
 
         added = sync_result.get("added") or {}
         not_found = sync_result.get("not_found") or {}
-
         added_count = 0
         not_found_count = 0
-
         for key in ("movies", "shows", "episodes"):
             value = added.get(key)
             if isinstance(value, int):
@@ -1733,17 +1869,58 @@ class MediaScrobbler:
                 added_count += len(value)
 
             value = not_found.get(key)
-            if isinstance(value, list):
+            if isinstance(value, int):
+                not_found_count += value
+            elif isinstance(value, list):
                 not_found_count += len(value)
-
         return added_count, not_found_count
 
     def _simkl_history_result_accepted(self, sync_result):
         """Return True only when Simkl accepted the single history payload."""
+        if isinstance(sync_result, HistorySyncResult):
+            return sync_result.accepted
         if not sync_result:
             return False
         _, not_found_count = self._get_sync_counts(sync_result)
         return not_found_count == 0
+
+    def _record_simkl_outcome(self, event_id, result):
+        """Persist the typed Simkl outcome for one completion event."""
+        if not event_id or not hasattr(self.backlog_cleaner, "record_outcome"):
+            return False
+        if isinstance(result, HistorySyncResult):
+            detail = {
+                "error": result.error,
+                "retry_after": result.retry_after,
+                "payload": result.payload,
+            }
+            return self.backlog_cleaner.record_outcome(
+                event_id,
+                provider="simkl",
+                status=result.status.value,
+                retryable=result.retryable,
+                status_code=result.status_code,
+                detail=detail,
+            )
+        return self.backlog_cleaner.record_outcome(
+            event_id,
+            provider="simkl",
+            status="accepted" if self._simkl_history_result_accepted(result) else "unknown_failure",
+            retryable=not self._simkl_history_result_accepted(result),
+            detail=result if isinstance(result, dict) else None,
+        )
+
+    @staticmethod
+    def _simkl_outcome_retryable(result):
+        if isinstance(result, HistorySyncResult):
+            return result.retryable
+        return True
+
+    @staticmethod
+    def _simkl_outcome_error(result):
+        if isinstance(result, HistorySyncResult):
+            return result.error or result.status.value
+        return "Simkl API add_to_history call failed or reported not_found."
 
 
     def _attempt_add_to_history(self):
@@ -1762,11 +1939,10 @@ class MediaScrobbler:
             return False
 
         # Cache key for cooldown tracking: prefer filepath, fallback to raw title
-        cache_key_for_cooldown = (
-            os.path.basename(self.current_filepath).lower()
-            if self.current_filepath
-            else (self.currently_tracking or "").lower()
-        )
+        cache_key_for_cooldown = cache_key_for_media(
+            self.current_filepath,
+            self.currently_tracking,
+        ) or ""
         current_time = time.time()
         cooldown_period = 300 # 5 minutes
 
@@ -1836,14 +2012,9 @@ class MediaScrobbler:
         # --- Internet Connection Check (Now that we have a Simkl ID) ---
         if not is_internet_connected():
             logger.warning(f"Offline: Adding '{display_title}' (ID: {self.simkl_id}) to backlog.")
-            # Only allow rewatch in backlog if user is Pro/VIP
-            allow_rewatch = False
-            if self.is_pro_or_vip():
-                allow_rewatch = get_setting('allow_rewatch', True)
-            
             queued = self._add_to_backlog_due_to_issue(
                 self.simkl_id, display_title, "offline_with_id",
-                {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode, "allow_rewatch": allow_rewatch}
+                {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode}
             )
             if queued:
                 self._send_notification("Offline: Added to Backlog", f"'{display_title}' will sync when online.", offline_only=True)
@@ -1862,11 +2033,39 @@ class MediaScrobbler:
                  return False
 
         # --- Construct Payload ---
-        # Use self.watched_at if available, else None (handled in payload builder)
         watched_at = getattr(self, 'watched_at', None)
+        if not watched_at:
+            watched_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+            self.watched_at = watched_at
         payload = self._build_add_to_history_payload(watched_at=watched_at)
         if not payload:
             logger.error(f"Could not construct valid payload for '{display_title}' (Type: {self.media_type}, S:{self.season}, E:{self.episode}).")
+            return False
+
+        event_id = self.backlog_cleaner.add(
+            self.simkl_id,
+            display_title,
+            additional_data={
+                "simkl_id": self.simkl_id,
+                "title": display_title,
+                "original_title": self.currently_tracking,
+                "type": self.media_type,
+                "season": self.season,
+                "episode": self.episode,
+                "original_filepath": self.current_filepath,
+                "watched_at": watched_at,
+                "simkl_payload": payload,
+                "source": "automatic_completion",
+            },
+            unique_event=True,
+        )
+        if not event_id:
+            logger.critical("Could not durably queue completion for '%s'; remote sync was not attempted.", display_title)
+            self._send_notification(
+                "Completion Storage Failed",
+                f"'{display_title}' was not synced because its recovery event could not be saved.",
+                critical=True,
+            )
             return False
 
         # --- Attempt API Call ---
@@ -1875,96 +2074,163 @@ class MediaScrobbler:
             log_item_desc += f" S{self.season}E{self.episode}" if self.media_type == 'show' and self.season else f" E{self.episode}"
 
         try:
-            # Only allow rewatch if user is Pro/VIP
-            allow_rewatch = False
-            if self.is_pro_or_vip():
-                allow_rewatch = get_setting('allow_rewatch', True)
-            
-            is_rewatch = False
-            if allow_rewatch:
-                is_rewatch = self._is_local_rewatch(self.simkl_id, self.media_type, self.season, self.episode)
-
-            result = add_to_history(payload, self.client_id, self.access_token, allow_rewatch=allow_rewatch)
+            # Automatic/background completion must never opt into Simkl rewatches.
+            result = add_to_history(payload, self.client_id, self.access_token, allow_rewatch=False)
+            outcome_saved = self._record_simkl_outcome(event_id, result)
             if self._simkl_history_result_accepted(result):
                 self.completed = True
-                self._log_playback_event("added_to_history_success", {"simkl_id": self.simkl_id, "type": self.media_type})
-                history_saved = self._store_in_watch_history(
-                    self.simkl_id, self.currently_tracking, self.movie_name, # Raw, Official
-                    media_type=self.media_type, season=self.season, episode=self.episode,
-                    original_filepath=self.current_filepath
+                if not outcome_saved:
+                    marker_saved = self.backlog_cleaner.update_item(
+                        event_id,
+                        {
+                            "simkl_synced": True,
+                            "provider_outcome_pending": True,
+                            "last_error": "Simkl accepted; provider outcome audit is pending",
+                        },
+                    )
+                    if not marker_saved:
+                        logger.critical(
+                            "Simkl accepted %s, but neither its outcome nor recovery marker could be saved.",
+                            log_item_desc,
+                        )
+                self._log_playback_event(
+                    "added_to_history_success",
+                    {"event_id": event_id, "simkl_id": self.simkl_id, "type": self.media_type},
                 )
-                if not history_saved:
+                history_saved = self._store_in_watch_history(
+                    self.simkl_id,
+                    self.currently_tracking,
+                    self.movie_name,
+                    media_type=self.media_type,
+                    season=self.season,
+                    episode=self.episode,
+                    original_filepath=self.current_filepath,
+                    watched_at=watched_at,
+                    event_id=event_id,
+                )
+                if history_saved:
+                    if outcome_saved:
+                        if not self.backlog_cleaner.remove(event_id):
+                            self.backlog_cleaner.update_item(
+                                event_id,
+                                {
+                                    "simkl_synced": True,
+                                    "local_history_saved": True,
+                                    "last_error": "Could not finalize delivered ledger event",
+                                },
+                            )
+                    else:
+                        self.backlog_cleaner.update_item(
+                            event_id,
+                            {
+                                "simkl_synced": True,
+                                "local_history_saved": True,
+                                "provider_outcome_pending": True,
+                                "last_error": "Simkl accepted; provider outcome audit is pending",
+                            },
+                        )
+                else:
                     logger.critical(
                         "Simkl accepted %s, but the durable local watch event could not be saved.",
                         log_item_desc,
                     )
-                    queued = self.backlog_cleaner.add(
-                        self.simkl_id,
-                        display_title,
-                        additional_data={
-                            "simkl_id": self.simkl_id,
-                            "title": display_title,
-                            "type": self.media_type,
-                            "season": self.season,
-                            "episode": self.episode,
-                            "original_filepath": self.current_filepath,
-                            "watched_at": watched_at,
+                    self.backlog_cleaner.update_item(
+                        event_id,
+                        {
                             "simkl_synced": True,
+                            "provider_outcome_pending": not outcome_saved,
                             "last_error": "Local watch-history write failed",
                         },
-                        unique_event=True,
                     )
-                    message = (
-                        f"'{display_title}' is on Simkl; local history and Trakt will retry."
-                        if queued
-                        else f"'{display_title}' is on Simkl, but local recovery storage also failed."
+                    self._send_notification(
+                        "Local History Pending",
+                        f"'{display_title}' is on Simkl; local history and Trakt will retry.",
+                        critical=True,
                     )
-                    self._send_notification("Local History Pending", message, critical=True)
+
+                self._emit_completion_receipt(
+                    event_id,
+                    display_title,
+                    simkl_status="Accepted" if outcome_saved else "Accepted (audit pending)",
+                    local_status="Saved" if history_saved else "Pending retry",
+                    media_type=self.media_type,
+                    season=self.season,
+                    episode=self.episode,
+                    simkl_id=self.simkl_id,
+                )
                 media_label = (self.media_type or 'media').capitalize()
                 added_count, not_found_count = self._get_sync_counts(result)
                 if added_count == 0 and not_found_count == 0:
                     self._send_notification(
                         f"{media_label} Already Watched",
                         f"'{display_title}' was already marked watched.",
-                        online_only=True
-                    )
-                elif added_count and is_rewatch:
-                    self._send_notification(
-                        f"{media_label} Rewatch Recorded",
-                        f"'{display_title}' rewatch added to Simkl.",
-                        online_only=True
+                        online_only=True,
                     )
                 else:
-                    self._send_notification(f"{media_label} Synced", f"'{display_title}' added to Simkl.", online_only=True)
-                if cache_key_for_cooldown in self.last_backlog_attempt_time:
-                    del self.last_backlog_attempt_time[cache_key_for_cooldown]
+                    self._send_notification(
+                        f"{media_label} Synced",
+                        f"'{display_title}' added to Simkl.",
+                        online_only=True,
+                    )
+                self.last_backlog_attempt_time.pop(cache_key_for_cooldown, None)
                 return True
-            else: # API call failed or explicitly reported the item as not found
-                logger.warning(f"Failed to add {log_item_desc} to Simkl history (API rejected or did not match it). Adding to backlog.")
-                queued = self._add_to_backlog_due_to_issue(
-                    self.simkl_id, display_title, "api_sync_fail",
-                    {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode, "error": "API_FAIL"}
+
+            self.completed = True
+            error = self._simkl_outcome_error(result)
+            if self._simkl_outcome_retryable(result):
+                self.backlog_cleaner.update_item(
+                    event_id,
+                    {
+                        "attempt_count": 1,
+                        "last_attempt_timestamp": time.time(),
+                        "last_error": error,
+                    },
                 )
-                if queued:
-                    self._send_notification("Online Sync Failed", f"'{display_title}' couldn't sync. Added to backlog.")
-                return False
-        except RequestException as e: # Network errors
-            logger.warning(f"Network error adding {log_item_desc} to history: {e}. Adding to backlog.")
-            queued = self._add_to_backlog_due_to_issue(
-                self.simkl_id, display_title, "api_network_error",
-                {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode, "error": str(e)}
+                self._send_notification(
+                    "Online Sync Pending",
+                    f"'{display_title}' could not sync yet and will retry.",
+                )
+            else:
+                self.backlog_cleaner.fail(event_id, error)
+                self._send_notification(
+                    "Simkl Sync Rejected",
+                    f"'{display_title}' needs attention: {error}",
+                    critical=True,
+                )
+            self._emit_completion_receipt(
+                event_id,
+                display_title,
+                simkl_status="Pending retry" if self._simkl_outcome_retryable(result) else "Rejected",
+                local_status="Queued",
+                media_type=self.media_type,
+                season=self.season,
+                episode=self.episode,
+                simkl_id=self.simkl_id,
+                detail=error,
             )
-            if queued:
-                self._send_notification("Sync Network Error", f"'{display_title}' couldn't sync. Added to backlog.")
             return False
-        except Exception as e: # Other unexpected errors
-            logger.error(f"Unexpected error adding {log_item_desc} to history: {e}", exc_info=True)
-            queued = self._add_to_backlog_due_to_issue(
-                self.simkl_id, display_title, "api_exception",
-                {"simkl_id": self.simkl_id, "type": self.media_type, "season": self.season, "episode": self.episode, "error": str(e)}
+        except Exception as exc:
+            logger.error("Unexpected error delivering %s: %s", log_item_desc, exc, exc_info=True)
+            self.completed = True
+            self.backlog_cleaner.record_outcome(
+                event_id,
+                provider="simkl",
+                status="unexpected_exception",
+                retryable=True,
+                detail={"error": str(exc)},
             )
-            if queued:
-                self._send_notification("Sync Error", f"Error syncing '{display_title}'. Added to backlog.")
+            self.backlog_cleaner.update_item(
+                event_id,
+                {
+                    "attempt_count": 1,
+                    "last_attempt_timestamp": time.time(),
+                    "last_error": str(exc),
+                },
+            )
+            self._send_notification(
+                "Sync Error",
+                f"Error syncing '{display_title}'. The saved event will retry.",
+            )
             return False
 
     def _add_to_backlog_due_to_issue(self, item_key_for_backlog, title_for_backlog, reason_code, backlog_data_payload):
@@ -2001,11 +2267,10 @@ class MediaScrobbler:
             return False
         
         # Use a consistent cache key for cooldown, based on current filepath or raw title
-        cooldown_key = (
-            os.path.basename(self.current_filepath).lower()
-            if self.current_filepath
-            else (self.currently_tracking or "").lower()
-        )
+        cooldown_key = cache_key_for_media(
+            self.current_filepath,
+            self.currently_tracking,
+        ) or ""
         self.last_backlog_attempt_time[cooldown_key] = time.time()
         
         self.completed = True # Mark as "handled" for this playback session
@@ -2062,64 +2327,30 @@ class MediaScrobbler:
 
 
     def _build_add_to_history_payload(self, watched_at=None):
-        """Constructs the payload for Simkl's add_to_history endpoint, with watched_at support."""
-        if not self.simkl_id: return None
-        
-        try:
-            # Ensure Simkl ID is an integer for the payload
-            simkl_id_int = int(self.simkl_id)
-            item_ids = {"simkl": simkl_id_int}
-        except ValueError:
-            logger.error(f"Invalid Simkl ID format for payload: {self.simkl_id}. Must be integer.")
-            return None
-
-        # Use provided watched_at or fallback to now (UTC, ISO8601)
+        """Build a completion payload from the current immutable identity values."""
         if not watched_at:
-            watched_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-
-        payload = {}
-        if self.media_type == 'movie':
-            payload = {"movies": [{"ids": item_ids, "watched_at": watched_at}]}
-        elif self.media_type == 'show':
-            if self.season is not None and self.episode is not None:
-                try:
-                    payload = {
-                        "shows": [{
-                            "ids": item_ids,
-                            "seasons": [{"number": int(self.season), "episodes": [{"number": int(self.episode), "watched_at": watched_at}]}]
-                        }]
-                    }
-                except ValueError:
-                    logger.error(f"Invalid S/E format for show payload: S{self.season}E{self.episode}")
-                    return None
-            else: return None # Missing S/E for show
-        elif self.media_type == 'anime':
-            # Anime payload might vary; Simkl API docs say episodes can be directly under show or under season.
-            # Assuming direct episodes for simplicity if season is not robustly identified.
-            # If Simkl API for anime consistently uses seasons, this might need adjustment or reliance on S/E resolution.
-            if self.episode is not None:
-                try:
-                    anime_episode_payload = [{"number": int(self.episode), "watched_at": watched_at}]
-                    show_item: Dict[str, Any] = {"ids": item_ids}
-                    if self.season is not None: # If season is known, nest episode under it
-                         show_item["seasons"] = [{"number": int(self.season), "episodes": anime_episode_payload}]
-                    else: # Otherwise, episodes directly under show (common for OVAs or movies treated as anime episodes)
-                         show_item["episodes"] = anime_episode_payload
-                    payload = {"shows": [show_item]}
-                except ValueError:
-                    logger.error(f"Invalid E (or S) format for anime payload: S{self.season}E{self.episode}")
-                    return None
-            else: return None # Missing E for anime
-        else:
-            logger.error(f"Unknown media type for payload: {self.media_type}")
-            return None
+            watched_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        payload = build_completion_payload(
+            self.simkl_id,
+            self.media_type,
+            season=self.season,
+            episode=self.episode,
+            watched_at=watched_at,
+        )
+        if not payload:
+            logger.error(
+                "Could not build history payload for type=%s, season=%s, episode=%s",
+                self.media_type,
+                self.season,
+                self.episode,
+            )
         return payload
 
 
     def _store_in_watch_history(self, simkl_id, original_title, resolved_title=None,
                                 media_type=None, season=None, episode=None,
                                 original_filepath=None, api_details_to_use=None,
-                                watched_at=None):
+                                watched_at=None, event_id=None):
         """Stores watched media in local history, enriching with API details if needed."""
         if not hasattr(self, 'watch_history'): # Should be initialized in __init__
             self.watch_history = WatchHistoryManager(self.app_data_dir)
@@ -2129,11 +2360,11 @@ class MediaScrobbler:
         # Cache key for fetching existing full details: prefer filepath, then resolved title, then original
         cache_key_for_details = None
         if media_file_path_for_history:
-            cache_key_for_details = os.path.basename(media_file_path_for_history).lower()
+            cache_key_for_details = cache_key_for_media(media_file_path_for_history)
         elif resolved_title:
-            cache_key_for_details = resolved_title.lower()
+            cache_key_for_details = cache_key_for_media(title=resolved_title)
         elif original_title:
-            cache_key_for_details = original_title.lower()
+            cache_key_for_details = cache_key_for_media(title=original_title)
 
         # Base info for history entry
         history_entry = {
@@ -2145,6 +2376,7 @@ class MediaScrobbler:
             'episode': episode,
             'watched_at': watched_at or getattr(self, 'watched_at', None)
                           or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            'event_id': event_id,
             'ids': {'simkl': simkl_id} # Ensure base 'ids' with simkl_id
         }
         if media_file_path_for_history:
@@ -2256,22 +2488,67 @@ class MediaScrobbler:
             logger.error(f"Error storing in local watch history (ID: {simkl_id}): {e}", exc_info=True)
             return False
 
-
     def process_backlog(self):
-        """Processes pending backlog items: identifies, resolves, and syncs to Simkl."""
+        """Run one backlog pass with exactly one active queue owner."""
+        if not hasattr(self, "_backlog_run_lock"):
+            self._backlog_run_lock = threading.Lock()
+        if not self._backlog_run_lock.acquire(blocking=False):
+            return {
+                "processed": 0,
+                "attempted": 0,
+                "failed": False,
+                "reason": "Backlog worker already running",
+            }
+        try:
+            return self._process_backlog_once()
+        finally:
+            self._backlog_run_lock.release()
+
+
+    def clear_pending_completion_events(self):
+        """Clear pending events through the same serialization boundary as retries."""
+        if not hasattr(self, "_backlog_run_lock"):
+            self._backlog_run_lock = threading.Lock()
+        with self._backlog_run_lock:
+            cleared = self.backlog_cleaner.clear()
+            if cleared:
+                self.clear_backlog_processing_state()
+            return bool(cleared)
+
+    def request_backlog_sync(self):
+        """Wake the sole background backlog worker."""
+        if not hasattr(self, "_backlog_wakeup"):
+            self._backlog_wakeup = threading.Event()
+        self._backlog_wakeup.set()
+
+
+    def _process_backlog_once(self):
+        """Process one serialized pass over pending completion events."""
         BASE_RETRY_DELAY_SECONDS = 60 # 1 minute
 
         pending_items_dict = self.backlog_cleaner.get_pending()
         if not pending_items_dict:
             return {'processed': 0, 'attempted': 0, 'failed': False, 'reason': 'No items'}
 
-        local_only_pending = any(
-            isinstance(item, dict) and item.get('simkl_synced')
-            for item in pending_items_dict.values()
-        )
+        audited_simkl_events = {
+            event_id
+            for event_id, item in pending_items_dict.items()
+            if isinstance(item, dict)
+            and any(
+                outcome.get("provider") == "simkl"
+                and outcome.get("status") == "accepted"
+                for outcome in item.get("provider_outcomes", [])
+            )
+        }
+        accepted_simkl_events = audited_simkl_events | {
+            event_id
+            for event_id, item in pending_items_dict.items()
+            if isinstance(item, dict) and item.get("simkl_synced")
+        }
+        local_only_pending = bool(accepted_simkl_events)
         remote_pending = any(
-            not (isinstance(item, dict) and item.get('simkl_synced'))
-            for item in pending_items_dict.values()
+            event_id not in accepted_simkl_events
+            for event_id in pending_items_dict
         )
         has_credentials = bool(self.client_id and self.access_token)
         online = is_internet_connected()
@@ -2320,8 +2597,38 @@ class MediaScrobbler:
                         logger.debug(f"[Backlog] Item '{display_title}' (Key: {item_key}) in retry cooldown. Skipping.")
                         continue
 
-                if item_data.get('simkl_synced'):
+                if item_key in accepted_simkl_events:
                     attempted_this_cycle += 1
+                    has_accepted_outcome = item_key in audited_simkl_events
+                    if item_data.get("provider_outcome_pending") or not has_accepted_outcome:
+                        outcome_saved = self.backlog_cleaner.record_outcome(
+                            item_key,
+                            provider="simkl",
+                            status="accepted",
+                            retryable=False,
+                            detail={"recovered_from": "simkl_synced_marker"},
+                        )
+                        if not outcome_saved:
+                            self.backlog_cleaner.update_item(
+                                item_key,
+                                {
+                                    "attempt_count": attempt_count + 1,
+                                    "last_attempt_timestamp": current_time,
+                                    "last_error": "Simkl outcome audit recovery failed",
+                                },
+                            )
+                            failure_this_cycle = True
+                            continue
+                        self.backlog_cleaner.update_item(
+                            item_key,
+                            {"provider_outcome_pending": False},
+                        )
+                    if item_data.get('local_history_saved'):
+                        if self.backlog_cleaner.remove(item_key):
+                            success_count += 1
+                        else:
+                            failure_this_cycle = True
+                        continue
                     logger.info(
                         "[Backlog] Retrying durable local event for '%s' (Key: %s, Attempt: %s)",
                         display_title,
@@ -2338,6 +2645,7 @@ class MediaScrobbler:
                         original_filepath=item_data.get('original_filepath'),
                         api_details_to_use=item_data.get('_api_details_for_history'),
                         watched_at=item_data.get('watched_at'),
+                        event_id=item_key,
                     )
                     if local_saved:
                         success_count += 1
@@ -2380,7 +2688,16 @@ class MediaScrobbler:
                 episode_to_sync = item_data.get('episode')
                 original_filepath_from_backlog = item_data.get('original_filepath') or \
                                                  (item_key if os.path.exists(str(item_key)) else None)
-                watched_at_to_sync = item_data.get('watched_at') # Extract watched_at from backlog item
+                watched_at_to_sync = item_data.get("watched_at")
+                if not watched_at_to_sync:
+                    watched_at_to_sync = datetime.now(timezone.utc).isoformat().replace(
+                        "+00:00", "Z"
+                    )
+                    item_data["watched_at"] = watched_at_to_sync
+                    self.backlog_cleaner.update_item(
+                        item_key,
+                        {"watched_at": watched_at_to_sync},
+                    )
 
                 if not simkl_id_to_sync or not media_type_to_sync:
                     logger.error(f"[Backlog] Resolved item '{title_to_sync}' missing Simkl ID or Type. Cannot sync.")
@@ -2393,26 +2710,13 @@ class MediaScrobbler:
                     continue
 
                 # --- Step 3: Construct Payload and Sync ---
-                # Use a temporary scrobbler state for payload building
-                # This is a bit of a hack but reuses the payload logic.
-                # A more direct payload builder for backlog items might be cleaner.
-                temp_state_simkl_id = self.simkl_id
-                temp_state_media_type = self.media_type
-                temp_state_season = self.season
-                temp_state_episode = self.episode
-                
-                self.simkl_id = simkl_id_to_sync
-                self.media_type = media_type_to_sync
-                self.season = season_to_sync
-                self.episode = episode_to_sync
-                
-                payload = self._build_add_to_history_payload(watched_at=watched_at_to_sync) # Pass watched_at
-
-                # Restore original scrobbler state
-                self.simkl_id = temp_state_simkl_id
-                self.media_type = temp_state_media_type
-                self.season = temp_state_season
-                self.episode = temp_state_episode
+                payload = build_completion_payload(
+                    simkl_id_to_sync,
+                    media_type_to_sync,
+                    season=season_to_sync,
+                    episode=episode_to_sync,
+                    watched_at=watched_at_to_sync,
+                )
 
                 if not payload:
                     logger.error(f"[Backlog] Failed to build payload for '{title_to_sync}' (ID: {simkl_id_to_sync}). Error in item data.")
@@ -2425,21 +2729,35 @@ class MediaScrobbler:
                     continue
 
                 sync_api_error = None
+                sync_retryable = True
                 try:
                     logger.info(f"[Backlog] Syncing '{title_to_sync}' (ID: {simkl_id_to_sync}, Type: {media_type_to_sync}) to Simkl.")
                     
-                    # Use the allow_rewatch intent stored in the backlog item, 
-                    # falling back to current settings if not present.
-                    allow_rewatch_intent = item_data.get('allow_rewatch', get_setting('allow_rewatch', True))
-                    
-                    sync_result = add_to_history(payload, self.client_id, self.access_token, allow_rewatch=allow_rewatch_intent)                    
+                    # Retries preserve the original automatic-completion intent.
+                    sync_result = add_to_history(payload, self.client_id, self.access_token, allow_rewatch=False)
+                    outcome_saved = self._record_simkl_outcome(item_key, sync_result)
                     if self._simkl_history_result_accepted(sync_result):
                         logger.info(f"[Backlog] Successfully synced '{title_to_sync}' to Simkl.")
+                        if not outcome_saved:
+                            marker_saved = self.backlog_cleaner.update_item(
+                                item_key,
+                                {
+                                    "simkl_synced": True,
+                                    "provider_outcome_pending": True,
+                                    "last_error": "Simkl accepted; provider outcome audit is pending",
+                                },
+                            )
+                            if not marker_saved:
+                                logger.critical(
+                                    "[Backlog] Simkl accepted '%s', but neither its outcome nor recovery marker could be saved.",
+                                    title_to_sync,
+                                )
 
                         # After successful sync, fetch and cache additional details
-                        cache_key_for_update = (os.path.basename(original_filepath_from_backlog).lower()
-                                                if original_filepath_from_backlog
-                                                else title_to_sync.lower())
+                        cache_key_for_update = cache_key_for_media(
+                            original_filepath_from_backlog,
+                            title_to_sync,
+                        )
                         self._fetch_and_update_cache_with_full_details(
                             simkl_id_to_sync,
                             media_type_to_sync,
@@ -2460,34 +2778,77 @@ class MediaScrobbler:
                             original_filepath=original_filepath_from_backlog,
                             api_details_to_use=item_data.get('_api_details_for_history'), # Pass if _resolve fetched them
                             watched_at=watched_at_to_sync,
+                            event_id=item_key,
                         )
                         if local_saved:
-                            success_count += 1
-                            self.backlog_cleaner.remove(item_key)
+                            if outcome_saved:
+                                if self.backlog_cleaner.remove(item_key):
+                                    success_count += 1
+                                else:
+                                    self.backlog_cleaner.update_item(item_key, {
+                                        'simkl_synced': True,
+                                        'local_history_saved': True,
+                                        'last_error': "Could not finalize delivered ledger event",
+                                    })
+                                    failure_this_cycle = True
+                            else:
+                                self.backlog_cleaner.update_item(item_key, {
+                                    'simkl_synced': True,
+                                    'local_history_saved': True,
+                                    'provider_outcome_pending': True,
+                                    'last_error': "Simkl accepted; provider outcome audit is pending",
+                                })
+                                failure_this_cycle = True
                         else:
                             self.backlog_cleaner.update_item(item_key, {
                                 'simkl_synced': True,
+                                'provider_outcome_pending': not outcome_saved,
                                 'attempt_count': attempt_count + 1,
                                 'last_attempt_timestamp': current_time,
                                 'last_error': "Local watch-history write failed",
                             })
                             failure_this_cycle = True
+                        self._emit_completion_receipt(
+                            item_key,
+                            title_to_sync,
+                            simkl_status="Accepted" if outcome_saved else "Accepted (audit pending)",
+                            local_status="Saved" if local_saved else "Pending retry",
+                            media_type=media_type_to_sync,
+                            season=season_to_sync,
+                            episode=episode_to_sync,
+                            simkl_id=simkl_id_to_sync,
+                        )
                     else:
-                        sync_api_error = "Simkl API add_to_history call failed or reported not_found."
+                        sync_api_error = self._simkl_outcome_error(sync_result)
+                        sync_retryable = self._simkl_outcome_retryable(sync_result)
                 except RequestException as e:
                     sync_api_error = f"Network error during Simkl sync: {e}"
+                    sync_retryable = True
                 except Exception as e:
                     sync_api_error = f"Unexpected error during Simkl sync: {e}"
                     logger.error(f"[Backlog] {sync_api_error} for '{title_to_sync}'", exc_info=True)
 
                 if sync_api_error:
                     logger.warning(f"[Backlog] Sync failed for '{title_to_sync}': {sync_api_error}")
-                    # Removed individual error notification - only log the error
-                    self.backlog_cleaner.update_item(item_key, {
-                        'attempt_count': attempt_count + 1,
-                        'last_attempt_timestamp': current_time,
-                        'last_error': sync_api_error
-                    })
+                    if sync_retryable:
+                        self.backlog_cleaner.update_item(item_key, {
+                            'attempt_count': attempt_count + 1,
+                            'last_attempt_timestamp': current_time,
+                            'last_error': sync_api_error
+                        })
+                    else:
+                        self.backlog_cleaner.fail(item_key, sync_api_error)
+                    self._emit_completion_receipt(
+                        item_key,
+                        title_to_sync,
+                        simkl_status="Pending retry" if sync_retryable else "Rejected",
+                        local_status="Queued",
+                        media_type=media_type_to_sync,
+                        season=season_to_sync,
+                        episode=episode_to_sync,
+                        simkl_id=simkl_id_to_sync,
+                        detail=sync_api_error,
+                    )
                     failure_this_cycle = True
 
             finally:
@@ -2657,46 +3018,54 @@ class MediaScrobbler:
 
 
     def start_offline_sync_thread(self, interval_seconds=120):
-        """Start a background thread to periodically sync backlog when online."""
+        """Start the sole background owner of the completion queue."""
         if hasattr(self, '_offline_sync_thread') and self._offline_sync_thread.is_alive():
-            logger.debug("Offline sync thread already running.")
+            self.request_backlog_sync()
             return
-            
+        if not hasattr(self, "_backlog_wakeup"):
+            self._backlog_wakeup = threading.Event()
+        if not hasattr(self, "_backlog_stop"):
+            self._backlog_stop = threading.Event()
+        self._backlog_stop.clear()
+
         def sync_loop():
-            logger.info("Offline sync thread started.")
-            while True:
+            logger.info("Completion queue worker started.")
+            while not self._backlog_stop.is_set():
+                self._backlog_wakeup.wait(interval_seconds)
+                self._backlog_wakeup.clear()
+                if self._backlog_stop.is_set():
+                    break
                 try:
-                    # Check internet connection before attempting to get pending items
-                    if is_internet_connected():
-                        if self.backlog_cleaner.has_pending_items(): # Efficient check
-                            logger.info("[Offline Sync Thread] Internet detected. Checking backlog...")
-                            result = self.process_backlog() # process_backlog itself checks connection again
-                            
-                            if isinstance(result, dict):
-                                processed = result.get('processed', 0)
-                                attempted = result.get('attempted', 0)                                
-                                if processed > 0:
-                                    logger.info(f"[Offline Sync Thread] Synced {processed} of {attempted} items from backlog.")
-                                    # Show notification for automatic backlog sync completion (showing only count)
-                                    self._send_notification(
-                                        "Simkl Backlog Sync Complete",
-                                        f"Successfully synced {processed} item(s) from your backlog.",
-                                        online_only=True
-                                    )
-                                elif attempted > 0 : # Attempted but none succeeded
-                                    logger.info(f"[Offline Sync Thread] Attempted {attempted} backlog items, none synced this cycle.")
-                        else:
-                            logger.debug("[Offline Sync Thread] Internet detected, but no backlog items to process.")
-                    else:
-                        logger.debug("[Offline Sync Thread] Still offline. Will retry later.")
-                except Exception as e:
-                    logger.error(f"[Offline Sync Thread] Error during backlog sync loop: {e}", exc_info=True)
-                
-                # Wait for the_interval_seconds regardless of outcome
-                time.sleep(interval_seconds)
-                
-        self._offline_sync_thread = threading.Thread(target=sync_loop, daemon=True, name="OfflineSyncThread")
+                    if self.backlog_cleaner.has_pending_items():
+                        result = self.process_backlog()
+                        logger.info(
+                            "Completion queue pass: processed=%s attempted=%s reason=%s",
+                            result.get("processed", 0),
+                            result.get("attempted", 0),
+                            result.get("reason"),
+                        )
+                except Exception as exc:
+                    logger.error("Completion queue worker failed: %s", exc, exc_info=True)
+            logger.info("Completion queue worker stopped.")
+
+        self._offline_sync_thread = threading.Thread(
+            target=sync_loop,
+            daemon=True,
+            name="CompletionQueueWorker",
+        )
         self._offline_sync_thread.start()
+        self.request_backlog_sync()
+
+    def stop_offline_sync_thread(self, timeout=2):
+        """Stop and join the completion queue worker before deleting its store."""
+        if not hasattr(self, "_backlog_stop"):
+            return
+        self._backlog_stop.set()
+        if hasattr(self, "_backlog_wakeup"):
+            self._backlog_wakeup.set()
+        worker = getattr(self, "_offline_sync_thread", None)
+        if worker and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=timeout)
 
     def cache_media_info(self, original_title_key, simkl_id, display_name, media_type='movie',
                          season=None, episode=None, year=None, runtime_minutes=None,
@@ -2717,7 +3086,10 @@ class MediaScrobbler:
             logger.warning(f"Cannot cache media info: Invalid Simkl ID format '{simkl_id}'. Must be integer-convertible.")
             return
 
-        cache_key_to_use = original_title_key.lower()
+        cache_key_to_use = cache_key_for_media(
+            original_filepath_if_any,
+            original_title_key,
+        )
 
         # Initialize local variables for fields that might be overridden by episode-specific data
         overview_for_cache = overview
@@ -2785,10 +3157,14 @@ class MediaScrobbler:
         # If self.total_duration_seconds is known from player for the current item, it's often more accurate
         # This check should happen AFTER episode-specific runtime is considered.
         # If player duration is available and this cache entry is for the currently playing item, prefer player duration.
-        if self.total_duration_seconds is not None and self.currently_tracking and \
-           (original_title_key.lower() == self.currently_tracking.lower() or \
-            (original_filepath_if_any and self.current_filepath and \
-             os.path.basename(original_filepath_if_any).lower() == os.path.basename(self.current_filepath).lower())):
+        if self.total_duration_seconds is not None and self.currently_tracking and (
+            original_title_key.casefold() == self.currently_tracking.casefold()
+            or (
+                original_filepath_if_any
+                and self.current_filepath
+                and same_media_path(original_filepath_if_any, self.current_filepath)
+            )
+        ):
             
             # If episode-specific runtime was found, player duration might still be more accurate for *that specific file*.
             # If no episode-specific runtime, player duration is definitely better than show average.
@@ -2801,74 +3177,40 @@ class MediaScrobbler:
         if duration_seconds_to_cache is not None:
             new_data_to_cache["duration_seconds"] = duration_seconds_to_cache
 
-        # --- Simkl ID based consolidation and merging ---
-        existing_key_for_id, existing_info = self.media_cache.get_by_simkl_id(simkl_id)
-        if existing_info and media_type in ['show', 'anime'] and season is not None and episode is not None:
-            same_episode = (
-                existing_info.get('season') == season
-                and existing_info.get('episode') == episode
-            )
-            if not same_episode:
-                existing_key_for_id, existing_info = None, None
+        # Merge only the canonical key for this file/title. Distinct paths remain aliases.
+        existing_info = self.media_cache.get(cache_key_to_use) or {}
+        merged_data = dict(existing_info)
+        for key, new_value in new_data_to_cache.items():
+            if new_value is None:
+                continue
+            if isinstance(new_value, dict) and isinstance(merged_data.get(key), dict):
+                merged_data[key] = {**merged_data[key], **new_value}
+            else:
+                merged_data[key] = new_value
 
-        if existing_info: # An entry with this simkl_id already exists
-            logger.info(f"Simkl ID {simkl_id} ('{display_name or existing_info.get('movie_name')}') already cached under key '{existing_key_for_id}'. Merging new data.")
-            
-            merged_data = {**existing_info} # Start with existing data
-
-            # Smart merge: new data takes precedence if not None, or if existing is None/empty
-            for key, new_value in new_data_to_cache.items():
-                if new_value is not None: # Only consider new values that are not None
-                    if key not in merged_data or merged_data[key] is None or str(merged_data[key]).strip() == "":
-                        merged_data[key] = new_value
-                    elif isinstance(new_value, dict) and isinstance(merged_data.get(key), dict):
-                        # For dicts (like 'ids' or '_api_full_details'), merge them deeply if appropriate
-                        if key == 'ids': # Simple overwrite for 'ids' is fine, new_data_to_cache['ids'] is already complete
-                             merged_data[key] = new_value
-                        elif key == '_api_full_details': # Prefer newer full details
-                             merged_data[key] = new_value
-                        else: # Generic dict merge (could be refined)
-                             merged_data[key] = {**merged_data.get(key, {}), **new_value}
-                    elif key == 'source': # Always update source to reflect the latest update
-                        merged_data[key] = new_value
-                    elif key == 'overview' and not merged_data.get('overview') and new_value: # Fill overview if missing
-                        merged_data[key] = new_value
-                    elif key == 'poster_url' and not merged_data.get('poster_url') and new_value: # Fill poster if missing
-                        merged_data[key] = new_value
-                    else: # General overwrite for other fields if new_value is present
-                        merged_data[key] = new_value
-            
-            # Ensure essential fields are correctly set from the latest information
-            if display_name: merged_data["movie_name"] = display_name
-            if media_type: merged_data["type"] = media_type
-            merged_data["simkl_id"] = simkl_id # Ensure it's the correct int type
-
-            self.media_cache.update(existing_key_for_id, merged_data)
-            logger.info(f"Updated entry for Simkl ID {simkl_id} at key '{existing_key_for_id}'.")
-            
-            # If the current call was with a different key (cache_key_to_use)
-            # and that key points to a now-redundant entry (that isn't the one we just updated), remove it.
-            if cache_key_to_use != existing_key_for_id:
-                other_entry_at_cache_key = self.media_cache.get(cache_key_to_use)
-                if other_entry_at_cache_key:
-                    # If the other entry has the same simkl_id, or no simkl_id (temp entry), it's redundant
-                    if other_entry_at_cache_key.get("simkl_id") == simkl_id or not other_entry_at_cache_key.get("simkl_id"):
-                        logger.info(f"Removing redundant cache entry at '{cache_key_to_use}' after merging into '{existing_key_for_id}'.")
-                        self.media_cache.remove(cache_key_to_use)
-        else: # No existing entry for this simkl_id, create a new one
-            # Ensure all essential fields are present before setting
-            if "movie_name" not in new_data_to_cache and display_name: new_data_to_cache["movie_name"] = display_name
-            if "type" not in new_data_to_cache and media_type: new_data_to_cache["type"] = media_type
-            if "simkl_id" not in new_data_to_cache: new_data_to_cache["simkl_id"] = simkl_id
-            if "source" not in new_data_to_cache: new_data_to_cache["source"] = source_description or "initial_cache_media_info"
-
-            self.media_cache.set(cache_key_to_use, new_data_to_cache)
-            logger.info(f"Cached new info for '{new_data_to_cache.get('movie_name', 'N/A')}' (ID: {simkl_id}) under key '{cache_key_to_use}'.")
+        merged_data["simkl_id"] = simkl_id
+        if display_name:
+            merged_data["movie_name"] = display_name
+        if media_type:
+            merged_data["type"] = media_type
+        self.media_cache.set(cache_key_to_use, merged_data)
+        new_data_to_cache = merged_data
+        logger.info(
+            "Cached info for '%s' (ID: %s) under canonical key '%s'.",
+            merged_data.get('movie_name', 'N/A'),
+            simkl_id,
+            cache_key_to_use,
+        )
 
         # If currently tracking this item, update instance state
-        if self.currently_tracking and \
-           (cache_key_to_use == self.currently_tracking.lower() or \
-            (original_filepath_if_any and self.current_filepath and os.path.basename(original_filepath_if_any).lower() == os.path.basename(self.current_filepath).lower())):
+        if self.currently_tracking and (
+            cache_key_to_use == cache_key_for_media(title=self.currently_tracking)
+            or (
+                original_filepath_if_any
+                and self.current_filepath
+                and same_media_path(original_filepath_if_any, self.current_filepath)
+            )
+        ):
             
             is_new_id_for_instance = (self.simkl_id != simkl_id)
             
@@ -2970,7 +3312,7 @@ class MediaScrobbler:
             # Use provided cache_key or derive from filepath/title
             cache_key_to_use = cache_key_override
             if not cache_key_to_use:
-                 cache_key_to_use = os.path.basename(filepath).lower() if filepath else raw_title_from_guessit.lower()
+                 cache_key_to_use = cache_key_for_media(filepath, raw_title_from_guessit)
             
             fallback_data = {
                 "movie_name": raw_title_from_guessit, # Store as movie_name for consistency
@@ -2987,9 +3329,14 @@ class MediaScrobbler:
             self.media_cache.set(cache_key_to_use, fallback_data)
 
             # If currently tracking this item and it's still unidentified by Simkl, apply guessit info to state
-            if self.currently_tracking and not self.simkl_id and \
-               ( (filepath and os.path.basename(filepath).lower() == self.currently_tracking.lower()) or \
-                 raw_title_from_guessit.lower() == self.currently_tracking.lower() ):
+            if self.currently_tracking and not self.simkl_id and (
+                (
+                    filepath
+                    and self.current_filepath
+                    and same_media_path(filepath, self.current_filepath)
+                )
+                or raw_title_from_guessit.casefold() == self.currently_tracking.casefold()
+            ):
                 
                 self.movie_name = raw_title_from_guessit # Use guessit title as current official title
                 self.media_type = media_type_from_guessit # Use guessit type as current type

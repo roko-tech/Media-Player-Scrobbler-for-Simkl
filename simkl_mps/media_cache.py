@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # before a fresh search, so a stamped-version mismatch clears it and stale
 # incorrect identifications can't persist. This only clears the filename->id lookup
 # cache -- never watch history, Simkl, or Trakt.
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 
 
 class MediaCache:
@@ -134,16 +134,14 @@ class MediaCache:
         return filtered
 
     def get(self, key):
-        """
-        Get media info from cache
-        
-        Args:
-            key: The key to look up (lowercase title, filename, or path)
-        
-        Returns:
-            dict: Media info including type, ID, and episode details if applicable
-        """
-        return self.cache.get(key.lower())
+        """Get media info by canonical key, with title-key compatibility."""
+        if key is None:
+            return None
+        normalized_key = str(key).casefold()
+        media_info = self.cache.get(normalized_key)
+        if media_info is None and not normalized_key.startswith(('path:', 'title:')):
+            media_info = self.cache.get(f"title:{normalized_key}")
+        return media_info
 
     def set(self, key, media_info):
         """

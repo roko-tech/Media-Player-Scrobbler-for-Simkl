@@ -96,47 +96,52 @@ class VLCIntegration:
         return {"port": port, "password": password}
     
     def get_position_duration(self, process_name=None):
-        """
-        Get current playback position and duration from VLC.
-        
-        Args:
-            process_name: Optional process name for debugging
-            
-        Returns:
-            tuple: (position, duration) in seconds, or (None, None) if unavailable
-        """
-        # If we have a successful config from a previous call, try it first
+        """Get playback position by trying every distinct VLC configuration."""
+        configs = []
         if self.last_successful_config:
-            position, duration = self._try_vlc_config(self.last_successful_config)
-            if position is not None and duration is not None:
-                return position, duration
-        
-        # Try with configuration from vlcrc first
-        config = {"port": self.vlc_config["port"], "password": self.vlc_config["password"]}
-        position, duration = self._try_vlc_config(config)
-        if position is not None and duration is not None:
-            return position, duration
-        
-        # Try common fallback configurations
-        common_configs = [
+            configs.append(self.last_successful_config)
+        configs.append({
+            "port": self.vlc_config["port"],
+            "password": self.vlc_config["password"],
+        })
+        configs.extend([
             {"port": 8080, "password": ""},
             {"port": 8080, "password": "admin"},
             {"port": 8080, "password": "simkl"},
             {"port": 9090, "password": ""},
-            {"port": 8888, "password": ""}
-        ]
-        
-        # Add the vlcrc password with different ports if it's not empty
-        if self.vlc_config["password"] and self.vlc_config["password"] not in ["", "admin", "simkl"]:
+            {"port": 8888, "password": ""},
+        ])
+        configured_password = self.vlc_config["password"]
+        if configured_password and configured_password not in ["admin", "simkl"]:
             for port in [8080, 9090, 8888]:
-                common_configs.append({"port": port, "password": self.vlc_config["password"]})
-        
-        for config in common_configs:
-            position, duration = self._try_vlc_config(config)
-            if position is not None and duration is not None:
-                return position, duration
-        
-        # If we reach here, we couldn't connect to VLC
+                configs.append({"port": port, "password": configured_password})
+
+        distinct_configs = []
+        seen = set()
+        for config in configs:
+            identity = (config["port"], config["password"])
+            if identity not in seen:
+                seen.add(identity)
+                distinct_configs.append(config)
+
+        last_error = None
+        received_response = False
+        for config in distinct_configs:
+            try:
+                position, duration = self._try_vlc_config(config)
+                received_response = True
+                if position is not None and duration is not None:
+                    return position, duration
+            except requests.RequestException as exc:
+                last_error = exc
+                logger.debug(
+                    "VLC candidate port %s failed: %s",
+                    config['port'],
+                    exc,
+                )
+
+        if not received_response and last_error:
+            raise last_error
         return None, None
     
     def _try_vlc_config(self, config):

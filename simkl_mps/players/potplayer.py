@@ -36,9 +36,9 @@ if PLATFORM == 'windows':
         logger.warning("PotPlayer integration requires pywin32 and psutil on Windows")
 
 # PotPlayer Windows Message constants
-PPM_GET_PLAYBACK_STATUS = 0x5001  # 0=stopped, 1=paused, 2=playing
-PPM_GET_TOTAL_TIME_MS = 0x5002
+PPM_GET_TOTAL_TIME_MS = 0x5003
 PPM_GET_PLAYBACK_TIME_MS = 0x5004
+PPM_GET_PLAYBACK_STATUS = 0x5006  # -1=stopped, 1=paused, 2=playing
 
 def find_potplayer_hwnd():
     """Find PotPlayer window handle."""

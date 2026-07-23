@@ -148,10 +148,10 @@ When adding a new player:
 - Use `testing_mode=True` parameter to disable real API calls
 
 ### Offline Support
-- All scrobbling attempts are queued in `backlog.json` when offline
-- `BacklogCleaner` retries items on reconnection
-- `MAX_BACKLOG_ATTEMPTS = 5` constant defines retry limit
-- Items are marked in `_processing_backlog_items` set during processing to prevent duplicates
+- Completion events are queued in the WAL-backed `completion_ledger.sqlite3`
+- `BacklogCleaner` migrates legacy `backlog.json` data and retries pending events
+- Retryable events remain pending with exponential cooldown; permanent outcomes move to `failed`
+- One queue-owner lock serializes retries, manual sync, and pending-event clearing
 
 ### Media Type Handling
 - `media_type` can be: `'movie'`, `'episode'`, `'show'`, or `'anime'`

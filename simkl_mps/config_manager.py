@@ -42,7 +42,9 @@ DEFAULT_SETTINGS = {
     "disable_notifications": False,  # Show all notifications by default
     "allow_rewatch": False,
     "allow_dirs": [],
-    "deny_dirs": []
+    "deny_dirs": [],
+    "history_retention_limit": 0,
+    "viewer_include_file_paths": False
 }
 
 # Last settings read/written OK; fallback so a corrupt read doesn't blank allow_dirs.

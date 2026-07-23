@@ -47,9 +47,10 @@ class MPVIntegration:
         self.platform = platform.system()
         self.ipc_path = self._find_ipc_path()
         self.connection = None
-        self.ipc_lock = Lock()  # Ensure only one command runs at a time
+        self.ipc_lock = Lock()
         self.request_id_counter = 1
-        logger.info(f"MPV Integration initialized. IPC Path: {self.ipc_path}")
+        self._receive_buffer = b""
+        logger.info("MPV Integration initialized. IPC Path: %s", self.ipc_path)
 
     def _find_mpv_config_path(self) -> Path | None:
         """Find the path to the mpv configuration file."""
@@ -194,8 +195,9 @@ class MPVIntegration:
             raise
 
     def _disconnect(self):
-        """Close the connection to the MPV IPC interface."""
+        """Close the MPV IPC connection and discard bytes from that connection."""
         if not self.connection:
+            self._receive_buffer = b""
             return
 
         try:
@@ -205,10 +207,11 @@ class MPVIntegration:
             else:
                 self.connection.close()
             logger.debug("Disconnected from MPV IPC.")
-        except Exception as e:
-            logger.error(f"Error disconnecting from MPV IPC: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error("Error disconnecting from MPV IPC: %s", exc, exc_info=True)
         finally:
             self.connection = None
+            self._receive_buffer = b""
 
     def _send_command(self, command: list) -> int:
         """Send a JSON command to MPV."""
@@ -250,104 +253,99 @@ class MPVIntegration:
             raise e
 
     def _receive_response_windows(self, timeout=MPV_TIMEOUT) -> dict | None:
-        """Receive and parse a JSON response from MPV on Windows."""
+        """Receive one response while preserving later complete replies."""
         if not WINDOWS_IMPORT_SUCCESS:
             raise MPVError("Windows IPC requires pywin32.")
-            
-        response_data = b""
+
         start_time = time.monotonic()
-        
         while time.monotonic() - start_time < timeout:
+            while b'\n' in self._receive_buffer:
+                line, self._receive_buffer = self._receive_buffer.split(b'\n', 1)
+                try:
+                    response = json.loads(line.decode('utf-8', errors='ignore'))
+                    if 'request_id' in response:
+                        return response
+                except json.JSONDecodeError:
+                    logger.warning("Invalid JSON from MPV: %s", line[:100])
+
             try:
-                # Check if pipe has any data
                 try:
                     result = win32pipe.PeekNamedPipe(self.connection, 0)
-                    bytes_available = result[2] if result and isinstance(result, tuple) and len(result) >= 3 else 0
-                except pywintypes.error as e:
-                    if e.winerror == 109:  # ERROR_BROKEN_PIPE
+                    bytes_available = (
+                        result[2]
+                        if result and isinstance(result, tuple) and len(result) >= 3
+                        else 0
+                    )
+                except pywintypes.error as exc:
+                    if exc.winerror == 109:
                         logger.debug("MPV pipe is broken or closed")
                         self._disconnect()
                         return None
                     raise
-                    
-                # Read data if available
+
                 if bytes_available > 0:
                     try:
-                        hr, data = win32file.ReadFile(self.connection, min(bytes_available, 4096))
+                        _, data = win32file.ReadFile(
+                            self.connection,
+                            min(bytes_available, 4096),
+                        )
                         if data:
-                            response_data += data
-                    except pywintypes.error as e:
-                        if e.winerror == 109:  # ERROR_BROKEN_PIPE
+                            self._receive_buffer += data
+                    except pywintypes.error as exc:
+                        if exc.winerror == 109:
                             self._disconnect()
                             return None
                         raise
                 else:
-                    # No data available, sleep briefly
                     time.sleep(MIN_READ_INTERVAL)
-                    
-                # Process any complete JSON lines in the response
-                if b'\n' in response_data:
-                    line, response_data = response_data.split(b'\n', 1)
-                    try:
-                        response_dict = json.loads(line.decode('utf-8', errors='ignore'))
-                        # Only return command responses (with request_id), ignore events
-                        if 'request_id' in response_dict:
-                            return response_dict
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invalid JSON from MPV: {line[:100]}")
-            
-            except Exception as e:
-                logger.error(f"Error reading from MPV pipe: {e}", exc_info=True)
+            except Exception as exc:
+                logger.error("Error reading from MPV pipe: %s", exc, exc_info=True)
                 self._disconnect()
                 return None
-                
-        # Timeout reached
-        logger.warning(f"Timeout waiting for MPV response after {timeout}s")
+
+        logger.warning("Timeout waiting for MPV response after %ss", timeout)
         return None
 
     def _receive_response_posix(self, timeout=MPV_TIMEOUT) -> dict | None:
-        """Receive and parse a JSON response from MPV on POSIX systems."""
-        response_data = b""
+        """Receive one response while preserving later complete replies."""
         start_time = time.monotonic()
-        
-        # Set socket to non-blocking mode for select
         self.connection.setblocking(False)
-        
+
         while time.monotonic() - start_time < timeout:
+            while b'\n' in self._receive_buffer:
+                line, self._receive_buffer = self._receive_buffer.split(b'\n', 1)
+                try:
+                    response = json.loads(line.decode('utf-8', errors='ignore'))
+                    if 'request_id' in response:
+                        return response
+                except json.JSONDecodeError:
+                    logger.warning("Invalid JSON from MPV: %s", line[:100])
+
             try:
-                # Use select to wait for data with timeout
-                ready, _, _ = select.select([self.connection], [], [], MIN_READ_INTERVAL)
+                ready, _, _ = select.select(
+                    [self.connection],
+                    [],
+                    [],
+                    MIN_READ_INTERVAL,
+                )
                 if ready:
                     try:
                         chunk = self.connection.recv(4096)
-                        if not chunk:  # Empty data means socket closed
+                        if not chunk:
                             logger.debug("MPV socket closed during read")
                             self._disconnect()
                             return None
-                        response_data += chunk
+                        self._receive_buffer += chunk
                     except ConnectionError:
                         logger.debug("Connection error while reading from MPV socket")
                         self._disconnect()
                         return None
-                    
-                # Process any complete JSON lines in the response
-                if b'\n' in response_data:
-                    line, response_data = response_data.split(b'\n', 1)
-                    try:
-                        response_dict = json.loads(line.decode('utf-8', errors='ignore'))
-                        # Only return command responses (with request_id), ignore events
-                        if 'request_id' in response_dict:
-                            return response_dict
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invalid JSON from MPV: {line[:100]}")
-            
-            except Exception as e:
-                logger.error(f"Error reading from MPV socket: {e}", exc_info=True)
+            except Exception as exc:
+                logger.error("Error reading from MPV socket: %s", exc, exc_info=True)
                 self._disconnect()
                 return None
-                
-        # Timeout reached
-        logger.warning(f"Timeout waiting for MPV response after {timeout}s")
+
+        logger.warning("Timeout waiting for MPV response after %ss", timeout)
         return None
 
     def _receive_response(self, timeout=MPV_TIMEOUT) -> dict | None:

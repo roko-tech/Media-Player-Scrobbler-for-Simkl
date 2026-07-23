@@ -2,6 +2,7 @@ import json
 import threading
 
 from simkl_mps import trakt_sync
+from simkl_mps.backlog_cleaner import BacklogCleaner
 from simkl_mps.trakt_watcher import TraktSyncWatcher
 from simkl_mps.watch_history_manager import WatchHistoryManager
 
@@ -531,6 +532,7 @@ def test_history_saved_sync_emits_exact_completion_receipt(monkeypatch):
         trakt_sync.SyncResult(True, "Trakt: +1 episode(s)", pushed=True),
     ]
     event = {
+        "event_id": "8ddf190c-57fd-48cb-838b-8457fd340b83",
         "kind": "episode",
         "title": "Example",
         "simkl_id": 100,
@@ -557,6 +559,53 @@ def test_history_saved_sync_emits_exact_completion_receipt(monkeypatch):
     assert receipts[0][0].ok is True
     assert receipts[0][0].pushed is True
     assert receipts[0][1] == event
+
+
+def test_completion_event_id_survives_history_flattening():
+    event_id = "8ddf190c-57fd-48cb-838b-8457fd340b83"
+    history = [
+        {
+            "simkl_id": 100,
+            "title": "Example",
+            "type": "show",
+            "watch_events": [
+                {
+                    "event_id": event_id,
+                    "season": 2,
+                    "episode": 3,
+                    "watched_at": "2026-07-17T10:00:00Z",
+                }
+            ],
+        }
+    ]
+
+    events = trakt_sync.collect_history_events(history, None)
+
+    assert events[0]["event_id"] == event_id
+    assert trakt_sync._event_key(events[0]) == event_id
+
+
+def test_trakt_outcome_is_recorded_against_same_completion_event(tmp_path, monkeypatch):
+    ledger = BacklogCleaner(tmp_path)
+    event_id = ledger.add(100, "Example", unique_event=True)
+    ledger.remove(event_id)
+    watcher = TraktSyncWatcher()
+    event = {
+        "event_id": event_id,
+        "kind": "movie",
+        "title": "Example",
+        "simkl_id": 100,
+        "watched_at": "2026-07-17T10:00:00Z",
+    }
+    monkeypatch.setattr(trakt_sync, "APP_DATA_DIR", tmp_path)
+    monkeypatch.setattr(watcher, "_latest_event", lambda: event)
+    watcher.set_result_callback(lambda result, latest_event: None)
+
+    watcher._emit_result(trakt_sync.SyncResult(True, "accepted"))
+
+    outcomes = BacklogCleaner(tmp_path).get_event(event_id)["provider_outcomes"]
+    assert outcomes[-1]["provider"] == "trakt"
+    assert outcomes[-1]["status"] == "accepted"
 
 
 def test_repeated_trakt_retry_emits_receipt_only_when_outcome_changes(monkeypatch):

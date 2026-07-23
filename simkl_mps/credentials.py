@@ -1,15 +1,21 @@
 """
 Manages Simkl API credentials.
 
-Client ID and Secret are injected during the build process.
-Access Token is loaded from a .env file in the user's application data directory.
+The public Client ID is injected during the build process.
+The user's Access Token is loaded from the application data directory.
 """
 import pathlib
 import logging
 import os
 from dotenv import dotenv_values
 from .migration import get_app_data_dir, perform_full_migration
-from .secure_store import is_protected, protect_secret, unprotect_secret
+from .secure_store import (
+    ensure_private_file,
+    is_protected,
+    open_private_text_file,
+    protect_secret,
+    unprotect_secret,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,18 +26,13 @@ except Exception as e:
     logger.warning(f"Migration warning: {e}")
 
 
-# --- Injected by build process ---
-# These placeholders are replaced by the build workflow.
+# The build replaces this public identifier. Public desktop clients must never
+# embed a client secret; Simkl PIN authentication requires only the Client ID.
 CLIENT_ID_PLACEHOLDER = "SIMKL_CLIENT_ID_PLACEHOLDER"
-CLIENT_SECRET_PLACEHOLDER = "SIMKL_CLIENT_SECRET_PLACEHOLDER"
-# --- End of injected values ---
-
-# Patched for source builds: if the build process did NOT inject real values,
-# treat the credentials as empty so get_credentials() falls back to runtime
-# sources (env vars / .simkl_mps.env / .env) instead of sending the literal
-# placeholder to the Simkl API (which returns 412 client_id_failed).
 SIMKL_CLIENT_ID = "" if "PLACEHOLDER" in CLIENT_ID_PLACEHOLDER else CLIENT_ID_PLACEHOLDER
-SIMKL_CLIENT_SECRET = "" if "PLACEHOLDER" in CLIENT_SECRET_PLACEHOLDER else CLIENT_SECRET_PLACEHOLDER
+
+# Compatibility only for developers with an older confidential-client setup.
+SIMKL_CLIENT_SECRET = ""
 
 APP_NAME_FOR_PATH = "simkl-mps"
 USER_SUBDIR_FOR_PATH = "kavin"  # Updated from kavinthangavel
@@ -60,11 +61,20 @@ def _replace_env_values(path, replacements):
     for key, value in remaining.items():
         lines.append(f"{key}={value}\n")
     temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text("".join(lines), encoding="utf-8")
+    with open_private_text_file(temp) as handle:
+        handle.write("".join(lines))
+        handle.flush()
+        os.fsync(handle.fileno())
     temp.replace(path)
+    ensure_private_file(path)
 
 
 def _load_secure_env(path, migrate=True):
+    if os.name != "nt" and pathlib.Path(path).exists():
+        try:
+            ensure_private_file(path)
+        except OSError as exc:
+            logger.warning("Could not restrict Simkl credential file permissions: %s", exc)
     config = dict(dotenv_values(path))
     replacements = {}
     for key in ("SIMKL_CLIENT_SECRET", "SIMKL_ACCESS_TOKEN"):
@@ -84,67 +94,19 @@ def _load_secure_env(path, migrate=True):
 
 
 def get_credentials():
+    """Return the public Simkl client ID and the user's saved credentials.
+
+    Desktop builds embed only the public Client ID. ``client_secret`` remains in
+    the returned mapping solely so older local configurations can be read and
+    migrated without breaking callers; public PIN authentication does not use it.
     """
-    Retrieves the Simkl API credentials.
+    client_id = SIMKL_CLIENT_ID or None
+    client_secret = SIMKL_CLIENT_SECRET or None
 
-    Client ID/Secret are read from module-level variables (injected at build).
-    Access Token, User ID, and cached account metadata are read directly from the .env file *each time* this function
-    is called to ensure the latest values are used.
-
-    Returns:
-        dict: A dictionary containing 'client_id', 'client_secret',
-              'access_token', and 'user_id'. Values might be None if not configured
-              or if the build/init process failed.
-    """
-
-    client_id = None
-    client_secret = None
-
-    if SIMKL_CLIENT_ID:
-        client_id = SIMKL_CLIENT_ID
-    if SIMKL_CLIENT_SECRET:
-        client_secret = SIMKL_CLIENT_SECRET
-
-    if client_id and client_secret:
-        logger.debug("Using build-injected SIMKL client credentials.")
-    else:
-        logger.debug("Build-injected credentials missing/placeholder, trying runtime sources...")
-
-        # Check environment variables
-        env_client_id = os.environ.get("SIMKL_CLIENT_ID")
-        env_client_secret = os.environ.get("SIMKL_CLIENT_SECRET")
-        
-        if env_client_id:
-            client_id = env_client_id
-        if env_client_secret:
-            client_secret = env_client_secret
-
-        # Fall back to app env file used by end users (.simkl_mps.env)
-        env_file_path = get_env_file_path()
-        if (not client_id or not client_secret) and env_file_path.exists():
-            logger.debug(f"Loading runtime credentials from {env_file_path}")
-            runtime_config = _load_secure_env(env_file_path)
-            
-            runtime_client_id = runtime_config.get("SIMKL_CLIENT_ID")
-            runtime_client_secret = runtime_config.get("SIMKL_CLIENT_SECRET")
-            
-            if runtime_client_id:
-                client_id = client_id or runtime_client_id
-            if runtime_client_secret:
-                client_secret = client_secret or runtime_client_secret
-
-        # Final fallback for local development
-        if (not client_id or not client_secret) and DEV_CREDS_PATH.exists():
-            logger.debug(f"Loading development credentials from {DEV_CREDS_PATH}")
-            dev_config = dotenv_values(DEV_CREDS_PATH)
-            
-            dev_client_id = dev_config.get("SIMKL_CLIENT_ID")
-            dev_client_secret = dev_config.get("SIMKL_CLIENT_SECRET")
-            
-            if dev_client_id:
-                client_id = client_id or dev_client_id
-            if dev_client_secret:
-                client_secret = client_secret or dev_client_secret
+    env_client_id = os.environ.get("SIMKL_CLIENT_ID")
+    env_client_secret = os.environ.get("SIMKL_CLIENT_SECRET")
+    client_id = client_id or env_client_id
+    client_secret = client_secret or env_client_secret
 
     access_token = None
     user_id = None
@@ -152,32 +114,29 @@ def get_credentials():
     settings_all = None
     env_file_path = get_env_file_path()
     if env_file_path.exists():
-        logger.debug(f"Reading credentials from {env_file_path} inside get_credentials()")
+        logger.debug("Reading credentials from %s", env_file_path)
         config = _load_secure_env(env_file_path)
-
+        client_id = client_id or config.get("SIMKL_CLIENT_ID")
+        client_secret = client_secret or config.get("SIMKL_CLIENT_SECRET")
         access_token = config.get("SIMKL_ACCESS_TOKEN")
         user_id = config.get("SIMKL_USER_ID")
         account_type = config.get("SIMKL_ACCOUNT_TYPE")
         settings_all = config.get("SIMKL_SETTINGS_ALL")
-
-        if user_id:
-            logger.debug(f"Found user ID in env file: {user_id}")
-        else:
-            logger.debug("User ID not found in env file")
-
-        if account_type:
-            logger.debug(f"Found account type in env file: {account_type}")
-
         if not access_token:
             logger.warning(
-                f"Found env file at {env_file_path}, but SIMKL_ACCESS_TOKEN key is missing or empty."
+                "Found env file at %s, but SIMKL_ACCESS_TOKEN is missing or empty.",
+                env_file_path,
             )
-    else:
-        logger.debug(f"Env file not found at {env_file_path} inside get_credentials()")
 
-    if not client_id or not client_secret:
+    if (not client_id or not client_secret) and DEV_CREDS_PATH.exists():
+        logger.debug("Loading development credentials from %s", DEV_CREDS_PATH)
+        dev_config = dotenv_values(DEV_CREDS_PATH)
+        client_id = client_id or dev_config.get("SIMKL_CLIENT_ID")
+        client_secret = client_secret or dev_config.get("SIMKL_CLIENT_SECRET")
+
+    if not client_id:
         logger.warning(
-            "Client ID or Secret not found. For local development, create a .env file with SIMKL_CLIENT_ID and SIMKL_CLIENT_SECRET."
+            "Simkl Client ID not found. Set SIMKL_CLIENT_ID for a source build."
         )
 
     return {
@@ -186,7 +145,7 @@ def get_credentials():
         "access_token": access_token,
         "user_id": user_id,
         "account_type": account_type,
-        "settings_all": settings_all
+        "settings_all": settings_all,
     }
 
 def get_env_file_path():

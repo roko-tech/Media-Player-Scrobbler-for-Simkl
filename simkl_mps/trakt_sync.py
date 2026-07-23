@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,7 +22,13 @@ import requests
 
 from simkl_mps.config_manager import get_app_data_dir
 from simkl_mps.credentials import get_credentials
-from simkl_mps.secure_store import is_protected, protect_secret, unprotect_secret
+from simkl_mps.secure_store import (
+    ensure_private_file,
+    is_protected,
+    open_private_text_file,
+    protect_secret,
+    unprotect_secret,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -61,11 +68,12 @@ def load_json(path: Path, default=None):
 def save_json(path: Path, data: Any):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
-    with temp.open("w", encoding="utf-8") as handle:
+    with open_private_text_file(temp) as handle:
         json.dump(data, handle, indent=2)
         handle.flush()
         os.fsync(handle.fileno())
     temp.replace(path)
+    ensure_private_file(path)
 
 
 def save_state(data, create_backup=True):
@@ -76,7 +84,9 @@ def save_state(data, create_backup=True):
             if isinstance(current, dict):
                 backup_temp = backup.with_suffix(backup.suffix + ".tmp")
                 shutil.copy2(STATE_FILE, backup_temp)
+                ensure_private_file(backup_temp)
                 backup_temp.replace(backup)
+                ensure_private_file(backup)
         except TraktSyncError:
             logger.warning("Trakt sync: skipped backup of an invalid state file")
     save_json(STATE_FILE, data)
@@ -117,6 +127,11 @@ def load_state(default=None):
 
 
 def load_secret_json(path, secret_keys, default=None):
+    if os.name != "nt" and path.exists():
+        try:
+            ensure_private_file(path)
+        except OSError as exc:
+            logger.warning("Could not restrict permissions for %s: %s", path.name, exc)
     stored = load_json(path, default)
     if not isinstance(stored, dict):
         return stored
@@ -203,21 +218,35 @@ def _record_health(
     save_state(state)
 
 
+
+
+def _simkl_pending_count():
+    ledger = SIMKL_BACKLOG_FILE.parent / "completion_ledger.sqlite3"
+    if ledger.exists():
+        try:
+            with sqlite3.connect(ledger) as connection:
+                return connection.execute(
+                    "SELECT COUNT(*) FROM completion_events WHERE state = 'pending'"
+                ).fetchone()[0]
+        except sqlite3.Error as exc:
+            logger.warning("Could not read completion ledger health: %s", exc)
+    backlog = load_json(SIMKL_BACKLOG_FILE, {}) or {}
+    return len(backlog) if isinstance(backlog, (dict, list)) else 0
+
 def get_sync_health():
     """Return structured health data without credentials, IDs, or file paths."""
     state = load_state({}) or {}
     history = load_json(HISTORY_FILE, []) or []
-    backlog = load_json(SIMKL_BACKLOG_FILE, {}) or {}
     events = collect_history_events(history, None)
     latest = events[-1] if events else None
     if latest:
         latest = {
             key: latest.get(key)
-            for key in ("kind", "title", "season", "episode", "watched_at", "is_anime")
+            for key in ("event_id", "kind", "title", "season", "episode", "watched_at", "is_anime")
         }
     return {
         "latest_event": latest,
-        "simkl_pending": len(backlog) if isinstance(backlog, (dict, list)) else 0,
+        "simkl_pending": _simkl_pending_count(),
         "pending": len(state.get("pending") or []),
         "synced_through": state.get("synced_through"),
         "health": dict(state.get("health") or {}),
@@ -351,6 +380,8 @@ def _anime_ids_and_season(event, client_id):
 
 
 def _event_key(event):
+    if event.get("event_id"):
+        return str(event["event_id"])
     return "|".join(
         str(event.get(key) or "")
         for key in ("kind", "simkl_id", "season", "episode", "watched_at")
@@ -398,6 +429,9 @@ def collect_history_events(history, since_dt):
                 "ids": entry.get("ids") or {},
                 "is_anime": media_type == "anime",
             }
+            event_id = raw_event.get("event_id") or entry.get("event_id")
+            if event_id:
+                event["event_id"] = event_id
             if not is_movie:
                 event["season"] = raw_event.get("season") or entry.get("season") or 1
                 event["episode"] = raw_event.get("episode") or entry.get("episode")

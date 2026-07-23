@@ -9,8 +9,6 @@ on:
     secrets:
       SIMKL_CLIENT_ID:
         required: true
-      SIMKL_CLIENT_SECRET:
-        required: true
 
 jobs:
   build:
@@ -30,11 +28,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install poetry
           poetry config virtualenvs.create false
-          poetry lock
-          poetry install
+          poetry install --no-interaction --sync
 
-      - name: Set version in pyproject.toml
-        run: poetry version ${{ inputs.version }}
+      - name: Validate release version
+        run: python scripts/validate_release_version.py ${{ inputs.version }}
 
       - name: Download build-info artifact
         uses: actions/download-artifact@v8
@@ -49,23 +46,17 @@ jobs:
           mkdir -p dist/
           cp build-info/build_info.json dist/
 
-      - name: Inject Simkl Credentials into Code
+      - name: Inject public Simkl Client ID
         env:
           SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
-          SIMKL_CLIENT_SECRET: ${{ secrets.SIMKL_CLIENT_SECRET }}
         shell: bash
         run: |
           if [ -z "$SIMKL_CLIENT_ID" ]; then
             echo "::error::SIMKL_CLIENT_ID secret is not set."
             exit 1
           fi
-          if [ -z "$SIMKL_CLIENT_SECRET" ]; then
-            echo "::error::SIMKL_CLIENT_SECRET secret is not set."
-            exit 1
-          fi
 
           sed -i "s|SIMKL_CLIENT_ID_PLACEHOLDER|${SIMKL_CLIENT_ID}|g" simkl_mps/credentials.py
-          sed -i "s|SIMKL_CLIENT_SECRET_PLACEHOLDER|${SIMKL_CLIENT_SECRET}|g" simkl_mps/credentials.py
 
       - name: Install Inno Setup
         run: |

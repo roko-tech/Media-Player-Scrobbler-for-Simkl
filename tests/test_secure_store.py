@@ -1,9 +1,10 @@
 import json
 import os
+import stat
 
 import pytest
 
-from simkl_mps import credentials, trakt_sync
+from simkl_mps import credentials, simkl_api, trakt_sync
 from simkl_mps.secure_store import is_protected, protect_secret, unprotect_secret
 
 
@@ -74,3 +75,19 @@ def test_simkl_plaintext_env_migrates_on_read(tmp_path, monkeypatch):
     assert result["access_token"] == "test-access-token"
     assert is_protected(stored["SIMKL_CLIENT_SECRET"])
     assert is_protected(stored["SIMKL_ACCESS_TOKEN"])
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes only")
+def test_posix_secret_files_are_owner_only(tmp_path):
+    trakt_file = tmp_path / "trakt_token.json"
+    env_file = tmp_path / ".simkl_mps.env"
+
+    trakt_sync.save_secret_json(
+        trakt_file,
+        {"access_token": "test-token", "refresh_token": "test-refresh"},
+        ("access_token", "refresh_token"),
+    )
+    assert simkl_api._save_access_token(env_file, "test-token")
+
+    assert stat.S_IMODE(trakt_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600

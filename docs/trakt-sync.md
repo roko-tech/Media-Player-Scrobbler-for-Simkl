@@ -6,11 +6,11 @@ its local `watch_history.json` and immediately sends it to Trakt. Startup and
 file polling remain as recovery paths. Events Trakt cannot match are retained in
 `trakt_sync_state.json` and retried later.
 
-The local watch history, Simkl backlog, and Trakt state are written with atomic
-file replacement and last-known-good backups. A corrupt primary file is
-preserved with a `.corrupt-*` suffix before recovery. Completed backlog events
-have unique keys, so two offline episodes from the same show cannot overwrite
-one another, and events are not deleted after an arbitrary retry count.
+The local watch history and Trakt state use atomic file replacement and
+last-known-good backups. Simkl completion delivery uses the local
+`completion_ledger.sqlite3` WAL database. Completed events have stable UUIDs, so
+two offline episodes from the same show cannot overwrite one another, and the
+ledger retains delivered events as an audit trail.
 
 ## One-time setup
 
@@ -34,7 +34,8 @@ one another, and events are not deleted after an arbitrary retry count.
 The config, OAuth token, sync state, and watch history live in the app data
 folder. On Windows, the client secret and OAuth tokens are encrypted for the
 current Windows user with DPAPI. Existing plaintext files migrate on first read.
-They are never stored in this Git repository.
+On Linux and macOS, secret-bearing files are explicitly restricted to owner
+read/write permissions (`0600`). They are never stored in this Git repository.
 
 ## Commands
 
@@ -49,6 +50,9 @@ Sync Health shows the latest Simkl-accepted watch, separate Simkl and Trakt
 pending counts, the last Trakt HTTP response, added/not-found counts, and the
 last attempt and success times. **Copy Safe Diagnostics** omits media titles,
 service IDs, file paths, and credentials so its output can be shared safely.
+For an event-by-event local view, open **Scrobbling → Playback & Delivery
+Activity**. It shows current playback plus persisted Simkl, local-history, and
+Trakt status without displaying full media paths.
 
 The watcher retries pending work on a timer even when `watch_history.json` does
 not change again. Trakt `429` responses honor the official `Retry-After` delay;
@@ -61,12 +65,13 @@ or tray icon is required.
 
 ## Correcting a media match
 
-While the media is playing, use **Scrobbling → Media Identification** to save an
-override for either the exact file or its folder. Enter the correct Simkl ID. For
-an episode, add the target Simkl season after a comma, such as `529392, 1` for a
-split-cour title that Simkl stores as season 1. Exact-file overrides take
-precedence over folder overrides, and the nearest matching folder wins. Use
-**Remove Current Override** to return to automatic matching.
+While the media is playing, use **Scrobbling → Correct Match** for either the
+exact file or its folder. Search by title, choose a labeled Simkl result, and,
+for split-cour titles, optionally add the target season to the result number
+(for example, `2, 1`). Advanced users can still enter a known value as
+`id: 529392, 1`. Exact-file corrections take precedence over folder
+corrections, and the nearest matching folder wins. Use **Remove Current
+Correction** to return to automatic matching.
 
 ## Letterboxd
 

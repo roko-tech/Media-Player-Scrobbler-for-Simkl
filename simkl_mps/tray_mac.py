@@ -179,11 +179,11 @@ class TrayAppMac(TrayAppBase):
         """Show help information on macOS"""
         try:
             # Open documentation
-            help_url = "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl#readme"
+            help_url = "https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl#readme"
             webbrowser.open(help_url)
         except Exception as e:
             logger.error(f"Error showing help: {e}")
-            self.show_notification("Help", "Visit https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl#readme for help")
+            self.show_notification("Help", "Visit https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl#readme for help")
         return 0
 
     def exit_app(self, _=None):
@@ -206,7 +206,8 @@ class TrayAppMac(TrayAppBase):
                 self.update_status("error", "Failed to start monitoring")
         else:
             self.update_status("error", "Failed to initialize")
-            
+
+        self._show_first_run_setup_if_needed()
         try:
             self.tray_icon.run()
         except Exception as e:

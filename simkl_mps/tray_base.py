@@ -27,18 +27,19 @@ if TYPE_CHECKING:
     from simkl_mps.watch_history_manager import WatchHistoryManager
 
 # Import API and credential functions
-from simkl_mps.simkl_api import get_user_settings, pin_auth_flow
+from simkl_mps.simkl_api import get_user_settings, pin_auth_flow, search_media_candidates
+from simkl_mps.activity import format_delivery_activity, format_setup_health
+from simkl_mps import __version__
 from simkl_mps.credentials import get_credentials
 # Import constants only, not the whole module
 from simkl_mps.main import APP_DATA_DIR, APP_NAME
 # Import settings functions
 from simkl_mps.config_manager import get_setting, set_setting, DEFAULT_THRESHOLD
+from simkl_mps.app_paths import AppPathManifest
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DONATION_URL = "https://github.com/sponsors/itskavin"
-# Hardcoded application version (used by About dialog).
-APP_HARDCODED_VERSION = "2.4.1"
 
 def get_simkl_scrobbler():
     """Lazy import for SimklScrobbler to avoid circular imports"""
@@ -67,19 +68,39 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             f"{receipt.get('title', 'Unknown media')}{year} via {receipt.get('match_method', 'Simkl')}",
         )
 
+    def handle_completion_receipt(self, receipt):
+        """Store the Simkl/local phase of a completion receipt by event ID."""
+        self._last_receipt = dict(receipt)
+        self.show_notification(
+            "Watch Sync Receipt",
+            f"Simkl: {receipt.get('simkl_status')} | Local: {receipt.get('local_status')}",
+        )
+
     def handle_trakt_sync_result(self, result, event):
-        """Store the final Simkl/Trakt state for platforms without an overlay."""
-        receipt = {
-            "kind": "completion",
-            "title": event.get("title") or "Unknown media",
-            "media_type": "anime" if event.get("is_anime") else event.get("kind"),
-            "season": event.get("season"),
-            "episode": event.get("episode"),
-            "simkl_status": "Accepted",
-            "trakt_status": "Accepted" if result.ok and result.pending == 0 else "Pending retry",
-            "summary": result.summary,
-            "simkl_id": event.get("simkl_id"),
-        }
+        """Merge the final Trakt outcome into the same completion receipt."""
+        event_id = event.get("event_id")
+        if (
+            self._last_receipt
+            and event_id
+            and self._last_receipt.get("event_id") == event_id
+        ):
+            receipt = dict(self._last_receipt)
+        else:
+            receipt = {
+                "kind": "completion",
+                "event_id": event_id,
+                "title": event.get("title") or "Unknown media",
+                "media_type": "anime" if event.get("is_anime") else event.get("kind"),
+                "season": event.get("season"),
+                "episode": event.get("episode"),
+                "simkl_status": "Accepted",
+                "local_status": "Saved",
+                "simkl_id": event.get("simkl_id"),
+            }
+        receipt["trakt_status"] = (
+            "Accepted" if result.ok and result.pending == 0 else "Pending retry"
+        )
+        receipt["summary"] = result.summary
         self._last_receipt = receipt
         self.show_notification(
             "Watch Sync Receipt",
@@ -385,13 +406,8 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         return 0
 
     def _get_app_version(self) -> str:
-        """Return the hardcoded application version.
-
-        This deliberately returns a fixed string to avoid runtime lookups.
-        Keep `APP_HARDCODED_VERSION` in this file in sync with the project's
-        versioning (the `version_manager.py` script now updates this constant).
-        """
-        return APP_HARDCODED_VERSION
+        """Return the package version used by every runtime surface."""
+        return __version__
 
     def _build_about_text(self) -> str:
         """Build standard About dialog text."""
@@ -786,6 +802,87 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         self._show_info_dialog("Media Sync Health", report)
         return 0
 
+
+    def _current_activity_snapshot(self):
+        media_scrobbler = self._get_media_scrobbler()
+        if not media_scrobbler or not getattr(media_scrobbler, "current_filepath", None):
+            return None
+        duration = getattr(media_scrobbler, "total_duration_seconds", None)
+        position = getattr(media_scrobbler, "current_position_seconds", None)
+        progress = None
+        if duration and position is not None:
+            progress = max(0, min(100, (float(position) / float(duration)) * 100))
+        return {
+            "title": getattr(media_scrobbler, "movie_name", None)
+            or getattr(media_scrobbler, "currently_tracking", None),
+            "season": getattr(media_scrobbler, "season", None),
+            "episode": getattr(media_scrobbler, "episode", None),
+            "simkl_id": getattr(media_scrobbler, "simkl_id", None),
+            "state": getattr(media_scrobbler, "state", None),
+            "progress": progress,
+            "identification_rejected": bool(
+                getattr(media_scrobbler, "identification_rejected", False)
+            ),
+        }
+
+    def show_activity_center(self, _=None):
+        """Show current playback and persisted per-provider completion state."""
+        media_scrobbler = self._get_media_scrobbler()
+        events = []
+        if media_scrobbler:
+            ledger = getattr(media_scrobbler, "backlog_cleaner", None)
+            if ledger and hasattr(ledger, "recent_events"):
+                events = ledger.recent_events(limit=12)
+        watcher = self._get_trakt_watcher()
+        report = format_delivery_activity(
+            self._current_activity_snapshot(),
+            events,
+            trakt_configured=bool(watcher and watcher.configured),
+        )
+        self._show_info_dialog("Playback & Delivery Activity", report)
+        return 0
+
+    def _build_setup_health_text(self, first_run=False):
+        self._refresh_auth_state()
+        media_scrobbler = self._get_media_scrobbler()
+        counts = {"pending": 0, "delivered": 0, "failed": 0}
+        current_title = None
+        if media_scrobbler:
+            current_title = getattr(media_scrobbler, "movie_name", None) or getattr(
+                media_scrobbler, "currently_tracking", None
+            )
+            ledger = getattr(media_scrobbler, "backlog_cleaner", None)
+            if ledger and hasattr(ledger, "delivery_counts"):
+                counts = ledger.delivery_counts()
+        watcher = self._get_trakt_watcher()
+        allow_dirs = get_setting("allow_dirs", [])
+        deny_dirs = get_setting("deny_dirs", [])
+        return format_setup_health(
+            authenticated=self.is_authenticated,
+            monitoring_status=self.status,
+            current_title=current_title,
+            delivery_counts=counts,
+            trakt_configured=bool(watcher and watcher.configured),
+            allow_dir_count=len(allow_dirs) if isinstance(allow_dirs, list) else 0,
+            deny_dir_count=len(deny_dirs) if isinstance(deny_dirs, list) else 0,
+            first_run=first_run,
+        )
+
+    def show_setup_health(self, _=None, first_run=False):
+        self._show_info_dialog(
+            "First-Run Setup" if first_run else "Setup & Health",
+            self._build_setup_health_text(first_run=first_run),
+        )
+        return 0
+
+    def _show_first_run_setup_if_needed(self):
+        if not self.is_first_run:
+            return 0
+        try:
+            return self.show_setup_health(first_run=True)
+        finally:
+            self.is_first_run = False
+
     def _copy_text_to_clipboard(self, text):
         def copy_with_root(root):
             root.clipboard_clear()
@@ -904,6 +1001,8 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                 media_scrobbler.set_notification_callback(self.show_notification)
                 if hasattr(media_scrobbler, "set_identification_callback"):
                     media_scrobbler.set_identification_callback(self.handle_identification_receipt)
+                if hasattr(media_scrobbler, "set_completion_callback"):
+                    media_scrobbler.set_completion_callback(self.handle_completion_receipt)
                 # Register menu refresh callback so UI updates when account type changes
                 if hasattr(self.scrobbler.monitor.scrobbler, 'set_menu_refresh_callback'):
                     try:
@@ -973,163 +1072,76 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         return False
 
     def process_backlog(self, _=None):
-        """Process the backlog from the tray menu"""
+        """Wake the sole completion-queue worker from the tray menu."""
         media_scrobbler = self._get_media_scrobbler()
-        if not media_scrobbler or not hasattr(media_scrobbler, "process_backlog"):
+        if not media_scrobbler or not hasattr(media_scrobbler, "request_backlog_sync"):
             logger.warning("Cannot process backlog: media scrobbler is unavailable.")
             self.show_notification(
                 "simkl-mps Error",
-                "Backlog processing is unavailable because monitoring is not running."
+                "Backlog processing is unavailable because monitoring is not running.",
             )
             return 0
-
-        def _process():
-            try:
-                result = media_scrobbler.process_backlog()
-                
-                # Handle both the old integer return type and new dictionary return type
-                if isinstance(result, dict):
-                    count_value = result.get('processed', 0)
-                    attempted = result.get('attempted', 0)
-                    failures = result.get('failed', False)
-                    
-                    if count_value > 0:
-                        self.show_notification(
-                            "simkl-mps",
-                            f"Processed {count_value} of {attempted} backlog items"
-                        )
-                    elif attempted > 0 and failures:
-                        self.show_notification(
-                            "simkl-mps",
-                            f"No backlog items processed successfully. {attempted} items will be retried later."
-                        )
-                    else:
-                        self.show_notification(
-                            "simkl-mps",
-                            "No backlog items to process"
-                        )
-                else:
-                    # Legacy integer return type
-                    count = result
-                    if count > 0:
-                        self.show_notification(
-                            "simkl-mps",
-                            f"Processed {count} backlog items"
-                        )
-                    else:
-                        self.show_notification(
-                            "simkl-mps",
-                            "No backlog items to process"
-                        )
-            except Exception as e:
-                logger.error(f"Error processing backlog: {e}")
-                self.update_status("error")
-                self.show_notification(
-                    "simkl-mps Error",
-                    "Failed to process backlog"
-                )
-            return 0
-        threading.Thread(target=_process, daemon=True).start()
+        media_scrobbler.request_backlog_sync()
+        self.show_notification("simkl-mps", "Completion queue sync requested.")
         return 0
 
     def clear_logs(self, _=None):
-        """Clear application and playback log files."""
+        """Clear only log files owned by the application-data directory."""
         logger.info("Clear logs requested from tray menu...")
-
         if not self._show_confirmation_dialog(
             "Clear Logs",
-            "This will erase the application log and playback logs.\n\n"
-            "Use this when you need a clean slate before reproducing an issue.\n\n"
-            "Continue?"
+            "This will erase the application and playback logs.\n\nContinue?",
         ):
             logger.info("Clear logs cancelled by user")
             return 0
 
-        log_targets: list[tuple[str, Path, str]] = [
-            ("application log", self.log_path, "truncate"),
-            ("app data playback log", APP_DATA_DIR / "playback_log.jsonl", "truncate"),
-            ("workspace playback log", Path("playback_log.jsonl"), "delete"),
-        ]
-
-        cleared: list[str] = []
-        failures: list[str] = []
-
-        for label, target_path, mode in log_targets:
-            try:
-                if not target_path.exists():
-                    logger.debug(f"Log target '{label}' not found at {target_path}. Skipping.")
-                    continue
-
-                if mode == "truncate":
-                    with open(target_path, "w", encoding="utf-8"):
-                        pass
-                else:
-                    target_path.unlink()
-
-                cleared.append(label)
-                logger.info(f"Cleared {label} at {target_path}")
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.error(f"Failed to clear {label} at {target_path}: {exc}", exc_info=True)
-                failures.append(label)
-
-        if cleared and not failures:
-            self.show_notification("simkl-mps", f"Cleared logs: {', '.join(cleared)}")
-        elif cleared:
+        result = AppPathManifest(APP_DATA_DIR).purge(("logs",))
+        cleared = len(result.removed) + len(result.retained_empty)
+        if result.success:
             self.show_notification(
                 "simkl-mps",
-                f"Cleared logs: {', '.join(cleared)}. Failed: {', '.join(failures)}"
+                f"Cleared {cleared} application log artifact(s).",
             )
         else:
-            self.show_notification("simkl-mps Error", "No log files could be cleared.")
-
+            failed_names = [path.name for path, _ in result.failed]
+            failed_names.extend(path.name for path in result.remaining)
+            self.show_notification(
+                "simkl-mps Error",
+                "Could not clear: " + ", ".join(sorted(set(failed_names))),
+            )
         return 0
 
     def clear_watch_history(self, _=None):
-        """Clear the local watch history cache and viewer data."""
+        """Clear all owned local-history and viewer artifacts."""
         logger.info("Clear watch history requested from tray menu...")
-
         if not self._show_confirmation_dialog(
             "Clear Watch History",
-            "This removes the locally stored watch_history.json and viewer data.\n\n"
-            "Simkl's online history is unaffected.\n\n"
-            "Continue?"
+            "This removes local history, its backups, recovery copies, and viewer data.\n\n"
+            "Simkl's online history is unaffected.\n\nContinue?",
         ):
             logger.info("Clear watch history cancelled by user")
             return 0
 
         try:
-            history_manager = None
-            if self.scrobbler and getattr(self.scrobbler, 'watch_history_manager', None):
-                history_manager = self.scrobbler.watch_history_manager
-
-            if history_manager is None:
+            manager = self._get_watch_history_manager()
+            if manager is None:
                 from simkl_mps.watch_history_manager import WatchHistoryManager
-                history_manager = WatchHistoryManager(APP_DATA_DIR)
-                if self.scrobbler and hasattr(self.scrobbler, 'watch_history_manager'):
-                    self.scrobbler.watch_history_manager = history_manager
-
-            if history_manager is None:
-                raise RuntimeError("Watch history manager unavailable")
-
-            history_manager.clear()
-            if hasattr(history_manager, "history"):
-                history_manager.history = []
-
-            history_file = APP_DATA_DIR / "watch_history.json"
-            if history_file.exists():
-                history_file.unlink()
-
-            viewer_dir = APP_DATA_DIR / "watch-history-viewer"
-            data_js = viewer_dir / "data.js"
-            if data_js.exists():
-                data_js.unlink()
-
+                manager = WatchHistoryManager(APP_DATA_DIR)
+            result = manager.purge_local_data()
+            if not result.success:
+                failed_names = [path.name for path, _ in result.failed]
+                failed_names.extend(path.name for path in result.remaining)
+                raise RuntimeError(
+                    "Could not remove: " + ", ".join(sorted(set(failed_names)))
+                )
             self.show_notification("simkl-mps", "Local watch history cleared.")
-            logger.info("Local watch history cleared via tray menu")
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.error(f"Failed to clear watch history: {exc}", exc_info=True)
-            self.show_notification("simkl-mps Error", f"Failed to clear watch history: {exc}")
-
+            logger.info("Local watch history and private derivatives cleared")
+        except Exception as exc:
+            logger.error("Failed to clear watch history: %s", exc, exc_info=True)
+            self.show_notification(
+                "simkl-mps Error",
+                f"Failed to clear watch history: {exc}",
+            )
         return 0
 
     def clear_backlog(self, _=None):
@@ -1151,45 +1163,49 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         
         logger.info("Clearing backlog from tray menu...")
         try:
-            # Clear the backlog
-            from simkl_mps.backlog_cleaner import BacklogCleaner
-            backlog_cleaner = BacklogCleaner(APP_DATA_DIR)
-            backlog_cleaner.clear()
-            
+            active_scrobbler = self._get_media_scrobbler()
+            if active_scrobbler and hasattr(active_scrobbler, "clear_pending_completion_events"):
+                cleared = active_scrobbler.clear_pending_completion_events()
+            else:
+                from simkl_mps.backlog_cleaner import BacklogCleaner
+
+                cleared = BacklogCleaner(APP_DATA_DIR).clear()
+            if not cleared:
+                raise RuntimeError("The pending completion queue could not be cleared")
+
             # Reset scrobbler state if running
-            if self.scrobbler:
-                if hasattr(self.scrobbler, 'monitor') and hasattr(self.scrobbler.monitor, 'scrobbler'):
-                    scrobbler: Any = self.scrobbler.monitor.scrobbler
-                    
-                    # Use the new reset method for comprehensive state clearing
-                    if hasattr(scrobbler, 'reset_tracking_state'):
-                        scrobbler.reset_tracking_state()
-                        logger.info("Used comprehensive tracking state reset")
-                    else:
-                        # Fallback to manual reset if method not available
-                        if hasattr(scrobbler, 'clear_backlog_processing_state'):
-                            scrobbler.clear_backlog_processing_state()
-                        
-                        # Reset tracking state to prevent stuck notifications
-                        for attr in ('currently_tracking', 'movie_name', 'show_name', 'media_title', 
-                                   'media_type', 'season', 'episode', 'simkl_id', 'completed',
-                                   'current_filepath', 'state'):
-                            if hasattr(scrobbler, attr):
-                                setattr(scrobbler, attr, None)
-                        
-                        # Reset timing and progress tracking
-                        scrobbler.start_time = None
-                        scrobbler.watch_time = 0
-                        scrobbler.current_position_seconds = 0
-                        scrobbler.total_duration_seconds = 0
-                        scrobbler.last_update_time = None
-                        
-                        # Clear any offline sync thread notification throttles
-                        if hasattr(scrobbler, '_last_offline_sync_notification'):
-                            scrobbler._last_offline_sync_notification = 0
-                        
-                        logger.info("Used manual tracking state reset")
-            
+            if active_scrobbler:
+                scrobbler: Any = active_scrobbler
+                if hasattr(scrobbler, "reset_tracking_state"):
+                    scrobbler.reset_tracking_state()
+                    logger.info("Used comprehensive tracking state reset")
+                else:
+                    if hasattr(scrobbler, "clear_backlog_processing_state"):
+                        scrobbler.clear_backlog_processing_state()
+                    for attr in (
+                        "currently_tracking",
+                        "movie_name",
+                        "show_name",
+                        "media_title",
+                        "media_type",
+                        "season",
+                        "episode",
+                        "simkl_id",
+                        "completed",
+                        "current_filepath",
+                        "state",
+                    ):
+                        if hasattr(scrobbler, attr):
+                            setattr(scrobbler, attr, None)
+                    scrobbler.start_time = None
+                    scrobbler.watch_time = 0
+                    scrobbler.current_position_seconds = 0
+                    scrobbler.total_duration_seconds = 0
+                    scrobbler.last_update_time = None
+                    if hasattr(scrobbler, "_last_offline_sync_notification"):
+                        scrobbler._last_offline_sync_notification = 0
+                    logger.info("Used manual tracking state reset")
+
             self.show_notification("simkl-mps", "Backlog cleared and tracking state reset.")
             self.update_icon()
             logger.info("Backlog cleared successfully")
@@ -1328,38 +1344,6 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         
         return 0
 
-    def toggle_rewatch_enabled(self, _=None):
-        """Toggle rewatch scrobbling on/off from the tray menu."""
-        try:
-            media_scrobbler = self._get_media_scrobbler()
-            if media_scrobbler is not None and hasattr(media_scrobbler, "refresh_account_type_if_needed"):
-                media_scrobbler.refresh_account_type_if_needed(min_interval_seconds=0)
-            account_type = getattr(media_scrobbler, '_account_type', None) if media_scrobbler is not None else None
-            current_value = get_setting('allow_rewatch', True)
-            new_value = not current_value
-
-            if new_value and account_type not in ('pro', 'vip'):
-                set_setting('allow_rewatch', False)
-                logger.info("Blocked rewatch enable attempt for non-Pro/VIP account.")
-                self.update_icon()
-                self.show_notification(
-                    "Rewatch Tracking Unavailable",
-                    "Rewatch tracking requires Simkl Pro or VIP."
-                )
-                return 0
-
-            set_setting('allow_rewatch', new_value)
-
-            status = "enabled" if new_value else "disabled"
-            logger.info(f"Rewatch scrobbling {status} via tray menu")
-            self.update_icon()  # Refresh menu to show new checkmark state
-            self.show_notification("Settings Updated", f"Rewatch scrobbling {status}.")
-        except Exception as e:
-            logger.error(f"Error toggling rewatch scrobbling: {e}", exc_info=True)
-            self.show_notification("Error", f"Failed to toggle rewatch scrobbling: {e}")
-
-        return 0
-    
     def check_first_run(self):
         """Check if this is the first time the app is being run"""
         # Platform-specific implementation required
@@ -1373,15 +1357,8 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
         )
         is_preset = lambda val: current_threshold == val
-        # Determine cached account type (do not force network refresh here)
-        media_scrobbler = self._get_media_scrobbler()
-        cached_account_type = None
-        if media_scrobbler is not None:
-            cached_account_type = getattr(media_scrobbler, '_account_type', None)
-        can_record_rewatches = cached_account_type in ('pro', 'vip')
-
         menu_items = [
-            pystray.MenuItem("MPS for SIMKL", None),
+            pystray.MenuItem("MPS for SIMKL", None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(lambda item: f"Status: {self.get_status_text()}", None, enabled=False),
             pystray.Menu.SEPARATOR,
@@ -1405,18 +1382,13 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         menu_items.append(pystray.MenuItem("Scrobbling", pystray.Menu(
             pystray.MenuItem("Retry Last Scrobble", self.try_scrobble_again),
             pystray.MenuItem("Sync Backlog Now", self.process_backlog),
-            pystray.MenuItem("Media Identification", pystray.Menu(
-                pystray.MenuItem("Override Current File...", self.set_current_file_override),
-                pystray.MenuItem("Override Current Folder...", self.set_current_folder_override),
-                pystray.MenuItem("Remove Current Override", self.remove_current_media_override),
+            pystray.MenuItem("Correct Match", pystray.Menu(
+                pystray.MenuItem("Correct Current File...", self.set_current_file_override),
+                pystray.MenuItem("Correct Current Folder...", self.set_current_folder_override),
+                pystray.MenuItem("Remove Current Correction", self.remove_current_media_override),
             )),
             pystray.MenuItem("Completion Threshold", threshold_submenu),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                "Record Rewatches",
-                self.toggle_rewatch_enabled,
-                checked=lambda item, _allowed=can_record_rewatches: get_setting('allow_rewatch', True) if _allowed else False
-            ),
             pystray.MenuItem(
                 "Turn Notifications Off",
                 self.toggle_notifications_disabled,
@@ -1424,6 +1396,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Show Last Receipt", self.show_last_receipt),
+            pystray.MenuItem("Playback & Delivery Activity...", self.show_activity_center),
             pystray.MenuItem("Open Local Watch History", self.open_watch_history),
         )))
         menu_items.append(pystray.Menu.SEPARATOR)
@@ -1485,6 +1458,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             pystray.MenuItem("Donate ❤️", self.open_donation_page),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Check for Updates", self.check_updates_thread),
+            pystray.MenuItem("Setup & Health...", lambda: self.show_setup_health()),
             pystray.MenuItem("Help", self.show_help),
             pystray.MenuItem("About", self.show_about),
         )))        # --- Exit (always last, separated) ---
@@ -1538,240 +1512,157 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         return 0    
     
     def clear_all_data(self, _=None):
-        """Clear all user data, logs, cache, backlog, playback log, watch history, and .env file."""
+        """Stop writers, purge the owned data manifest, verify, and exit."""
         logger.info("Clear all data requested from tray menu...")
-        
-        # Show confirmation dialog
         if not self._show_confirmation_dialog(
             "Clear All Data",
-            "⚠️ WARNING: This will permanently delete ALL application data! ⚠️\n\n"
-            "This will remove:\n"
-            "• All cached media data\n"
-            "• All log files\n"
-            "• Backlog and playback history\n"
-            "• Watch history\n"
-            "• All settings and credentials\n"
-            "• Environment configuration\n\n"
-            "The application will EXIT after clearing data.\n\n"
-            "This action CANNOT be undone!\n\n"
-            "Are you absolutely sure you want to proceed?"
+            "WARNING: This permanently removes all local application data, including "
+            "settings, credentials, history, retries, overrides, viewer data, and logs.\n\n"
+            "Simkl and Trakt online history are unaffected. The application will exit.\n\n"
+            "Continue?",
         ):
             logger.info("Clear all data cancelled by user")
             return 0
-        
-        logger.info("Clearing all data and logs from tray menu...")
-        cleared_items = []
-        failed_items = []
-        
+
         try:
-            # Clear media cache
-            from simkl_mps.media_cache import MediaCache
-            MediaCache.clear_media_cache_all_locations(APP_DATA_DIR)
-            cleared_items.append("media cache")
-            
-            # Clear backlog
-            from simkl_mps.backlog_cleaner import BacklogCleaner
-            backlog_cleaner = BacklogCleaner(APP_DATA_DIR)
-            backlog_cleaner.clear()
-            cleared_items.append("backlog")
-            
-            # Clear log file content (instead of deleting the file to avoid "file in use" errors)
-            log_path = APP_DATA_DIR / "simkl_mps.log"
-            if log_path.exists():
-                try:
-                    # Clear the log file content instead of deleting it
-                    with open(log_path, 'w', encoding='utf-8') as f:
-                        f.write("")  # Clear the file content
-                    logger.info("Log file content cleared.")
-                    cleared_items.append("log file")
-                except (PermissionError, OSError) as log_error:
-                    # If we can't clear the log, continue with other cleanup
-                    logger.warning(f"Could not clear log file (file may be in use): {log_error}")
-                    failed_items.append("log file")
-            
-            # Clear playback log (in workspace root and app data dir)
-            playback_log_paths = [
-                Path("playback_log.jsonl"),  # Workspace root
-                APP_DATA_DIR / "playback_log.jsonl",  # App data directory
-            ]
-            for playback_log_path in playback_log_paths:
-                if playback_log_path.exists():
-                    try:
-                        playback_log_path.unlink()
-                        logger.info(f"Deleted playback log: {playback_log_path}")
-                        cleared_items.append(f"playback log ({playback_log_path.name})")
-                    except (PermissionError, OSError) as e:
-                        # If file is locked, try to clear its contents instead
-                        try:
-                            with open(playback_log_path, 'w', encoding='utf-8') as f:
-                                f.write("")
-                            logger.info(f"Cleared playback log content: {playback_log_path}")
-                            cleared_items.append(f"playback log content cleared ({playback_log_path.name})")
-                        except Exception as e2:
-                            logger.warning(f"Could not clear or delete playback log {playback_log_path}: {e2}")
-                            failed_items.append(f"playback log ({playback_log_path.name})")
-            
-            # Clear backlog.json (in workspace root and app data dir)
-            backlog_json_paths = [
-                Path("backlog.json"),  # Workspace root  
-                APP_DATA_DIR / "backlog.json",  # App data directory
-            ]
-            for backlog_json_path in backlog_json_paths:
-                if backlog_json_path.exists():
-                    try:
-                        backlog_json_path.unlink()
-                        logger.info(f"Deleted backlog file: {backlog_json_path}")
-                        cleared_items.append(f"backlog file ({backlog_json_path.name})")
-                    except (PermissionError, OSError) as e:
-                        logger.warning(f"Could not delete backlog file {backlog_json_path}: {e}")
-                        failed_items.append(f"backlog file ({backlog_json_path.name})")
-            
-            # Clear .env file (in workspace root and app data dir)
-            env_paths = [
-                Path(".env"),  # Workspace root
-                APP_DATA_DIR / ".env",  # App data directory
-                APP_DATA_DIR / ".simkl_mps.env",  # App-specific env file
-            ]
-            for env_path in env_paths:
-                if env_path.exists():
-                    try:
-                        env_path.unlink()
-                        logger.info(f"Deleted environment file: {env_path}")
-                        cleared_items.append(f"environment file ({env_path.name})")
-                    except (PermissionError, OSError) as e:
-                        logger.warning(f"Could not delete environment file {env_path}: {e}")
-                        failed_items.append(f"environment file ({env_path.name})")
-            
-            # Clear watch history (via scrobbler if available)
-            watch_history_manager = self._get_watch_history_manager()
-            if watch_history_manager:
-                try:
-                    if hasattr(watch_history_manager, 'clear'):
-                        watch_history_manager.clear()
-                    elif hasattr(watch_history_manager, 'clear_history'):
-                        watch_history_manager.clear_history()
-                    cleared_items.append("watch history")
-                except Exception as e:
-                    logger.warning(f"Could not clear watch history: {e}")
-                    failed_items.append("watch history")
-            
-            # Clear settings file
-            settings_file = APP_DATA_DIR / "settings.json"
-            if settings_file.exists():
-                try:
-                    settings_file.unlink()
-                    logger.info(f"Deleted settings file: {settings_file}")
-                    cleared_items.append("settings file")
-                except (PermissionError, OSError) as e:
-                    logger.warning(f"Could not delete settings file: {e}")
-                    failed_items.append("settings file")
+            if self.scrobbler and hasattr(self.scrobbler, 'stop'):
+                self.scrobbler.stop()
 
-            # Clear optional Trakt integration credentials and state.
-            for trakt_path in (
-                APP_DATA_DIR / "trakt_config.json",
-                APP_DATA_DIR / "trakt_token.json",
-                APP_DATA_DIR / "trakt_sync_state.json",
-            ):
-                if trakt_path.exists():
-                    try:
-                        trakt_path.unlink()
-                        cleared_items.append(trakt_path.name)
-                    except (PermissionError, OSError) as e:
-                        logger.warning(f"Could not delete {trakt_path.name}: {e}")
-                        failed_items.append(trakt_path.name)
-            
-            # Clear in-memory cache and reset tracked media in scrobbler if running
-            if self.scrobbler:
-                if hasattr(self.scrobbler, 'monitor') and hasattr(self.scrobbler.monitor, 'scrobbler'):
-                    scrobbler = self.scrobbler.monitor.scrobbler
-                    if hasattr(scrobbler, 'media_cache'):
-                        scrobbler.media_cache.cache.clear()
-                        scrobbler.media_cache._save_cache()
-                    # Clear backlog processing state and notification throttles
-                    if hasattr(scrobbler, 'clear_backlog_processing_state'):
-                        scrobbler.clear_backlog_processing_state()
-                for attr in ('currently_tracking', 'movie_name', 'show_name', 'media_title', 'media_type', 'season', 'episode'):
-                    if hasattr(self.scrobbler, attr):
-                        setattr(self.scrobbler, attr, None)
-                cleared_items.append("in-memory cache")
+            result = AppPathManifest(APP_DATA_DIR).purge()
 
-            # Reset authentication state after credential files are removed
+            media_scrobbler = self._get_media_scrobbler()
+            if media_scrobbler:
+                if hasattr(media_scrobbler, 'media_cache'):
+                    media_scrobbler.media_cache.cache.clear()
+                if hasattr(media_scrobbler, 'watch_history'):
+                    media_scrobbler.watch_history.history = []
+                for attr in (
+                    'currently_tracking',
+                    'current_filepath',
+                    'movie_name',
+                    'media_type',
+                    'season',
+                    'episode',
+                    'simkl_id',
+                ):
+                    if hasattr(media_scrobbler, attr):
+                        setattr(media_scrobbler, attr, None)
+
             self._refresh_auth_state()
-            
-            # Prepare notification message
-            if cleared_items and not failed_items:
-                message = f"Successfully Cleared All Data"
-                notification_title = "simkl-mps"
-            elif cleared_items and failed_items:
-                message = f"Cleared Some but Failed: {', '.join(failed_items)}"
-                notification_title = "simkl-mps - Partial Success"
-            elif failed_items:
-                message = f"Failed to clear: {', '.join(failed_items)}"
-                notification_title = "simkl-mps Error"
+            if result.success:
+                cleared = len(result.removed) + len(result.retained_empty)
+                self.show_notification(
+                    "simkl-mps",
+                    f"Cleared {cleared} owned application-data artifact(s).",
+                )
             else:
-                message = "No data found to clear"
-                notification_title = "simkl-mps"
-            
-            self.show_notification(notification_title, message)
-            self.update_icon()
-            self.exit_app()  # Exit the tray app after notifying the user
-            
-        except Exception as e:
-            logger.error(f"Error clearing all data: {e}")
-            self.show_notification("simkl-mps Error", f"Failed to clear all data: {e}")
+                failed_names = [path.name for path, _ in result.failed]
+                failed_names.extend(path.name for path in result.remaining)
+                self.show_notification(
+                    "simkl-mps - Partial Reset",
+                    "Could not remove: " + ", ".join(sorted(set(failed_names))),
+                )
+        except Exception as exc:
+            logger.error("Error clearing all data: %s", exc, exc_info=True)
+            self.show_notification(
+                "simkl-mps Error",
+                f"Failed to clear all data: {exc}",
+            )
+        finally:
+            self.exit_app()
         return 0
 
     def _set_current_media_override(self, scope):
         media_scrobbler = self._get_media_scrobbler()
-        filepath = getattr(media_scrobbler, 'current_filepath', None)
+        filepath = getattr(media_scrobbler, "current_filepath", None)
         if not media_scrobbler or not filepath:
-            self.show_notification("Media Override", "No local media file is currently playing.")
+            self.show_notification("Correct Match", "No local media file is currently playing.")
             return 0
 
-        current_id = getattr(media_scrobbler, 'simkl_id', None)
-        current_season = getattr(media_scrobbler, 'season', None)
-        current_value = str(current_id or "")
-        if current_id and current_season is not None:
-            current_value += f", {current_season}"
-        help_text = (
-            "Enter the correct Simkl ID. For an episode, optionally add the target "
-            "Simkl season after a comma (example: 529392, 1)."
+        current_title = getattr(media_scrobbler, "movie_name", None) or getattr(
+            media_scrobbler, "currently_tracking", None
         )
-        value = self._ask_directory_filter_dialog(
-            f"Override Current {scope.title()}", current_value, help_text
+        query = self._ask_directory_filter_dialog(
+            f"Correct Current {scope.title()}",
+            current_title or "",
+            (
+                "Search Simkl by title. You will choose from labeled results. "
+                "Advanced: enter 'id: 529392, 1' to use a known ID and optional season."
+            ),
         )
-        if value is None:
+        if query is None:
+            return 0
+        query = query.strip()
+        if not query:
+            self.show_notification("Correct Match", "Enter a title to search.")
             return 0
 
-        match = re.fullmatch(r"\s*(\d+)\s*(?:[,;]\s*(\d+)\s*)?", value)
-        if not match:
-            self.show_notification("Media Override", "Enter a Simkl ID, optionally followed by a season.")
-            return 0
+        has_episode = getattr(media_scrobbler, "episode", None) is not None
+        current_type = getattr(media_scrobbler, "media_type", None)
+        is_anime = current_type == "anime" or f"{os.sep}anime{os.sep}" in filepath.lower()
+        inferred_type = "anime" if has_episode and is_anime else "show" if has_episode else "movie"
+        direct_match = re.fullmatch(
+            r"\s*id\s*:\s*(\d+)\s*(?:[,;]\s*(\d+)\s*)?",
+            query,
+            flags=re.IGNORECASE,
+        )
 
-        simkl_id = int(match.group(1))
-        target_season = int(match.group(2)) if match.group(2) else None
-        has_episode = getattr(media_scrobbler, 'episode', None) is not None
-        media_type = getattr(media_scrobbler, 'media_type', None)
-        if has_episode and (media_type == 'anime' or f"{os.sep}anime{os.sep}" in filepath.lower()):
-            media_type = 'anime'
-        elif has_episode:
-            media_type = 'show'
+        if direct_match:
+            simkl_id = int(direct_match.group(1))
+            target_season = int(direct_match.group(2)) if direct_match.group(2) else None
+            media_type = inferred_type
+            selected_title = current_title
         else:
-            media_type = 'movie'
-        target_path = filepath if scope == 'file' else os.path.dirname(filepath)
-        title = getattr(media_scrobbler, 'movie_name', None) or getattr(
-            media_scrobbler, 'currently_tracking', None
-        )
+            media_kind = "anime" if has_episode and is_anime else "episode" if has_episode else "movie"
+            candidates = search_media_candidates(
+                query,
+                getattr(media_scrobbler, "client_id", None),
+                getattr(media_scrobbler, "access_token", None),
+                media_kind=media_kind,
+                limit=8,
+            )
+            if not candidates:
+                self.show_notification(
+                    "Correct Match",
+                    "No Simkl results were found. Check the title or your connection.",
+                )
+                return 0
+            choices = "\n".join(
+                f"{index}. {candidate.label}"
+                for index, candidate in enumerate(candidates, start=1)
+            )
+            selection = self._ask_directory_filter_dialog(
+                "Choose the Correct Match",
+                "1",
+                choices + "\n\nEnter a result number; optionally add a target season (example: 2, 1).",
+            )
+            if selection is None:
+                return 0
+            selected = re.fullmatch(r"\s*(\d+)\s*(?:[,;]\s*(\d+)\s*)?", selection)
+            if not selected:
+                self.show_notification("Correct Match", "Enter one listed result number.")
+                return 0
+            selected_index = int(selected.group(1))
+            if selected_index < 1 or selected_index > len(candidates):
+                self.show_notification("Correct Match", "That result number is not in the list.")
+                return 0
+            candidate = candidates[selected_index - 1]
+            simkl_id = candidate.simkl_id
+            target_season = int(selected.group(2)) if selected.group(2) else None
+            media_type = candidate.media_type
+            selected_title = candidate.title
+
+        target_path = filepath if scope == "file" else os.path.dirname(filepath)
         media_scrobbler.media_overrides.set(
             scope,
             target_path,
             simkl_id,
             season=target_season,
-            title=title,
+            title=selected_title,
             media_type=media_type,
         )
         logger.info("Saved %s media override for current playback", scope)
-        self.show_notification("Media Override", "Saved. Re-identifying the current media now.")
+        self.show_notification("Correct Match", "Saved. Re-identifying the current media now.")
         return self.try_scrobble_again()
 
     def set_current_file_override(self, _=None):

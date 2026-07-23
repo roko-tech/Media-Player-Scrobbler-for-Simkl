@@ -90,7 +90,7 @@ Media-Player-Scrobbler-for-Simkl/
 ### Setup & Environment
 
 ```bash
-git clone https://github.com/ByteTrix/media-player-scrobbler-for-simkl.git
+git clone https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl.git
 cd Media-Player-Scrobbler-for-Simkl
 poetry install --with dev
 # or

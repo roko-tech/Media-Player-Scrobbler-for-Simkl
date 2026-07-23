@@ -80,27 +80,21 @@ else:
 
 
 def load_configuration():
-    """
-    Loads necessary credentials using the credentials module.
+    """Load the public Simkl client ID and the user's access token.
 
     Raises:
-        ConfigurationError: If essential credentials (Client ID, Client Secret, Access Token) are missing.
+        ConfigurationError: If the Client ID or Access Token is missing.
 
     Returns:
-        dict: The credentials dictionary containing 'client_id', 'client_secret', 'access_token', etc.
+        dict: The credentials dictionary.
     """
     logger.info("Loading application configuration...")
     creds = get_credentials()
     client_id = creds.get("client_id")
-    client_secret = creds.get("client_secret")
     access_token = creds.get("access_token")
 
     if not client_id:
         msg = "Client ID not found. Check installation/build or dev environment."
-        logger.critical(f"Configuration Error: {msg}")
-        raise ConfigurationError(msg)
-    if not client_secret:
-        msg = "Client Secret not found. Check installation/build or dev environment."
         logger.critical(f"Configuration Error: {msg}")
         raise ConfigurationError(msg)
     if not access_token:
@@ -211,15 +205,16 @@ class SimklScrobbler:
         return True
 
     def stop(self):
-        """Stops the media monitoring thread gracefully."""
-        if not self.running:
-            logger.info("Stop command received, but scrobbler was not running.")
-            return
-
+        """Stop monitoring, provider watchers, and the completion queue worker."""
         logger.info("Initiating scrobbler shutdown...")
         self.running = False
-        self.trakt_watcher.stop()
-        self.monitor.stop()
+        if getattr(self, 'trakt_watcher', None):
+            self.trakt_watcher.stop()
+        if getattr(self, 'monitor', None):
+            self.monitor.stop()
+            media_scrobbler = getattr(self.monitor, 'scrobbler', None)
+            if media_scrobbler and hasattr(media_scrobbler, 'stop_offline_sync_thread'):
+                media_scrobbler.stop_offline_sync_thread()
         logger.info("Scrobbler shutdown complete.")
 
     def _signal_handler(self, sig, frame):

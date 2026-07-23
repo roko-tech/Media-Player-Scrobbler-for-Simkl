@@ -5,6 +5,7 @@ import threading
 import time
 
 from simkl_mps import trakt_sync
+from simkl_mps.backlog_cleaner import BacklogCleaner
 
 
 logger = logging.getLogger(__name__)
@@ -150,13 +151,31 @@ class TraktSyncWatcher:
         events = trakt_sync.collect_history_events(history, None)
         return events[-1] if events else None
 
+    def _record_trakt_outcome(self, event, result):
+        event_id = event.get("event_id")
+        if not event_id:
+            return
+        ledger = BacklogCleaner(trakt_sync.APP_DATA_DIR)
+        if not ledger.get_event(event_id):
+            return
+        accepted = bool(result.ok and result.pending == 0)
+        ledger.record_outcome(
+            event_id,
+            provider="trakt",
+            status="accepted" if accepted else "pending_retry",
+            retryable=not accepted,
+            detail={"summary": result.summary, "pending": result.pending},
+        )
+
     def _emit_result(self, result):
         if not self._result_callback:
             return
         event = self._latest_event()
         if not event:
             return
+        self._record_trakt_outcome(event, result)
         receipt_key = (
+            event.get("event_id"),
             event.get("kind"),
             event.get("simkl_id"),
             event.get("season"),

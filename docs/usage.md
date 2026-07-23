@@ -8,9 +8,10 @@ This guide explains how to use MPS for SIMKL to track your media and sync with y
 ## 🏁 Getting Started
 
 1. Install the app for your platform (see guides above).
-2. Authenticate with SIMKL on first run.
+2. Follow the first-run **Setup & Health** checklist and authenticate with SIMKL.
 3. **Configure your media players** (see [Media Players Guide](media-players.md)).
-4. Play media in your configured player. The app tracks and syncs progress automatically.
+4. Play a local file, then reopen **More → Setup & Health** to confirm detection.
+5. The app tracks and syncs progress automatically.
 
 ## 🖥️ Windows (EXE)
 - Just install and launch. The app runs in the tray —no commands needed.
@@ -68,8 +69,10 @@ Right-click the tray icon to access the app menu with the following sections:
 **Scrobbling** - Recovery and threshold controls:
 - **Retry Last Scrobble:** Clears cache for the active file and attempts to re-identify and scrobble it. Use when the wrong title/episode appears.
 - **Sync Backlog Now:** Immediately processes any offline scrobbles waiting in backlog.
+- **Correct Match:** Search Simkl by title and save the selected result for the current file or folder. A result number can include a target season for split-cour mappings.
 - **Completion Threshold:** Quickly switch between preset watch thresholds (65%, 80%, 90%) or define a custom percentage.
 - **Turn Notifications Off:** Disable all desktop notifications from the app (checkmark means notifications are off).
+- **Playback & Delivery Activity:** Review current playback and the persisted Simkl, local-history, and Trakt state for recent completion events.
 - **Open Local Watch History:** Browse your tracked movies, shows, and anime in the local viewer.
 
 **SIMKL** - Account and service management:
@@ -89,6 +92,7 @@ Right-click the tray icon to access the app menu with the following sections:
 **More** - Additional utilities:
 - **Donate ❤️:** Support the project.
 - **Check for Updates:** Check if a newer version is available.
+- **Setup & Health:** Review authentication, monitoring, player detection, delivery queue, Trakt, and directory-filter status.
 - **Help:** Open help documentation.
 - **About:** View application information.
 

@@ -8,8 +8,8 @@ param (
 )
 
 $AppName = "Media Player Scrobbler for SIMKL"
-$Publishers = @("ByteTrix", "kavin")
-$ApiURL = "https://api.github.com/repos/ByteTrix/Media-Player-Scrobbler-for-Simkl/releases/latest"
+$Publishers = @("roko-tech", "kavin", "ByteTrix")
+$ApiURL = "https://api.github.com/repos/roko-tech/Media-Player-Scrobbler-for-Simkl/releases/latest"
 $UserAgent = "MPSS-Updater/2.1"
 $LogFile = Join-Path $env:LOCALAPPDATA "SIMKL-MPS\updater.log"
 
@@ -447,7 +447,7 @@ try {
         Write-Log "Update available: $($LatestRelease.Version)"
         
         # Output in the expected format for parsing by the application
-        $DownloadUrl = if ($LatestRelease.DownloadUrl) { $LatestRelease.DownloadUrl } else { "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/releases/latest" }
+        $DownloadUrl = if ($LatestRelease.DownloadUrl) { $LatestRelease.DownloadUrl } else { "https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl/releases/latest" }
         Write-Output "UPDATE_AVAILABLE: $($LatestRelease.Version) $DownloadUrl"
         
         if ($CheckOnly -eq $false) {

@@ -97,21 +97,17 @@ def _check_prerequisites(check_token=True, check_client_id=True):
     return not error
 
 def init_command(args):
-    """
-    Handles the 'init' command.
-    Checks existing credentials, performs OAuth device flow if necessary,
-    and saves the access token. Verifies the final configuration.
-    """
+    """Authenticate the public desktop client and verify API access."""
     print(f"{Fore.CYAN}=== Media Player Scrobbler for SIMKL Initialization ==={Style.RESET_ALL}")
     env_path = get_env_file_path()
     print(f"Access token file: {env_path}")
     creds = get_credentials()
     client_id = creds.get("client_id")
     access_token = creds.get("access_token")
-    if not client_id or not creds.get("client_secret"):
-        print(f"{Fore.RED}ERROR: Client ID or Secret not found. Please reinstall the application.{Style.RESET_ALL}", file=sys.stderr)
+    if not client_id:
+        print(f"{Fore.RED}ERROR: Client ID not found. Please reinstall the application.{Style.RESET_ALL}", file=sys.stderr)
         return 1
-    print(f"{Fore.GREEN}✓ Client ID/Secret loaded.{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}✓ Client ID loaded.{Style.RESET_ALL}")
     if access_token:
         print(f"{Fore.GREEN}✓ Access Token found. Skipping authentication.{Style.RESET_ALL}")
     else:
@@ -121,20 +117,18 @@ def init_command(args):
             print(f"{Fore.RED}ERROR: Authentication failed or was cancelled.{Style.RESET_ALL}", file=sys.stderr)
             return 1
         print(f"{Fore.GREEN}✓ Access token saved successfully.{Style.RESET_ALL}")
-        access_token = new_access_token # Use the newly obtained token
+        access_token = new_access_token
 
-    print(f"Verifying application configuration by checking API access...")
-    # Use get_user_settings for a lightweight verification check
+    print("Verifying application configuration by checking API access...")
     user_settings = get_user_settings(client_id, access_token)
     if not user_settings:
         print(f"{Fore.RED}ERROR: Configuration verification failed. Could not connect to Simkl API with the current credentials.{Style.RESET_ALL}", file=sys.stderr)
         print(f"{Fore.YELLOW}Hint: Check your internet connection, Simkl API status, or try re-initializing ('simkl-mps init').{Style.RESET_ALL}")
         print(f"{Fore.YELLOW}Log file: {APP_DATA_DIR / 'simkl_mps.log'}{Style.RESET_ALL}")
         return 1
-    else:
-        user_id = user_settings.get('user_id', 'N/A')
-        print(f"{Fore.GREEN}✓ API connection verified successfully (User ID: {user_id}).{Style.RESET_ALL}")
 
+    user_id = user_settings.get('user_id', 'N/A')
+    print(f"{Fore.GREEN}✓ API connection verified successfully (User ID: {user_id}).{Style.RESET_ALL}")
     print(f"{Fore.GREEN}Initialization Complete!{Style.RESET_ALL}")
     print(f"To start monitoring and scrobbling, run: {Fore.WHITE}simkl-mps start{Style.RESET_ALL}")
     return 0
@@ -655,7 +649,7 @@ def main():
         if sys.platform == 'win32':
             try:
                 import winreg
-                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\kavin\Media Player Scrobbler for SIMKL") as key:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\roko-tech\Media Player Scrobbler for SIMKL") as key:
                     check_updates = winreg.QueryValueEx(key, "CheckUpdates")[0]
                     if check_updates == 1:
                         logger.info("Auto-update check enabled, checking for updates...")

@@ -166,6 +166,49 @@ body {
     flex-direction: column;
 }
 
+.privacy-notice {
+    margin: 0 0 1rem;
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius-md);
+    color: var(--text-secondary);
+    background: var(--card-bg);
+    font-size: 0.82rem;
+    line-height: 1.45;
+}
+
+.ph-duotone {
+    font-style: normal;
+}
+
+.ph-popcorn::before { content: "▣"; }
+.ph-moon::before { content: "☾"; }
+.ph-sun::before { content: "☀"; }
+.ph-list::before { content: "☰"; }
+.ph-grid-four::before { content: "▦"; }
+.ph-chart-pie-slice::before { content: "◔"; }
+.ph-magnifying-glass::before { content: "⌕"; }
+.ph-caret-left::before { content: "‹"; }
+.ph-caret-right::before { content: "›"; }
+.ph-x::before { content: "×"; }
+.ph-calendar::before,
+.ph-calendar-check::before { content: "◫"; }
+.ph-clock::before { content: "◷"; }
+.ph-file::before { content: "▤"; }
+.ph-folder::before,
+.ph-folder-open::before { content: "▱"; }
+.ph-film-slate::before,
+.ph-film-strip::before { content: "▰"; }
+.ph-monitor::before { content: "▣"; }
+.ph-play-circle::before { content: "▷"; }
+.ph-projector-screen::before { content: "▭"; }
+.ph-star::before { content: "★"; }
+.ph-television::before,
+.ph-television-simple::before { content: "▣"; }
+.ph-arrow-counter-clockwise::before { content: "↻"; }
+.ph-github-logo::before,
+.ph-globe::before { content: "↗"; }
+
 /* Scrollbar styling */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }

@@ -11,9 +11,6 @@ from pathlib import Path
 import guessit
 import babelfish # Added import
 import os
-import time
-import subprocess
-import shutil
 
 # Get the directory containing this spec file
 spec_dir = Path(SPECPATH)
@@ -21,62 +18,6 @@ spec_dir = Path(SPECPATH)
 assets_path = spec_dir / 'simkl_mps' / 'assets'
 
 assets_dest = 'simkl_mps/assets'
-
-# Add pre-build cleanup to handle locked files
-def cleanup_build_artifacts():
-    """Attempt to clean up previous build artifacts that might be locked"""
-    print("Performing pre-build cleanup...")
-    dist_dir = os.path.join(spec_dir, 'dist')
-    
-    try:
-        # Try to terminate any running instances that might lock files
-        # Windows-specific process termination
-        try:
-            subprocess.run(['taskkill', '/F', '/IM', 'MPS for Simkl.exe'], 
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(['taskkill', '/F', '/IM', 'MPSS.exe'], 
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            # Give Windows time to release file handles
-            time.sleep(1)
-        except Exception as e:
-            print(f"Warning: Could not terminate processes: {e}")
-        
-        # Check for locked executables and handle them
-        problematic_files = [
-            os.path.join(dist_dir, 'MPS for Simkl.exe'),
-            os.path.join(dist_dir, 'MPSS.exe')
-        ]
-        
-        for file_path in problematic_files:
-            if os.path.exists(file_path):
-                try:
-                    # First try: Normal deletion
-                    os.remove(file_path)
-                    print(f"Successfully removed {file_path}")
-                except PermissionError:
-                    # Second try: Rename then delete
-                    try:
-                        temp_name = file_path + ".old"
-                        os.rename(file_path, temp_name)
-                        os.remove(temp_name)
-                        print(f"Renamed and removed {file_path}")
-                    except Exception as e:
-                        print(f"Warning: Could not remove {file_path}: {e}")
-                        # Final attempt - create new build directory
-                        if os.path.dirname(file_path) == dist_dir:
-                            new_dist = dist_dir + "_new"
-                            if os.path.exists(new_dist):
-                                shutil.rmtree(new_dist, ignore_errors=True)
-                            os.makedirs(new_dist, exist_ok=True)
-                            os.environ['DISTPATH'] = new_dist
-                            print(f"Using alternative dist directory: {new_dist}")
-                except Exception as e:
-                    print(f"Warning: Could not remove {file_path}: {e}")
-    except Exception as e:
-        print(f"Pre-build cleanup warning: {e}")
-
-# Run cleanup before build starts
-cleanup_build_artifacts()
 
 # --- Find guessit data path ---
 try:
