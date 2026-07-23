@@ -11,6 +11,7 @@ import logging
 import pathlib
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -59,7 +60,9 @@ class BacklogCleaner:
                     updated_at TEXT NOT NULL,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     last_attempt_timestamp REAL,
-                    last_error TEXT
+                    last_error TEXT,
+                    claim_owner TEXT,
+                    claim_expires_at REAL
                 );
 
                 CREATE TABLE IF NOT EXISTS provider_outcomes (
@@ -86,6 +89,20 @@ class BacklogCleaner:
                     ON provider_outcomes(event_id, outcome_id);
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(completion_events)"
+                ).fetchall()
+            }
+            if "claim_owner" not in columns:
+                connection.execute(
+                    "ALTER TABLE completion_events ADD COLUMN claim_owner TEXT"
+                )
+            if "claim_expires_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE completion_events ADD COLUMN claim_expires_at REAL"
+                )
 
     def _legacy_data(self):
         if not self.backlog_file.exists():
@@ -367,6 +384,56 @@ class BacklogCleaner:
                 logger.error("Could not update completion event %s: %s", event_id, exc)
                 return False
 
+    def claim_event(self, event_id, owner, lease_seconds=600):
+        """Atomically lease one pending event to a delivery worker."""
+        owner = str(owner)
+        now = time.time()
+        expires_at = now + max(1, float(lease_seconds))
+        with self._lock:
+            try:
+                with self._connect() as connection:
+                    cursor = connection.execute(
+                        """
+                        UPDATE completion_events
+                        SET claim_owner = ?, claim_expires_at = ?
+                        WHERE event_id = ?
+                          AND state = 'pending'
+                          AND (
+                              claim_owner IS NULL
+                              OR claim_expires_at IS NULL
+                              OR claim_expires_at <= ?
+                              OR claim_owner = ?
+                          )
+                        """,
+                        (owner, expires_at, str(event_id), now, owner),
+                    )
+                    return cursor.rowcount == 1
+            except (sqlite3.Error, TypeError, ValueError) as exc:
+                logger.error("Could not claim completion event %s: %s", event_id, exc)
+                return False
+
+    def release_event_claim(self, event_id, owner):
+        """Release a delivery lease only when it is still owned by this worker."""
+        with self._lock:
+            try:
+                with self._connect() as connection:
+                    cursor = connection.execute(
+                        """
+                        UPDATE completion_events
+                        SET claim_owner = NULL, claim_expires_at = NULL
+                        WHERE event_id = ? AND claim_owner = ?
+                        """,
+                        (str(event_id), str(owner)),
+                    )
+                    return cursor.rowcount == 1
+            except sqlite3.Error as exc:
+                logger.error(
+                    "Could not release completion event %s: %s",
+                    event_id,
+                    exc,
+                )
+                return False
+
     def record_outcome(
         self,
         event_id,
@@ -428,6 +495,60 @@ class BacklogCleaner:
         if error is not None:
             updates["last_error"] = str(error)
         return self.update_item(event_id, updates)
+
+    def requeue_unauthorized(self):
+        """Requeue failed events blocked by the most recent Simkl authorization outcome."""
+        with self._lock:
+            try:
+                with self._connect() as connection:
+                    rows = connection.execute(
+                        """
+                        SELECT event_id, payload_json
+                        FROM completion_events
+                        WHERE state = 'failed'
+                          AND (
+                              SELECT status
+                              FROM provider_outcomes
+                              WHERE provider_outcomes.event_id = completion_events.event_id
+                                AND provider = 'simkl'
+                              ORDER BY outcome_id DESC
+                              LIMIT 1
+                          ) = 'unauthorized'
+                        ORDER BY created_at, event_id
+                        """
+                    ).fetchall()
+                    now = self._now()
+                    event_ids = []
+                    for row in rows:
+                        payload = json.loads(row["payload_json"])
+                        payload.update(
+                            {
+                                "delivery_state": "pending",
+                                "attempt_count": 0,
+                                "last_attempt_timestamp": None,
+                                "last_error": None,
+                            }
+                        )
+                        connection.execute(
+                            """
+                            UPDATE completion_events
+                            SET payload_json = ?, state = 'pending', updated_at = ?,
+                                attempt_count = 0, last_attempt_timestamp = NULL,
+                                last_error = NULL, claim_owner = NULL,
+                                claim_expires_at = NULL
+                            WHERE event_id = ?
+                            """,
+                            (
+                                json.dumps(payload, ensure_ascii=False),
+                                now,
+                                row["event_id"],
+                            ),
+                        )
+                        event_ids.append(row["event_id"])
+                return event_ids
+            except (sqlite3.Error, TypeError, ValueError) as exc:
+                logger.error("Could not requeue unauthorized completion events: %s", exc)
+                return []
 
     def clear(self):
         """Delete pending events only; delivered audit history is retained."""

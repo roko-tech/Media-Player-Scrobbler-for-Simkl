@@ -26,7 +26,9 @@ from tkinter import simpledialog, messagebox
 # Import Base Class and common functions/constants
 from simkl_mps.tray_base import TrayAppBase, get_simkl_scrobbler
 from simkl_mps.config_manager import get_setting, DEFAULT_THRESHOLD # Keep for menu state check
+from simkl_mps.credentials import bootstrap_credentials
 from simkl_mps.main import APP_DATA_DIR # Keep for log/config paths
+from simkl_mps.runtime_lock import RuntimeInstanceLock, retain_failed_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -594,7 +596,7 @@ class TrayAppWin(TrayAppBase):
                 parent.focus_force()
             return messagebox.showinfo(str(title), str(message), parent=parent)
 
-        self._run_on_tk_thread(_dialog)
+        return bool(self._run_on_tk_thread(_dialog, default=False))
 
     def _show_confirmation_dialog(self, title, message):
         """Windows override: show Yes/No confirmation via Tk thread."""
@@ -949,13 +951,13 @@ Tips:
         """Exit the pystray application"""
         logger.info("Exiting application from tray")
         self._exit_requested = True
-        try:
-            if self.monitoring_active:
-                self.stop_monitoring()
-        finally:
-            if self.tray_icon:
-                self.tray_icon.stop()
-        return 0
+        if self.monitoring_active and self.stop_monitoring() is False:
+            self._exit_requested = False
+            logger.error("Tray exit aborted because monitoring workers are still alive.")
+            return False
+        if self.tray_icon:
+            self.tray_icon.stop()
+        return True
 
     def _setup_auto_update_if_needed(self):
         """Set up auto-updates if this is the first run"""
@@ -1043,30 +1045,75 @@ Tips:
             import winreg
 
             registry_path = r"Software\roko-tech\Media Player Scrobbler for SIMKL"
-            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, registry_path) as key:
-                try:
-                    completed = int(winreg.QueryValueEx(key, "FirstRun")[0])
-                except FileNotFoundError:
-                    completed = 0
-                self.is_first_run = completed == 0
-                if self.is_first_run:
-                    winreg.SetValueEx(key, "FirstRun", 0, winreg.REG_DWORD, 1)
+            try:
+                key_context = winreg.OpenKey(winreg.HKEY_CURRENT_USER, registry_path)
+            except FileNotFoundError:
+                key_context = None
+            if key_context is None:
+                completed = 0
+            else:
+                with key_context as key:
+                    try:
+                        completed = int(winreg.QueryValueEx(key, "FirstRun")[0])
+                    except FileNotFoundError:
+                        completed = 0
+            self.is_first_run = completed == 0
             logger.debug("First run check result: %s", self.is_first_run)
         except Exception as exc:
             logger.error("Unexpected error in first run check: %s", exc)
             self.is_first_run = False  # Default to not showing the notification on error
 
-def run_tray_app():
-    """Run the Windows tray application"""
+    def _mark_first_run_complete(self):
+        if sys.platform != "win32":
+            return False
+        try:
+            import winreg
+
+            registry_path = r"Software\roko-tech\Media Player Scrobbler for SIMKL"
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, registry_path) as key:
+                try:
+                    winreg.SetValueEx(key, "FirstRun", 0, winreg.REG_DWORD, 1)
+                except OSError as exc:
+                    logger.error("Could not persist first-run completion: %s", exc)
+                    return False
+            return True
+        except Exception as exc:
+            logger.error("Could not persist first-run completion: %s", exc)
+            return False
+
+def _run_owned_tray_app():
+    """Run the Windows tray application after data-directory ownership is held."""
     if not _acquire_single_instance():
         logger.warning("Another MPS tray instance is already running; exiting duplicate launch.")
-        return 0
+        return 0, None
+    app = None
     try:
         app = TrayAppWin()
         app.run()
+        if app.scrobbler and app.scrobbler.stop() is False:
+            logger.critical(
+                "Tray loop ended while application workers were still alive."
+            )
+            return 1, app.scrobbler
+        return 0, None
     except Exception as e:
         # Log the full traceback for critical startup errors
         logger.error(f"Critical error preventing tray app startup: {type(e).__name__} - {e}", exc_info=True)
+        previous_runtime = getattr(app, "scrobbler", None)
+        if previous_runtime is not None:
+            try:
+                if previous_runtime.stop() is False:
+                    logger.critical(
+                        "Console fallback suppressed because the tray runtime "
+                        "did not stop."
+                    )
+                    return 1, previous_runtime
+            except Exception:
+                logger.exception(
+                    "Console fallback suppressed because tray runtime cleanup failed."
+                )
+                return 1, previous_runtime
+
         print(f"Failed to start in tray mode: {e}")
         print("Falling back to console mode.")
         
@@ -1074,17 +1121,74 @@ def run_tray_app():
         from simkl_mps.main import SimklScrobbler
         
         scrobbler = SimklScrobbler()
-        if scrobbler.initialize():
-            print("Scrobbler initialized. Press Ctrl+C to exit.")
-            if scrobbler.start():
-                try:
-                    while scrobbler.running:
-                        time.sleep(1)
-                except KeyboardInterrupt:
-                    scrobbler.stop()
-                    print("Stopped monitoring.")
+        if not scrobbler.initialize():
+            return 1, None
+        print("Scrobbler initialized. Press Ctrl+C to exit.")
+        try:
+            fallback_started = scrobbler.start()
+        except BaseException:
+            try:
+                if scrobbler.stop() is False:
+                    return 1, scrobbler
+            except BaseException:
+                return 1, scrobbler
+            raise
+        if not fallback_started:
+            if scrobbler.stop() is False:
+                return 1, scrobbler
+            return 1, None
+        try:
+            while scrobbler.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        except BaseException:
+            try:
+                if scrobbler.stop() is False:
+                    return 1, scrobbler
+            except BaseException:
+                return 1, scrobbler
+            raise
+        if scrobbler.stop() is False:
+            return 1, scrobbler
+        print("Stopped monitoring.")
+        return 0, None
+    except BaseException:
+        previous_runtime = getattr(app, "scrobbler", None)
+        if previous_runtime is not None:
+            try:
+                if previous_runtime.stop() is False:
+                    logger.critical(
+                        "Tray interruption left a live worker; fallback is suppressed."
+                    )
+                    return 1, previous_runtime
+            except BaseException:
+                logger.exception(
+                    "Tray interruption cleanup raised while stopping workers."
+                )
+                return 1, previous_runtime
+        raise
     finally:
         _release_single_instance()
+
+
+def run_tray_app():
+    """Run one Windows tray runtime for this data directory."""
+    runtime_lock = RuntimeInstanceLock(APP_DATA_DIR)
+    if not runtime_lock.acquire():
+        logger.warning("Another simkl-mps runtime is already running; exiting duplicate launch.")
+        return 0
+    ownership_transferred = False
+    try:
+        bootstrap_credentials()
+        exit_code, failed_runtime = _run_owned_tray_app()
+        if failed_runtime is not None:
+            retain_failed_runtime(failed_runtime, runtime_lock)
+            ownership_transferred = True
+        return exit_code
+    finally:
+        if not ownership_transferred:
+            runtime_lock.release()
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, 

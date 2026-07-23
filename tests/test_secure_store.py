@@ -1,11 +1,76 @@
 import json
 import os
 import stat
+import subprocess
+import sys
 
 import pytest
 
 from simkl_mps import credentials, simkl_api, trakt_sync
-from simkl_mps.secure_store import is_protected, protect_secret, unprotect_secret
+from simkl_mps.secure_store import (
+    SecretProtectionError,
+    is_protected,
+    protect_secret,
+    unprotect_secret,
+)
+
+
+def test_importing_credentials_does_not_run_stateful_migration():
+    code = """
+import simkl_mps.migration as migration
+def fail():
+    raise AssertionError("credential import triggered migration")
+migration.perform_full_migration = fail
+import simkl_mps.credentials
+"""
+
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_credential_bootstrap_is_explicit_and_runs_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(credentials, "_BOOTSTRAP_COMPLETE", False)
+    monkeypatch.setattr(
+        credentials,
+        "perform_full_migration",
+        lambda: calls.append("migration"),
+    )
+
+    assert credentials.bootstrap_credentials() is True
+    assert credentials.bootstrap_credentials() is True
+    assert calls == ["migration"]
+
+
+def test_unreadable_protected_secret_degrades_to_unauthenticated(
+    tmp_path, monkeypatch, caplog
+):
+    env_file = tmp_path / ".simkl_mps.env"
+    env_file.write_text(
+        "SIMKL_CLIENT_ID=public-id\n"
+        "SIMKL_CLIENT_SECRET=dpapi:unreadable-secret\n"
+        "SIMKL_ACCESS_TOKEN=dpapi:unreadable-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(credentials, "ENV_FILE_PATH", env_file)
+    monkeypatch.setattr(credentials, "SIMKL_CLIENT_ID", "")
+    monkeypatch.setattr(credentials, "SIMKL_CLIENT_SECRET", "")
+    monkeypatch.setattr(credentials, "DEV_CREDS_PATH", tmp_path / "missing.env")
+    monkeypatch.delenv("SIMKL_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SIMKL_CLIENT_SECRET", raising=False)
+
+    def unreadable(_value):
+        raise SecretProtectionError("test-only decryption failure")
+
+    monkeypatch.setattr(credentials, "unprotect_secret", unreadable)
+
+    result = credentials.get_credentials()
+
+    assert result["client_id"] == "public-id"
+    assert result["client_secret"] is None
+    assert result["access_token"] is None
+    assert "treating it as unavailable until re-authentication" in caplog.text
+    assert "unreadable-secret" not in caplog.text
+    assert "unreadable-token" not in caplog.text
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows DPAPI only")

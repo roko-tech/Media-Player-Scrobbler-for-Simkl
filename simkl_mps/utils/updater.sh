@@ -25,7 +25,7 @@ elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
     CONFIG_DIR="${HOME}/.local/share/kavin/simkl-mps"
     PACKAGE_EXTRAS="linux"
 else
-    echo "Unsupported operating system: $OSTYPE"
+    echo "Unsupported operating system: $OSTYPE" >&2
     exit 1
 fi
 
@@ -34,15 +34,15 @@ LOG_FILE="${CONFIG_DIR}/updater.log"
 # Command line arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --Silent|-s)
+        --Silent|--silent|-s)
             SILENT=true
             shift
             ;;
-        --CheckOnly)
+        --CheckOnly|--check-only)
             CHECK_ONLY=true
             shift
             ;;
-        --Force|-f)
+        --Force|--force|-f)
             FORCE=true
             shift
             ;;
@@ -57,7 +57,7 @@ mkdir -p "${CONFIG_DIR}"
 
 # Logging function
 log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${LOG_FILE}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${LOG_FILE}" >&2
 }
 
 log_message "========== Update Check Started =========="
@@ -465,8 +465,8 @@ check_for_updates() {
             # Just notify about the update
             if [ "$SILENT" != "true" ]; then
                 show_notification "Update Available" "Version $latest_version is available. Current version: $installed_version"
-                echo "UPDATE_AVAILABLE: $latest_version https://pypi.org/project/simkl-mps/$latest_version/"
             fi
+            echo "UPDATE_AVAILABLE: $latest_version https://pypi.org/project/simkl-mps/$latest_version/"
             return 0
         fi
         
@@ -491,6 +491,8 @@ check_for_updates() {
         log_message "No update available. Current version ($installed_version) is the latest."
         if [ "$SILENT" != "true" ] && [ "$CHECK_ONLY" = "true" ]; then
             show_notification "No Updates Available" "You are already running the latest version ($installed_version)."
+        fi
+        if [ "$CHECK_ONLY" = "true" ]; then
             echo "NO_UPDATE: $installed_version"
         fi
         return 0

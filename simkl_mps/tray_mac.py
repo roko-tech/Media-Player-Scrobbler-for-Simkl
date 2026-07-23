@@ -16,7 +16,9 @@ import pystray
 from plyer import notification
 
 from simkl_mps.tray_base import TrayAppBase, get_simkl_scrobbler, logger
-from simkl_mps.config_manager import get_setting, DEFAULT_THRESHOLD # Import for threshold menu
+from simkl_mps.config_manager import get_app_data_dir, get_setting, DEFAULT_THRESHOLD # Import for threshold menu
+from simkl_mps.credentials import bootstrap_credentials
+from simkl_mps.runtime_lock import RuntimeInstanceLock, retain_failed_runtime
 
 class TrayAppMac(TrayAppBase):
     """macOS system tray application for simkl-mps"""
@@ -109,15 +111,20 @@ class TrayAppMac(TrayAppBase):
                 self.is_first_run = False
             else:
                 self.is_first_run = True
-                # Create the marker file for next time
-                try:
-                    first_run_marker.touch()
-                except Exception as e:
-                    logger.warning(f"Error creating first run marker file: {e}")
-            
+
         except Exception as e:
             logger.error(f"Unexpected error in first run check: {e}")
             self.is_first_run = False  # Default to not showing the notification on error
+
+    def _mark_first_run_complete(self):
+        try:
+            first_run_marker = self.config_path.parent / ".first_run_complete"
+            first_run_marker.parent.mkdir(parents=True, exist_ok=True)
+            first_run_marker.touch()
+            return True
+        except OSError as exc:
+            logger.warning("Error creating first run marker file: %s", exc)
+            return False
 
     def show_notification(self, title, message):
         """Show a desktop notification on macOS"""
@@ -189,11 +196,12 @@ class TrayAppMac(TrayAppBase):
     def exit_app(self, _=None):
         """Exit the application"""
         logger.info("Exiting application from tray")
-        if self.monitoring_active:
-            self.stop_monitoring()
+        if self.monitoring_active and self.stop_monitoring() is False:
+            logger.error("Tray exit aborted because monitoring workers are still alive.")
+            return False
         if self.tray_icon:
             self.tray_icon.stop()
-        return 0
+        return True
 
     def run(self):
         """Run the tray application"""
@@ -500,13 +508,35 @@ class TrayAppMac(TrayAppBase):
             self.show_notification("Error", f"Could not edit directory filters: {e}")
             return None
 
-def run_tray_app():
-    """Run the application in tray mode"""
+def _run_owned_tray_app():
+    """Run the application after data-directory ownership is held."""
+    app = None
     try:
         app = TrayAppMac()
         app.run()
+        if app.scrobbler and app.scrobbler.stop() is False:
+            logger.critical(
+                "Tray loop ended while application workers were still alive."
+            )
+            return 1, app.scrobbler
+        return 0, None
     except Exception as e:
         logger.error(f"Critical error in tray app: {e}")
+        previous_runtime = getattr(app, "scrobbler", None)
+        if previous_runtime is not None:
+            try:
+                if previous_runtime.stop() is False:
+                    logger.critical(
+                        "Console fallback suppressed because the tray runtime "
+                        "did not stop."
+                    )
+                    return 1, previous_runtime
+            except Exception:
+                logger.exception(
+                    "Console fallback suppressed because tray runtime cleanup failed."
+                )
+                return 1, previous_runtime
+
         print(f"Failed to start in tray mode: {e}")
         print("Falling back to console mode.")
         
@@ -514,12 +544,69 @@ def run_tray_app():
         from simkl_mps.main import SimklScrobbler
         
         scrobbler = SimklScrobbler()
-        if scrobbler.initialize():
-            print("Scrobbler initialized. Press Ctrl+C to exit.")
-            if scrobbler.start():
-                try:
-                    while scrobbler.running:
-                        time.sleep(1)
-                except KeyboardInterrupt:
-                    scrobbler.stop()
-                    print("Stopped monitoring.")
+        if not scrobbler.initialize():
+            return 1, None
+        print("Scrobbler initialized. Press Ctrl+C to exit.")
+        try:
+            fallback_started = scrobbler.start()
+        except BaseException:
+            try:
+                if scrobbler.stop() is False:
+                    return 1, scrobbler
+            except BaseException:
+                return 1, scrobbler
+            raise
+        if not fallback_started:
+            if scrobbler.stop() is False:
+                return 1, scrobbler
+            return 1, None
+        try:
+            while scrobbler.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        except BaseException:
+            try:
+                if scrobbler.stop() is False:
+                    return 1, scrobbler
+            except BaseException:
+                return 1, scrobbler
+            raise
+        if scrobbler.stop() is False:
+            return 1, scrobbler
+        print("Stopped monitoring.")
+        return 0, None
+    except BaseException:
+        previous_runtime = getattr(app, "scrobbler", None)
+        if previous_runtime is not None:
+            try:
+                if previous_runtime.stop() is False:
+                    logger.critical(
+                        "Tray interruption left a live worker; fallback is suppressed."
+                    )
+                    return 1, previous_runtime
+            except BaseException:
+                logger.exception(
+                    "Tray interruption cleanup raised while stopping workers."
+                )
+                return 1, previous_runtime
+        raise
+
+
+def run_tray_app():
+    """Run one macOS tray runtime for this data directory."""
+    runtime_lock = RuntimeInstanceLock(get_app_data_dir())
+    if not runtime_lock.acquire():
+        logger.warning("Another simkl-mps runtime is already running; exiting duplicate launch.")
+        return 0
+    ownership_transferred = False
+    try:
+        bootstrap_credentials()
+        exit_code, failed_runtime = _run_owned_tray_app()
+        if failed_runtime is not None:
+            retain_failed_runtime(failed_runtime, runtime_lock)
+            ownership_transferred = True
+        return exit_code
+    finally:
+        if not ownership_transferred:
+            runtime_lock.release()

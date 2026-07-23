@@ -34,6 +34,8 @@ class Monitor:
         self.running = False
         self.monitor_thread = None
         self._lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
+        self._stop_event = None
         self.scrobbler = MediaScrobbler( # Updated instantiation
             app_data_dir=self.app_data_dir,
             client_id=self.client_id,
@@ -58,35 +60,48 @@ class Monitor:
         self.search_callback = callback
 
     def start(self):
-        """Start monitoring"""
-        if self.running:
-            logger.warning("Monitor already running")
-            return False
+        """Start one monitor generation."""
+        with self._lifecycle_lock:
+            if self.monitor_thread and self.monitor_thread.is_alive():
+                logger.warning("Monitor already running")
+                return False
 
-        self.running = True
-        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.monitor_thread.start()
+            stop_event = threading.Event()
+            self._stop_event = stop_event
+            self.running = True
+            self.monitor_thread = threading.Thread(
+                target=self._monitor_loop,
+                args=(stop_event,),
+                daemon=True,
+            )
+            self.monitor_thread.start()
+
         logger.info("Monitor started")
         return True
 
     def stop(self):
-        """Stop monitoring"""
-        if not self.running:
-            logger.warning("Monitor not running")
-            return False
+        """Stop the active monitor generation before another can start."""
+        with self._lifecycle_lock:
+            thread = self.monitor_thread
+            if not thread or not thread.is_alive():
+                self.running = False
+                logger.warning("Monitor not running")
+                return False
+            self.running = False
+            stop_event = self._stop_event
+            if stop_event:
+                stop_event.set()
 
-        self.running = False
-        
-        if self.monitor_thread and self.monitor_thread.is_alive():
+        if thread is not threading.current_thread():
             try:
-                self.monitor_thread.join(timeout=2)
+                thread.join(timeout=2)
             except RuntimeError:
                 logger.warning("Could not join monitor thread")
-        
-        with self._lock:
-            if self.scrobbler.currently_tracking:
-                self.scrobbler.stop_tracking()
-        
+                return False
+            if thread.is_alive():
+                logger.error("Monitor thread did not stop; restart remains blocked")
+                return False
+
         logger.info("Monitor stopped")
         return True
 
@@ -179,12 +194,12 @@ class Monitor:
 
         return min(observations, key=sort_key)
 
-    def _monitor_loop(self):
-        """Main monitoring loop."""
+    def _monitor_loop(self, stop_event):
+        """Main monitoring loop for one generation."""
         logger.info("Media monitoring service initialized and running")
         last_processed_titles = {}
 
-        while self.running:
+        while not stop_event.is_set():
             try:
                 all_windows = get_all_windows_info()
                 self._debug_cycles += 1
@@ -271,7 +286,7 @@ class Monitor:
                     self.scrobbler.request_backlog_sync()
                     self.last_backlog_check = current_time
 
-                time.sleep(self.poll_interval)
+                stop_event.wait(self.poll_interval)
 
             except Exception as exc:
                 logger.error(
@@ -279,8 +294,14 @@ class Monitor:
                     exc,
                     exc_info=True,
                 )
-                time.sleep(max(5, self.poll_interval))
+                stop_event.wait(max(5, self.poll_interval))
 
+        with self._lock:
+            if self.scrobbler.currently_tracking:
+                self.scrobbler.stop_tracking()
+        with self._lifecycle_lock:
+            if self._stop_event is stop_event:
+                self.running = False
         logger.info("Media monitoring service stopped")
 
     def set_credentials(self, client_id, access_token, account_type=None, settings_all=None):

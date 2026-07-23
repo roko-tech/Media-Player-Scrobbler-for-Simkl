@@ -6,6 +6,9 @@ on:
       version:
         required: true
         type: string
+      source_sha:
+        required: true
+        type: string
     secrets:
       RELEASE_TOKEN:
         required: true
@@ -21,6 +24,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha }}
 
       - name: Download Build Artifacts
         uses: actions/download-artifact@v8
@@ -42,8 +46,8 @@ jobs:
             exit 1
           fi
           if [ -z "$BUILD_INFO_PATH" ]; then
-            echo "::warning::build_info.json not found in artifacts/build-info"
-            # Decide if this is fatal or not, for now just warn
+            echo "::error::build_info.json not found in artifacts/build-info"
+            exit 1
           fi
 
           echo "Found Installer: $INSTALLER_PATH"
@@ -54,12 +58,50 @@ jobs:
           echo "installer_filename=$(basename "$INSTALLER_PATH")" >> $GITHUB_OUTPUT
           echo "build_info_filename=$(basename "$BUILD_INFO_PATH")" >> $GITHUB_OUTPUT
 
+      - name: Verify immutable release source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          BUILD_INFO_PATH: ${{ steps.prep_paths.outputs.build_info_path }}
+        run: |
+          TAG_NAME="v$RELEASE_VERSION"
+          EXPECTED_REF="refs/tags/$TAG_NAME"
+
+          if [ "$GITHUB_REF" != "$EXPECTED_REF" ]; then
+            echo "::error::The signing workflow must run from $EXPECTED_REF, not $GITHUB_REF."
+            exit 1
+          fi
+
+          git fetch --force origin "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
+          TAG_SHA=$(git rev-parse "refs/tags/$TAG_NAME^{commit}")
+          CHECKED_OUT_SHA=$(git rev-parse HEAD)
+
+          if [ "$TAG_SHA" != "$SOURCE_SHA" ] || [ "$CHECKED_OUT_SHA" != "$SOURCE_SHA" ]; then
+            echo "::error::Tag, checkout, and requested source SHA do not match."
+            exit 1
+          fi
+
+          python - "$BUILD_INFO_PATH" "$SOURCE_SHA" <<'PY'
+          import json
+          import sys
+
+          build_info_path, expected_sha = sys.argv[1:]
+          with open(build_info_path, encoding="utf-8") as handle:
+              build_info = json.load(handle)
+          if build_info.get("git_commit") != expected_sha:
+              raise SystemExit(
+                  "build_info.json does not identify the verified release source SHA."
+              )
+          PY
+
+          echo "Verified release source $SOURCE_SHA for $TAG_NAME"
+
       - name: Calculate Specific Checksums
         id: calc_hashes
+        env:
+          INSTALLER_PATH: ${{ steps.prep_paths.outputs.installer_path }}
+          BUILD_INFO_PATH: ${{ steps.prep_paths.outputs.build_info_path }}
         run: |
-          INSTALLER_PATH="${{ steps.prep_paths.outputs.installer_path }}"
-          BUILD_INFO_PATH="${{ steps.prep_paths.outputs.build_info_path }}"
-
           echo "Calculating SHA256 for $INSTALLER_PATH..."
           EXE_HASH=$(sha256sum "$INSTALLER_PATH" | awk '{print $1}')
           echo "exe_hash=$EXE_HASH" >> $GITHUB_OUTPUT
@@ -79,8 +121,12 @@ jobs:
 
       - name: Sign Windows Installer with Cosign
         id: sign_installer
+        env:
+          INSTALLER_PATH: ${{ steps.prep_paths.outputs.installer_path }}
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          INSTALLER_PATH="${{ steps.prep_paths.outputs.installer_path }}"
+          CERT_IDENTITY="https://github.com/$GITHUB_REPOSITORY/.github/workflows/create-release.yml@refs/tags/v$RELEASE_VERSION"
+          CERT_ISSUER="https://token.actions.githubusercontent.com"
           echo "Signing $INSTALLER_PATH..."
           cosign sign-blob --yes "$INSTALLER_PATH" --output-signature "${INSTALLER_PATH}.sig" --bundle "${INSTALLER_PATH}.sigstore.bundle"
           if [ -f "${INSTALLER_PATH}.sig" ]; then
@@ -92,16 +138,23 @@ jobs:
           fi
           echo "Bundle created at ${INSTALLER_PATH}.sigstore.bundle"
           echo "bundle_path=${INSTALLER_PATH}.sigstore.bundle" >> $GITHUB_OUTPUT
+          cosign verify-blob \
+            --bundle "${INSTALLER_PATH}.sigstore.bundle" \
+            --certificate-identity "$CERT_IDENTITY" \
+            --certificate-oidc-issuer "$CERT_ISSUER" \
+            "$INSTALLER_PATH"
 
       - name: Prepare Verification Instructions (docs/verify.md)
+        env:
+          INSTALLER_FILENAME: ${{ steps.prep_paths.outputs.installer_filename }}
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
           mkdir -p docs # Ensure docs directory exists
 
           # Define variables for clarity
-          INSTALLER_FILENAME="${{ steps.prep_paths.outputs.installer_filename }}"
           INSTALLER_BUNDLE_FILENAME="${INSTALLER_FILENAME}.sigstore.bundle"
-          RELEASE_TAG="v${{ inputs.version }}"
-          REPO_URL="https://github.com/${{ github.repository }}"
+          RELEASE_TAG="v$RELEASE_VERSION"
+          REPO_URL="https://github.com/$GITHUB_REPOSITORY"
           RELEASE_URL="$REPO_URL/releases/tag/$RELEASE_TAG"
           # Identity should point to *this* workflow (create-release.yml) as it's doing the signing now
           CERT_IDENTITY="$REPO_URL/.github/workflows/create-release.yml@refs/tags/$RELEASE_TAG"
@@ -139,6 +192,8 @@ jobs:
           # Verify the Windows Installer signature (preferred, using bundle)
           cosign verify-blob \\
             --bundle "$INSTALLER_BUNDLE_FILENAME" \\
+            --certificate-identity "$CERT_IDENTITY" \\
+            --certificate-oidc-issuer "$CERT_ISSUER" \\
             "$INSTALLER_FILENAME"
 
           # Optional alternative (if a .sig file is provided in a future release)
@@ -151,7 +206,7 @@ jobs:
 
           If verification is successful, you will see a "Verified OK" message. This confirms the file was signed by the official release workflow (\`create-release.yml\`) for the tag \`$RELEASE_TAG\`. **Do not proceed if verification fails.**
 
-          *Note: The \`--certificate-identity\` points to this workflow (\`create-release.yml\`) and the specific release tag (\`$RELEASE_TAG\`) that signed the file.*
+          *Note: The \`--certificate-identity\` points to this workflow (\`create-release.yml\`) and the verified release tag (\`$RELEASE_TAG\`) that signed the file.*
 
           ## 4. Verify Checksums Manually
 
@@ -173,8 +228,8 @@ jobs:
 
           ## Build Provenance
 
-          This release incorporates artifacts built and verified by GitHub Actions workflow run #${{ github.run_number }} (ID: ${{ github.run_id }}).
-          View the release workflow log: $REPO_URL/actions/runs/${{ github.run_id }}
+          This release incorporates artifacts built and verified by GitHub Actions workflow run #$GITHUB_RUN_NUMBER (ID: $GITHUB_RUN_ID).
+          View the release workflow log: $REPO_URL/actions/runs/$GITHUB_RUN_ID
           EOF
 
           echo "Generated verification instructions: docs/verify.md"
@@ -189,37 +244,41 @@ jobs:
             sudo apt install gh
           )
 
-      - name: Create/Update Release and Upload Artifacts
+      - name: Assemble draft release and verify uploaded assets
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }} # Some tools might prefer GH_TOKEN
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          INSTALLER_PATH: ${{ steps.prep_paths.outputs.installer_path }}
+          INSTALLER_FILENAME: ${{ steps.prep_paths.outputs.installer_filename }}
+          INSTALLER_SIG_PATH: ${{ steps.sign_installer.outputs.signature_path }}
+          INSTALLER_BUNDLE_PATH: ${{ steps.sign_installer.outputs.bundle_path }}
+          BUILD_INFO_FILENAME: ${{ steps.prep_paths.outputs.build_info_filename }}
+          EXE_HASH: ${{ steps.calc_hashes.outputs.exe_hash }}
+          BUILD_INFO_HASH: ${{ steps.calc_hashes.outputs.build_info_hash }}
         run: |
-          VERSION="${{ inputs.version }}"
+          set -euo pipefail
+
+          VERSION="$RELEASE_VERSION"
           TAG_NAME="v$VERSION"
-          INSTALLER_PATH="${{ steps.prep_paths.outputs.installer_path }}"
-          INSTALLER_FILENAME="${{ steps.prep_paths.outputs.installer_filename }}"
-          INSTALLER_SIG_PATH="${{ steps.sign_installer.outputs.signature_path }}"
-          INSTALLER_BUNDLE_PATH="${{ steps.sign_installer.outputs.bundle_path }}"
-          BUILD_INFO_FILENAME="${{ steps.prep_paths.outputs.build_info_filename }}"
           VERIFY_DOC_PATH="docs/verify.md"
-          WORKFLOW_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          WORKFLOW_RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          VERIFICATION_BLOCK_FILE=$(mktemp)
+          EXISTING_BODY_FILE=$(mktemp)
+          UPDATED_BODY_FILE=$(mktemp)
 
-          echo "Release Tag: $TAG_NAME"
-          echo "Installer: $INSTALLER_PATH"
-          echo "Installer Sig: ${INSTALLER_SIG_PATH:-<not generated>}"
-          echo "Installer Bundle: $INSTALLER_BUNDLE_PATH"
-          echo "Build Info Filename: $BUILD_INFO_FILENAME"
-          echo "Verification Doc: $VERIFY_DOC_PATH"
+          cat > "$VERIFICATION_BLOCK_FILE" <<EOF
+          <!-- simkl-mps-verification-start -->
+          <!-- simkl-mps-source-sha:$SOURCE_SHA -->
 
-          # Construct the verification section for the release body
-          # Use filenames from prep_paths step and hashes from calc_hashes step
-          HASH_TABLE=$(cat <<EOF
+          **Source commit:** \`$SOURCE_SHA\`
+
           **Checksums:**
 
           | File                 | SHA256 Checksum                                  |
           |----------------------|--------------------------------------------------|
-          | \`$INSTALLER_FILENAME\` | \`${{ steps.calc_hashes.outputs.exe_hash }}\`    |
-          | \`$BUILD_INFO_FILENAME\` | \`${{ steps.calc_hashes.outputs.build_info_hash }}\`    |
+          | \`$INSTALLER_FILENAME\` | \`$EXE_HASH\`    |
+          | \`$BUILD_INFO_FILENAME\` | \`$BUILD_INFO_HASH\`    |
 
           **Build Info:**
           
@@ -227,48 +286,67 @@ jobs:
 
           **Verification:**
 
-          Please follow the instructions in the [Verification Guide](https://github.com/${{ github.repository }}/releases/download/$TAG_NAME/verify.md) to verify the signatures and checksums of the downloaded files.
-          EOF
-          )
+          Please follow the instructions in the [Verification Guide](https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG_NAME/verify.md) to verify the signatures and checksums of the downloaded files.
 
-          # Check if release already exists
+          <!-- simkl-mps-verification-end -->
+          EOF
+
           if gh release view "$TAG_NAME" --json id --jq .id &>/dev/null; then
             IS_DRAFT=$(gh release view "$TAG_NAME" --json isDraft --jq .isDraft)
             if [ "$IS_DRAFT" != "true" ]; then
               echo "::error::Release $TAG_NAME is already public; refusing to replace published assets."
               exit 1
             fi
-            echo "Draft release $TAG_NAME already exists. Updating notes and uploading artifacts."
-            EXISTING_BODY=$(gh release view "$TAG_NAME" --json body --jq .body)
-            # Simple strategy: Replace the whole body if it exists, otherwise use generated notes + hash table
-            # More sophisticated: Find a marker and replace only the verification section
-            # For now, let's append if the hash table isn't obviously there
-            if ! echo "$EXISTING_BODY" | grep -q "SHA256 Checksum"; then
-                echo "Appending verification info to existing notes..."
-                # Use printf for better control over newlines
-                NEW_BODY=$(printf "%s\n\n---\n\n%s" "$EXISTING_BODY" "$HASH_TABLE")
-                gh release edit "$TAG_NAME" --notes "$NEW_BODY"
-            else
-                echo "Verification table seems present. Consider manual review/update if needed."
-                # Potentially replace existing table here if needed
+
+            gh release view "$TAG_NAME" --json body --jq .body > "$EXISTING_BODY_FILE"
+            DRAFT_SOURCE_SHA=$(sed -n 's/^<!-- simkl-mps-source-sha:\([0-9a-f]\{40\}\) -->$/\1/p' "$EXISTING_BODY_FILE")
+            if [ -z "$DRAFT_SOURCE_SHA" ]; then
+              echo "::error::Existing draft $TAG_NAME has no trusted source-SHA marker; refusing to replace its assets."
+              exit 1
+            fi
+            if [ "$DRAFT_SOURCE_SHA" != "$SOURCE_SHA" ]; then
+              echo "::error::Existing draft $TAG_NAME belongs to $DRAFT_SOURCE_SHA, not $SOURCE_SHA."
+              exit 1
             fi
           else
             echo "Creating new release $TAG_NAME..."
-            # Create a draft release first to capture generated notes
             gh release create "$TAG_NAME" \
+              --verify-tag \
               --title "Release $VERSION" \
               --generate-notes \
+              --notes-file "$VERIFICATION_BLOCK_FILE" \
               --discussion-category "Releases" \
               --draft
-            # Get the body of the draft (which includes generated notes)
-            DRAFT_BODY=$(gh release view "$TAG_NAME" --json body --jq .body)
-            # Construct the final body for the new release
-            NEW_BODY=$(printf "%s\n\n---\n\n%s" "$DRAFT_BODY" "$HASH_TABLE")
-            echo "Updating draft release with full notes..."
-            gh release edit "$TAG_NAME" --notes "$NEW_BODY"
+            gh release view "$TAG_NAME" --json body --jq .body > "$EXISTING_BODY_FILE"
           fi
 
-          # Upload all required artifacts, overwriting if they exist
+          python - "$EXISTING_BODY_FILE" "$VERIFICATION_BLOCK_FILE" "$UPDATED_BODY_FILE" <<'PY'
+          import sys
+          from pathlib import Path
+
+          body_path, block_path, output_path = map(Path, sys.argv[1:])
+          body = body_path.read_text(encoding="utf-8").rstrip()
+          block = block_path.read_text(encoding="utf-8").strip()
+          start = "<!-- simkl-mps-verification-start -->"
+          end = "<!-- simkl-mps-verification-end -->"
+
+          has_start = start in body
+          has_end = end in body
+          if has_start != has_end:
+              raise SystemExit("Existing release notes contain an incomplete verification block.")
+          if has_start:
+              prefix, remainder = body.split(start, 1)
+              _, suffix = remainder.split(end, 1)
+              updated = prefix.rstrip() + "\n\n" + block + suffix
+          else:
+              separator = "\n\n---\n\n" if body else ""
+              updated = body + separator + block + "\n"
+          output_path.write_text(updated, encoding="utf-8")
+          PY
+
+          # Updating the complete body in one API call keeps the checksum block atomic.
+          gh release edit "$TAG_NAME" --notes-file "$UPDATED_BODY_FILE"
+
           echo "Uploading artifacts..."
           gh release upload "$TAG_NAME" "$INSTALLER_PATH" --clobber
           if [ -n "$INSTALLER_SIG_PATH" ] && [ -f "$INSTALLER_SIG_PATH" ]; then
@@ -278,4 +356,36 @@ jobs:
           fi
           gh release upload "$TAG_NAME" "$INSTALLER_BUNDLE_PATH" --clobber
           gh release upload "$TAG_NAME" "$VERIFY_DOC_PATH" --clobber
-          # Note: Not uploading the build_info.json file as requested
+
+          VERIFY_DIR=$(mktemp -d)
+          DOWNLOAD_ARGS=(
+            --dir "$VERIFY_DIR"
+            --pattern "$INSTALLER_FILENAME"
+            --pattern "$(basename "$INSTALLER_BUNDLE_PATH")"
+            --pattern "$(basename "$VERIFY_DOC_PATH")"
+          )
+          if [ -n "$INSTALLER_SIG_PATH" ] && [ -f "$INSTALLER_SIG_PATH" ]; then
+            DOWNLOAD_ARGS+=(--pattern "$(basename "$INSTALLER_SIG_PATH")")
+          fi
+          gh release download "$TAG_NAME" "${DOWNLOAD_ARGS[@]}"
+
+          verify_uploaded_asset() {
+            LOCAL_PATH="$1"
+            DOWNLOADED_PATH="$VERIFY_DIR/$(basename "$LOCAL_PATH")"
+            if [ ! -f "$DOWNLOADED_PATH" ]; then
+              echo "::error::Uploaded asset $(basename "$LOCAL_PATH") could not be downloaded."
+              exit 1
+            fi
+            if ! cmp --silent "$LOCAL_PATH" "$DOWNLOADED_PATH"; then
+              echo "::error::Uploaded asset $(basename "$LOCAL_PATH") differs from the verified local artifact."
+              exit 1
+            fi
+            echo "Verified uploaded asset: $(basename "$LOCAL_PATH")"
+          }
+
+          verify_uploaded_asset "$INSTALLER_PATH"
+          verify_uploaded_asset "$INSTALLER_BUNDLE_PATH"
+          verify_uploaded_asset "$VERIFY_DOC_PATH"
+          if [ -n "$INSTALLER_SIG_PATH" ] && [ -f "$INSTALLER_SIG_PATH" ]; then
+            verify_uploaded_asset "$INSTALLER_SIG_PATH"
+          fi

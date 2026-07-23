@@ -321,10 +321,11 @@ class WatchHistoryManager:
             logger.error(f"Error opening history page: {e}")
             return False
             
-    def _viewer_history(self):
+    def _viewer_history(self, history=None):
         """Return a viewer projection with local paths redacted by default."""
+        source_history = self.history if history is None else history
         if get_setting("viewer_include_file_paths", False):
-            return copy.deepcopy(self.history)
+            return copy.deepcopy(source_history)
 
         private_keys = {"file_path", "media_file_path", "original_filepath"}
 
@@ -339,35 +340,36 @@ class WatchHistoryManager:
                 return [redact(item) for item in value]
             return value
 
-        return redact(self.history)
+        return redact(source_history)
 
     def _update_history_data(self):
         """Atomically generate the offline viewer's redacted data projection."""
         try:
-            loaded_history = self._load_history()
-            self.history = loaded_history if isinstance(loaded_history, list) else []
-            viewer_dir = self.app_data_dir / "watch-history-viewer"
-            viewer_dir.mkdir(parents=True, exist_ok=True)
+            with self._lock:
+                loaded_history = self._load_history()
+                history_snapshot = loaded_history if isinstance(loaded_history, list) else []
+                projection = self._viewer_history(history_snapshot)
+                viewer_dir = self.app_data_dir / "watch-history-viewer"
+                viewer_dir.mkdir(parents=True, exist_ok=True)
 
-            projection = self._viewer_history()
-            history_json = json.dumps(
-                projection,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            )
-            data_file = viewer_dir / "data.js"
-            temp_file = data_file.with_suffix(data_file.suffix + ".tmp")
-            with open(temp_file, "w", encoding="utf-8") as handle:
-                handle.write("// Auto-generated local viewer data.\n")
-                handle.write(f"const HISTORY_DATA = {history_json};\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            temp_file.replace(data_file)
-            logger.info(
-                "Updated offline viewer projection with %s history entries (paths included: %s).",
-                len(projection),
-                bool(get_setting("viewer_include_file_paths", False)),
-            )
+                history_json = json.dumps(
+                    projection,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                data_file = viewer_dir / "data.js"
+                temp_file = data_file.with_suffix(data_file.suffix + ".tmp")
+                with open(temp_file, "w", encoding="utf-8") as handle:
+                    handle.write("// Auto-generated local viewer data.\n")
+                    handle.write(f"const HISTORY_DATA = {history_json};\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                temp_file.replace(data_file)
+                logger.info(
+                    "Updated offline viewer projection with %s history entries (paths included: %s).",
+                    len(projection),
+                    bool(get_setting("viewer_include_file_paths", False)),
+                )
         except Exception as exc:
             logger.error("Error updating history data: %s", exc, exc_info=True)
     
@@ -420,6 +422,26 @@ class WatchHistoryManager:
             history_entry["rewatch_count"] = 0
         return events
 
+
+    def _has_event_id(self, event_id):
+        """Return whether an immutable completion event is already projected."""
+        if not event_id:
+            return False
+        target = str(event_id)
+        for entry in self.history:
+            if str(entry.get("event_id") or "") == target:
+                return True
+            for event in entry.get("watch_events") or []:
+                if isinstance(event, dict) and str(event.get("event_id") or "") == target:
+                    return True
+            for episode in entry.get("episodes") or []:
+                if not isinstance(episode, dict):
+                    continue
+                for event in episode.get("watch_events") or []:
+                    if isinstance(event, dict) and str(event.get("event_id") or "") == target:
+                        return True
+        return False
+
     def _append_watch_event(self, history_entry, media_item, watched_at, media_file_path=None,
                             watched_progress=100, is_rewatch=False):
         events = self._ensure_watch_events(history_entry)
@@ -461,6 +483,11 @@ class WatchHistoryManager:
 
     def _add_entry_unlocked(self, media_item, media_file_path=None, watched_progress=100):
         """Add a new entry to watch history, or update existing show entries with new episodes"""
+        event_id = media_item.get("event_id")
+        if event_id and self._has_event_id(event_id):
+            logger.info("Completion event %s is already present in watch history.", event_id)
+            self._notify_saved()
+            return True
         watched_at = media_item.get("watched_at") or datetime.now().isoformat()
         
         # Check if we already have this item in the history

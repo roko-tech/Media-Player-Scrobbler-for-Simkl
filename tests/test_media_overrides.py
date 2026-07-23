@@ -1,3 +1,8 @@
+import json
+import os
+
+import pytest
+
 from simkl_mps.media_overrides import MediaOverrides
 from simkl_mps.media_scrobbler import MediaScrobbler
 
@@ -40,6 +45,43 @@ def test_override_persists_and_can_be_removed(tmp_path):
     assert reloaded.find(episode)["simkl_id"] == 123
     assert reloaded.remove_match(episode)["scope"] == "file"
     assert reloaded.find(episode) is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX paths are case-sensitive")
+def test_posix_case_distinct_paths_have_distinct_overrides(tmp_path):
+    upper = tmp_path / "Series" / "Episode.mkv"
+    lower = tmp_path / "series" / "episode.mkv"
+    overrides = MediaOverrides(tmp_path)
+    overrides.set("file", upper, 100)
+    overrides.set("file", lower, 200)
+
+    assert overrides.find(upper)["simkl_id"] == 100
+    assert overrides.find(lower)["simkl_id"] == 200
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX legacy path migration")
+def test_posix_legacy_casefolded_override_remains_usable_after_migration(tmp_path):
+    media_file = tmp_path / "MixedCase" / "Episode.mkv"
+    legacy_key = str(media_file.resolve()).casefold()
+    override_file = tmp_path / "media_overrides.json"
+    override_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "files": {legacy_key: {"simkl_id": 100}},
+                "folders": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    overrides = MediaOverrides(tmp_path)
+
+    assert overrides.find(media_file)["simkl_id"] == 100
+    migrated = json.loads(override_file.read_text(encoding="utf-8"))
+    assert migrated["version"] == 2
+    assert migrated["legacy_casefold_files"] == [legacy_key]
+    assert MediaOverrides(tmp_path).find(media_file)["simkl_id"] == 100
 
 
 def test_override_is_applied_before_credentials_cache_or_network():

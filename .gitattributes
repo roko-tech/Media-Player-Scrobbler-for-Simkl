@@ -1,1 +1,2 @@
-* export-ignore 
+* export-ignore
+simkl_mps/utils/updater.sh text eol=lf

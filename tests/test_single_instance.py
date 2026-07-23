@@ -89,7 +89,7 @@ def test_exit_app_marks_intent_before_stopping_monitor(monkeypatch):
 
     monkeypatch.setattr(app, "stop_monitoring", stop_monitoring)
 
-    assert app.exit_app() == 0
+    assert app.exit_app() is True
     assert events == ["monitor stopped", "icon stopped"]
 
 

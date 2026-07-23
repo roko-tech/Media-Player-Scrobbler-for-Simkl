@@ -1,8 +1,12 @@
+import importlib
+import sys
 from types import SimpleNamespace
 
 from simkl_mps import simkl_api, tray_base
 from simkl_mps.activity import format_delivery_activity, format_setup_health
 from simkl_mps.backlog_cleaner import BacklogCleaner
+from simkl_mps.media_cache import MediaCache
+from simkl_mps.media_identity import cache_key_for_media
 from simkl_mps.simkl_api import SearchCandidate
 from simkl_mps.tray_base import TrayAppBase
 
@@ -213,13 +217,234 @@ def test_first_run_setup_is_shown_only_once():
     app = StubTray.__new__(StubTray)
     app.is_first_run = True
     calls = []
-    app.show_setup_health = lambda **kwargs: calls.append(kwargs) or 0
+    completed = []
+    app.show_setup_health = lambda **kwargs: calls.append(kwargs) or True
+    app._mark_first_run_complete = lambda: completed.append(True) or True
 
     app._show_first_run_setup_if_needed()
     app._show_first_run_setup_if_needed()
 
     assert calls == [{"first_run": True}]
+    assert completed == [True]
     assert app.is_first_run is False
+
+
+def test_first_run_stays_pending_when_onboarding_dialog_fails():
+    app = StubTray.__new__(StubTray)
+    app.is_first_run = True
+    completed = []
+    app.show_setup_health = lambda **_kwargs: False
+    app._mark_first_run_complete = lambda: completed.append(True) or True
+
+    assert app._show_first_run_setup_if_needed() is False
+    assert completed == []
+    assert app.is_first_run is True
+
+
+def test_linux_first_run_marker_is_written_only_when_completed(tmp_path):
+    from simkl_mps.tray_linux import TrayAppLinux
+
+    app = TrayAppLinux.__new__(TrayAppLinux)
+    app.config_path = tmp_path / ".simkl_mps.env"
+    marker = tmp_path / ".first_run_complete"
+
+    app.check_first_run()
+    assert app.is_first_run is True
+    assert not marker.exists()
+
+    assert app._mark_first_run_complete() is True
+    assert marker.exists()
+    app.check_first_run()
+    assert app.is_first_run is False
+
+
+def test_windows_first_run_registry_is_read_then_written_hermetically(monkeypatch):
+    from simkl_mps import tray_win
+
+    values = {}
+    registry_exists = [False]
+
+    class FakeKey:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def open_key(_root, _path):
+        if not registry_exists[0]:
+            raise FileNotFoundError
+        return FakeKey()
+
+    def create_key(_root, _path):
+        registry_exists[0] = True
+        return FakeKey()
+
+    def query_value(_key, name):
+        if name not in values:
+            raise FileNotFoundError
+        return values[name], 4
+
+    def set_value(_key, name, _reserved, _kind, value):
+        values[name] = value
+
+    fake_winreg = SimpleNamespace(
+        HKEY_CURRENT_USER=object(),
+        REG_DWORD=4,
+        OpenKey=open_key,
+        CreateKey=create_key,
+        QueryValueEx=query_value,
+        SetValueEx=set_value,
+    )
+    monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
+    monkeypatch.setattr(tray_win, "sys", SimpleNamespace(platform="win32"))
+    app = tray_win.TrayAppWin.__new__(tray_win.TrayAppWin)
+
+    app.check_first_run()
+    assert app.is_first_run is True
+    assert values == {}
+
+    assert app._mark_first_run_complete() is True
+    assert values == {"FirstRun": 1}
+    app.check_first_run()
+    assert app.is_first_run is False
+
+
+def test_retry_last_scrobble_clears_canonical_path_and_title_cache(tmp_path, monkeypatch):
+    current_path = tmp_path / "Series A" / "Episode.mkv"
+    other_path = tmp_path / "Series B" / "Episode.mkv"
+    cache = MediaCache(tmp_path)
+    cache.set(cache_key_for_media(current_path), {"simkl_id": 1, "type": "show"})
+    cache.set(cache_key_for_media(other_path), {"simkl_id": 2, "type": "show"})
+    cache.set(
+        cache_key_for_media(title="Series A S01E01"),
+        {"simkl_id": 1, "type": "show"},
+    )
+    media = SimpleNamespace(
+        currently_tracking="Series A S01E01",
+        current_filepath=str(current_path),
+        media_cache=cache,
+        media_overrides=SimpleNamespace(find=lambda _path: None),
+        simkl_id=1,
+        movie_name="Series A",
+        media_type="show",
+        season=1,
+        episode=1,
+        completed=False,
+        start_time=1,
+        watch_time=2,
+        state="playing",
+        current_position_seconds=3,
+        total_duration_seconds=4,
+    )
+    app = StubTray.__new__(StubTray)
+    app._get_media_scrobbler = lambda: media
+    app.show_notification = lambda *_args: None
+    app.update_icon = lambda *_args: None
+    monkeypatch.setattr(simkl_api, "is_internet_connected", lambda: False)
+
+    app.try_scrobble_again()
+
+    assert cache.get(cache_key_for_media(current_path)) is None
+    assert cache.get(cache_key_for_media(title="Series A S01E01")) is None
+    assert cache.get(cache_key_for_media(other_path))["simkl_id"] == 2
+
+
+def test_clear_all_data_aborts_when_background_worker_is_still_alive(monkeypatch):
+    app = StubTray.__new__(StubTray)
+    app.scrobbler = SimpleNamespace(stop=lambda: False)
+    app._show_confirmation_dialog = lambda *_args: True
+    notifications = []
+    exits = []
+    app.show_notification = lambda *args: notifications.append(args)
+    app.exit_app = lambda: exits.append(True)
+
+    class UnexpectedManifest:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("purge started while a background worker was alive")
+
+    monkeypatch.setattr(tray_base, "AppPathManifest", UnexpectedManifest)
+
+    assert app.clear_all_data() == 0
+    assert notifications[-1][0] == "simkl-mps Error"
+    assert "No application data was removed" in notifications[-1][1]
+    assert exits == []
+
+
+def test_platform_tray_exit_keeps_runtime_open_when_workers_are_alive():
+    platforms = (
+        ("simkl_mps.tray_win", "TrayAppWin"),
+        ("simkl_mps.tray_linux", "TrayAppLinux"),
+        ("simkl_mps.tray_mac", "TrayAppMac"),
+    )
+
+    for module_name, class_name in platforms:
+        tray_class = getattr(importlib.import_module(module_name), class_name)
+        app = tray_class.__new__(tray_class)
+        app.monitoring_active = True
+        app.stop_monitoring = lambda: False
+        stopped = []
+        app.tray_icon = SimpleNamespace(stop=lambda: stopped.append(True))
+        if class_name == "TrayAppWin":
+            app._exit_requested = False
+        elif class_name == "TrayAppLinux":
+            app.using_appindicator = False
+
+        assert app.exit_app() is False
+        assert stopped == []
+        if class_name == "TrayAppWin":
+            assert app._exit_requested is False
+
+
+def test_failed_tray_start_preserves_active_state_when_cleanup_times_out():
+    stop_calls = []
+    media_scrobbler = SimpleNamespace(
+        set_notification_callback=lambda _callback: None
+    )
+    runtime = SimpleNamespace(
+        monitor=SimpleNamespace(running=False, scrobbler=media_scrobbler),
+        trakt_watcher=None,
+        start=lambda: False,
+        stop=lambda: stop_calls.append(True) or False,
+    )
+    app = StubTray.__new__(StubTray)
+    app.scrobbler = runtime
+    app.monitoring_active = False
+    app.is_first_run = False
+    app.update_status = lambda *_args: None
+    app.show_notification = lambda *_args: None
+
+    assert app.start_monitoring() is False
+    assert stop_calls == [True]
+    assert app.monitoring_active is True
+
+
+def test_tray_ui_error_after_start_stops_the_new_runtime():
+    stop_calls = []
+    media_scrobbler = SimpleNamespace(
+        set_notification_callback=lambda _callback: None
+    )
+    runtime = SimpleNamespace(
+        monitor=SimpleNamespace(running=False, scrobbler=media_scrobbler),
+        trakt_watcher=None,
+        start=lambda: True,
+        stop=lambda: stop_calls.append(True) or True,
+    )
+    app = StubTray.__new__(StubTray)
+    app.scrobbler = runtime
+    app.monitoring_active = False
+    app.is_first_run = False
+    app.show_notification = lambda *_args: None
+
+    def update_status(status, *_args):
+        if status == "running":
+            raise RuntimeError("tray refresh failed")
+
+    app.update_status = update_status
+
+    assert app.start_monitoring() is False
+    assert stop_calls == [True]
+    assert app.monitoring_active is False
 
 
 def test_delivery_health_counts_all_persisted_states(tmp_path):

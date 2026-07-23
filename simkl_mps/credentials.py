@@ -8,8 +8,9 @@ import pathlib
 import logging
 import os
 from dotenv import dotenv_values
-from .migration import get_app_data_dir, perform_full_migration
+from .migration import perform_full_migration
 from .secure_store import (
+    SecretProtectionError,
     ensure_private_file,
     is_protected,
     open_private_text_file,
@@ -18,13 +19,6 @@ from .secure_store import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Perform migration on import
-try:
-    perform_full_migration()
-except Exception as e:
-    logger.warning(f"Migration warning: {e}")
-
 
 # The build replaces this public identifier. Public desktop clients must never
 # embed a client secret; Simkl PIN authentication requires only the Client ID.
@@ -37,8 +31,7 @@ SIMKL_CLIENT_SECRET = ""
 APP_NAME_FOR_PATH = "simkl-mps"
 USER_SUBDIR_FOR_PATH = "kavin"  # Updated from kavinthangavel
 try:
-    # Use migration-aware directory path
-    APP_DATA_DIR_FOR_PATH = get_app_data_dir()
+    APP_DATA_DIR_FOR_PATH = pathlib.Path.home() / USER_SUBDIR_FOR_PATH / APP_NAME_FOR_PATH
     ENV_FILE_PATH = APP_DATA_DIR_FOR_PATH / ".simkl_mps.env"
     logger.debug(f"Using env file path: {ENV_FILE_PATH}")
 except Exception as e:
@@ -48,6 +41,21 @@ except Exception as e:
 
 
 DEV_CREDS_PATH = pathlib.Path(".env")
+_BOOTSTRAP_COMPLETE = False
+
+
+def bootstrap_credentials():
+    """Run stateful legacy-data migration from an explicit runtime entry point."""
+    global _BOOTSTRAP_COMPLETE
+    if _BOOTSTRAP_COMPLETE:
+        return True
+    try:
+        perform_full_migration()
+        _BOOTSTRAP_COMPLETE = True
+        return True
+    except Exception as exc:
+        logger.warning("Credential migration warning: %s", exc)
+        return False
 
 
 def _replace_env_values(path, replacements):
@@ -81,7 +89,16 @@ def _load_secure_env(path, migrate=True):
         stored = config.get(key)
         if not stored:
             continue
-        config[key] = unprotect_secret(stored)
+        try:
+            config[key] = unprotect_secret(stored)
+        except SecretProtectionError as exc:
+            logger.error(
+                "Could not open stored %s; treating it as unavailable until re-authentication: %s",
+                key,
+                exc,
+            )
+            config[key] = None
+            continue
         if migrate and os.name == "nt" and not is_protected(stored):
             replacements[key] = protect_secret(stored)
     if replacements:
@@ -115,7 +132,14 @@ def get_credentials():
     env_file_path = get_env_file_path()
     if env_file_path.exists():
         logger.debug("Reading credentials from %s", env_file_path)
-        config = _load_secure_env(env_file_path)
+        try:
+            config = _load_secure_env(env_file_path)
+        except (OSError, UnicodeError) as exc:
+            logger.error(
+                "Could not read the Simkl credential file; continuing without saved credentials: %s",
+                exc,
+            )
+            config = {}
         client_id = client_id or config.get("SIMKL_CLIENT_ID")
         client_secret = client_secret or config.get("SIMKL_CLIENT_SECRET")
         access_token = config.get("SIMKL_ACCESS_TOKEN")

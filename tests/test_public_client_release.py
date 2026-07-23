@@ -224,6 +224,143 @@ def test_release_promotion_happens_only_after_draft_assets_and_pypi():
     ).read_text(encoding="utf-8")
 
 
+def test_release_binds_tag_source_build_and_signer_identity():
+    build = (REPO_ROOT / ".github" / "workflows" / "build.yml").read_text(
+        encoding="utf-8"
+    )
+    build_verification = (
+        REPO_ROOT / ".github" / "workflows" / "build-verification.yml"
+    ).read_text(encoding="utf-8")
+    windows_build = (
+        REPO_ROOT / ".github" / "workflows" / "windows-build.yml"
+    ).read_text(encoding="utf-8")
+    create_release = (
+        REPO_ROOT / ".github" / "workflows" / "create-release.yml"
+    ).read_text(encoding="utf-8")
+
+    assert 'EXPECTED_REF="refs/tags/$TAG_NAME"' in build
+    assert "git rev-parse \"refs/tags/$TAG_NAME^{commit}\"" in build
+    assert 'TAG_SHA" != "$CHECKED_OUT_SHA' in build
+    assert "source_sha: ${{ steps.verify_release_ref.outputs.source_sha }}" in build
+    assert "Reverify and publish fully assembled release" in build
+    assert "Release tag moved after the build; refusing publication." in build
+
+    assert "ref: ${{ inputs.source_sha }}" in build_verification
+    assert '"git_commit": os.environ["SOURCE_SHA"]' in build_verification
+    assert "ref: ${{ inputs.source_sha }}" in windows_build
+
+    assert "build_info.get(\"git_commit\") != expected_sha" in create_release
+    assert "--verify-tag" in create_release
+    assert "--certificate-identity \"$CERT_IDENTITY\"" in create_release
+    assert "--certificate-oidc-issuer \"$CERT_ISSUER\"" in create_release
+    assert create_release.count("cosign verify-blob") >= 2
+
+
+def test_release_reruns_refresh_checksums_and_verify_uploaded_assets():
+    create_release = (
+        REPO_ROOT / ".github" / "workflows" / "create-release.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "<!-- simkl-mps-verification-start -->" in create_release
+    assert "<!-- simkl-mps-source-sha:$SOURCE_SHA -->" in create_release
+    assert "DRAFT_SOURCE_SHA" in create_release
+    assert 'DRAFT_SOURCE_SHA" != "$SOURCE_SHA' in create_release
+    create_start = create_release.index('gh release create "$TAG_NAME"')
+    first_release_view = create_release.index(
+        'gh release view "$TAG_NAME" --json body',
+        create_start,
+    )
+    initial_create = create_release[create_start:first_release_view]
+    assert '--notes-file "$VERIFICATION_BLOCK_FILE"' in initial_create
+    assert 'gh release edit "$TAG_NAME" --notes-file "$UPDATED_BODY_FILE"' in create_release
+    assert 'gh release download "$TAG_NAME" "${DOWNLOAD_ARGS[@]}"' in create_release
+    assert 'cmp --silent "$LOCAL_PATH" "$DOWNLOADED_PATH"' in create_release
+    assert "Consider manual review/update if needed" not in create_release
+
+
+def test_existing_pypi_version_must_match_local_distribution_digests():
+    publish = (
+        REPO_ROOT / ".github" / "workflows" / "publish-pypi.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "https://pypi.org/pypi/simkl-mps/{version}/json" in publish
+    assert "local_names != remote_names" in publish
+    assert "hashlib.sha256(path.read_bytes()).hexdigest()" in publish
+    assert "already_exists=true" in publish
+    assert "steps.pypi_preflight.outputs.already_exists != 'true'" in publish
+    assert "poetry publish --skip-existing" not in publish
+
+
+def test_pypi_publish_is_reusable_only_and_revalidates_tag_last():
+    publish = (
+        REPO_ROOT / ".github" / "workflows" / "publish-pypi.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "workflow_dispatch:" not in publish
+    assert "inputs.source_sha || github.sha" not in publish
+    assert "ref: ${{ inputs.source_sha }}" in publish
+    validation = "Revalidate release tag and source immediately before PyPI publication"
+    assert validation in publish
+    assert 'TAG_SHA" != "$SOURCE_SHA' in publish
+    validation_start = publish.index(validation)
+    publish_start = publish.index("- name: Publish to PyPI")
+    assert validation_start < publish_start
+    assert "\n      - name:" not in publish[validation_start + len(validation) : publish_start]
+
+
+def test_release_runs_are_serialized_and_promotion_reverifies_assets():
+    build = (REPO_ROOT / ".github" / "workflows" / "build.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "group: release-${{ github.repository }}-${{ github.ref }}" in build
+    assert "cancel-in-progress: false" in build
+    assert "name: windows-installer" in build
+    assert "Reverify and publish fully assembled release" in build
+    assert 'cmp --silent "$EXPECTED_INSTALLER"' in build
+    assert 'cosign verify-blob \\' in build
+    assert "<!-- simkl-mps-source-sha:$SOURCE_SHA -->" in build
+    assert "EXPECTED_ROW=" in build
+    assert build.index("Reverify and publish fully assembled release") < build.index(
+        "--draft=false"
+    )
+
+
+def test_release_workflow_run_scripts_do_not_interpolate_actions_expressions():
+    workflow_names = (
+        "build.yml",
+        "build-verification.yml",
+        "windows-build.yml",
+        "create-release.yml",
+        "publish-pypi.yml",
+    )
+
+    for workflow_name in workflow_names:
+        path = REPO_ROOT / ".github" / "workflows" / workflow_name
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            stripped = line.lstrip()
+            if not stripped.startswith("run:"):
+                continue
+
+            assert "${{" not in line, f"{workflow_name}:{index + 1}"
+            if stripped not in {"run: |", "run: >", "run: |-", "run: >-"}:
+                continue
+
+            run_indent = len(line) - len(stripped)
+            for nested_index in range(index + 1, len(lines)):
+                nested = lines[nested_index]
+                if not nested.strip():
+                    continue
+                nested_indent = len(nested) - len(nested.lstrip())
+                if nested_indent <= run_indent:
+                    break
+                assert "${{" not in nested, (
+                    f"{workflow_name}:{nested_index + 1} interpolates an Actions "
+                    "expression directly into a shell script"
+                )
+
+
 def test_pyinstaller_build_does_not_kill_running_user_processes():
     spec = (REPO_ROOT / "simkl-mps.spec").read_text(encoding="utf-8")
 

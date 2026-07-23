@@ -135,8 +135,14 @@ class TraktSyncWatcher:
         self._stop.set()
         self._history_saved.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=self.poll_seconds + 1)
-        logger.info("Trakt sync watcher stopped")
+            if self._thread is not threading.current_thread():
+                self._thread.join(timeout=self.poll_seconds + 1)
+        stopped = not self._thread or not self._thread.is_alive()
+        if stopped:
+            logger.info("Trakt sync watcher stopped")
+        else:
+            logger.error("Trakt sync watcher did not stop before the timeout")
+        return stopped
 
     def notify_history_saved(self):
         """Wake the watcher after a completed-watch event is safely on disk."""
@@ -151,37 +157,94 @@ class TraktSyncWatcher:
         events = trakt_sync.collect_history_events(history, None)
         return events[-1] if events else None
 
-    def _record_trakt_outcome(self, event, result):
-        event_id = event.get("event_id")
-        if not event_id:
+
+    def _event_for_result(self, result):
+        """Return an event explicitly named by a sync result, newest relevant first."""
+        if result.pending_event_ids:
+            event_ids = result.pending_event_ids
+        elif result.pending:
+            return None
+        elif result.accepted_event_ids:
+            event_ids = result.accepted_event_ids
+        elif result.pushed:
+            return None
+        else:
+            return None
+        target = str(event_ids[-1])
+        history = trakt_sync.load_json(trakt_sync.HISTORY_FILE, []) or []
+        events = trakt_sync.collect_history_events(history, None)
+        for event in reversed(events):
+            if str(event.get("event_id") or "") == target:
+                return event
+        logger.warning("Trakt result referenced missing local event %s", target)
+        return None
+
+    def _record_trakt_outcome(self, ledger, event_id, status, result):
+        event = ledger.get_event(event_id)
+        if not event:
             return
-        ledger = BacklogCleaner(trakt_sync.APP_DATA_DIR)
-        if not ledger.get_event(event_id):
+        detail = {"summary": result.summary, "pending": result.pending}
+        latest = next(
+            (
+                outcome
+                for outcome in reversed(event.get("provider_outcomes", []))
+                if outcome.get("provider") == "trakt"
+            ),
+            None,
+        )
+        if (
+            latest
+            and latest.get("status") == status
+            and bool(latest.get("retryable")) == (status != "accepted")
+            and latest.get("detail") == detail
+        ):
             return
-        accepted = bool(result.ok and result.pending == 0)
         ledger.record_outcome(
             event_id,
             provider="trakt",
-            status="accepted" if accepted else "pending_retry",
-            retryable=not accepted,
-            detail={"summary": result.summary, "pending": result.pending},
+            status=status,
+            retryable=status != "accepted",
+            detail=detail,
         )
+
+
+    def _record_trakt_outcomes(self, result):
+        accepted_ids = tuple(dict.fromkeys(result.accepted_event_ids))
+        pending_ids = tuple(
+            event_id
+            for event_id in dict.fromkeys(result.pending_event_ids)
+            if event_id not in accepted_ids
+        )
+        if not accepted_ids and not pending_ids:
+            return
+        try:
+            ledger = BacklogCleaner(trakt_sync.APP_DATA_DIR)
+            for event_id in accepted_ids:
+                self._record_trakt_outcome(ledger, event_id, "accepted", result)
+            for event_id in pending_ids:
+                self._record_trakt_outcome(ledger, event_id, "pending_retry", result)
+        except Exception:
+            logger.exception("Could not record event-correlated Trakt outcomes")
 
     def _emit_result(self, result):
         if not self._result_callback:
             return
-        event = self._latest_event()
+        event = self._event_for_result(result)
         if not event:
             return
-        self._record_trakt_outcome(event, result)
+        event_id = event.get("event_id")
+        if result.accepted_event_ids or result.pending_event_ids:
+            accepted = event_id in result.accepted_event_ids
+        else:
+            accepted = bool(result.ok and result.pending == 0)
         receipt_key = (
-            event.get("event_id"),
+            event_id,
             event.get("kind"),
             event.get("simkl_id"),
             event.get("season"),
             event.get("episode"),
             event.get("watched_at"),
-            bool(result.ok and result.pending == 0),
+            accepted,
         )
         if receipt_key == self._last_emitted_receipt_key:
             logger.debug("Trakt sync receipt unchanged; suppressing duplicate overlay")
@@ -202,6 +265,7 @@ class TraktSyncWatcher:
         try:
             result = trakt_sync.sync_history()
             self.last_summary = result.summary
+            self._record_trakt_outcomes(result)
             return result
         except Exception as exc:
             self.last_summary = f"error: {exc}"

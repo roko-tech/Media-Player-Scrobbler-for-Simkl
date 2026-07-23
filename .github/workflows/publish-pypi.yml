@@ -6,6 +6,9 @@ on:
       version:
         required: true
         type: string
+      source_sha:
+        required: true
+        type: string
       build:
         required: false
         type: boolean
@@ -19,22 +22,6 @@ on:
         required: false
       PYPI_API_TOKEN:
         required: false
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to build/publish (e.g., 2.3.1)'
-        required: true
-        type: string
-      publish:
-        description: 'PyPI publish'
-        required: true
-        type: boolean
-        default: true
-      build:
-        description: 'Build the package artifact'
-        required: true
-        type: boolean
-        default: true
 
 jobs:
   publish:
@@ -45,6 +32,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -64,7 +54,9 @@ jobs:
       
       - name: Validate release version
         if: ${{ inputs.build }}
-        run: python scripts/validate_release_version.py ${{ inputs.version }}
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python scripts/validate_release_version.py "$RELEASE_VERSION"
 
       - name: Validate build inputs
         if: ${{ inputs.build }}
@@ -106,18 +98,101 @@ jobs:
           name: python-package
           path: dist/
 
+      - name: Verify existing PyPI release matches this build
+        if: ${{ inputs.publish }}
+        id: pypi_preflight
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          version = os.environ["RELEASE_VERSION"]
+          request = urllib.request.Request(
+              f"https://pypi.org/pypi/simkl-mps/{version}/json",
+              headers={"User-Agent": "simkl-mps-release-verifier/1"},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  release = json.load(response)
+          except urllib.error.HTTPError as exc:
+              if exc.code != 404:
+                  raise
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("already_exists=false\n")
+              raise SystemExit(0)
+
+          local_files = sorted(path for path in Path("dist").iterdir() if path.is_file())
+          if not local_files:
+              raise SystemExit("No local Python distribution files were found in dist/.")
+
+          remote_hashes = {
+              item["filename"]: item.get("digests", {}).get("sha256")
+              for item in release.get("urls", [])
+          }
+          local_names = {path.name for path in local_files}
+          remote_names = set(remote_hashes)
+          if local_names != remote_names:
+              raise SystemExit(
+                  "PyPI already contains this version with a different file set: "
+                  f"local={sorted(local_names)}, remote={sorted(remote_names)}"
+              )
+
+          mismatches = []
+          for path in local_files:
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != remote_hashes.get(path.name):
+                  mismatches.append(path.name)
+          if mismatches:
+              raise SystemExit(
+                  "PyPI already contains this version with different file digest(s): "
+                  + ", ".join(mismatches)
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("already_exists=true\n")
+          print("PyPI already contains byte-identical artifacts; publication is already complete.")
+          PY
+
       - name: Validate publish token
         if: ${{ inputs.publish }}
         env:
+          ALREADY_EXISTS: ${{ steps.pypi_preflight.outputs.already_exists }}
           PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          if [ -z "$PYPI_API_TOKEN" ]; then
+          if [ "$ALREADY_EXISTS" != "true" ] && [ -z "$PYPI_API_TOKEN" ]; then
             echo "::error::PYPI_API_TOKEN secret is not set."
             exit 1
           fi
 
-      - name: Publish to PyPI (skip existing)
+      - name: Revalidate release tag and source immediately before PyPI publication
         if: ${{ inputs.publish }}
-        run: poetry publish --skip-existing -vvv
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          TAG_NAME="v$RELEASE_VERSION"
+          EXPECTED_REF="refs/tags/$TAG_NAME"
+          if [ "$GITHUB_REF" != "$EXPECTED_REF" ]; then
+            echo "::error::PyPI publication must run from $EXPECTED_REF, not $GITHUB_REF."
+            exit 1
+          fi
+
+          git fetch --force origin "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
+          TAG_SHA=$(git rev-parse "refs/tags/$TAG_NAME^{commit}")
+          CHECKED_OUT_SHA=$(git rev-parse HEAD)
+          if [ "$TAG_SHA" != "$SOURCE_SHA" ] || [ "$CHECKED_OUT_SHA" != "$SOURCE_SHA" ]; then
+            echo "::error::Release tag or checkout changed before PyPI publication."
+            exit 1
+          fi
+
+      - name: Publish to PyPI
+        if: ${{ inputs.publish && steps.pypi_preflight.outputs.already_exists != 'true' }}
+        run: poetry publish -vvv
         env:
           POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_API_TOKEN }}

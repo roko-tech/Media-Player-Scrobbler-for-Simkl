@@ -1,3 +1,16 @@
+function normalizeHistoryMediaType(mediaType) {
+    return mediaType === 'show' ? 'tv' : mediaType;
+}
+
+function matchesHistoryTypeAndRewatch(item, typeFilter, rewatchFilter, counts) {
+    if (typeFilter !== 'all' && normalizeHistoryMediaType(item.type) !== typeFilter) {
+        return false;
+    }
+    if (rewatchFilter === 'original' && counts.rewatchCount > 0) return false;
+    if (rewatchFilter === 'rewatch' && counts.rewatchCount < 1) return false;
+    return true;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     const OFFLINE_POSTER = "data:image/svg+xml;charset=utf-8," +
         encodeURIComponent(
@@ -12,6 +25,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const emptyHistory = document.getElementById('empty-history');
     const searchInput = document.getElementById('search-input');
     const filterType = document.getElementById('filter-type');
+    const filterRewatch = document.getElementById('filter-rewatch');
     const filterYear = document.getElementById('filter-year');
     const sortBy = document.getElementById('sort-by');
     const viewToggle = document.getElementById('view-toggle');
@@ -820,21 +834,15 @@ document.addEventListener('DOMContentLoaded', () => {
     function filterHistory() {
         const searchTerm = searchInput.value.toLowerCase().trim();
         const typeFilter = filterType.value;
-        const rewatchFilter = document.getElementById('filter-rewatch') ? document.getElementById('filter-rewatch').value : 'all';
+        const rewatchFilter = filterRewatch ? filterRewatch.value : 'all';
         const yearFilter = filterYear.value;
         const sortOption = sortBy.value;
 
         let filtered = historyData.filter(item => {
-            // Type filter
-            if (typeFilter !== 'all' && item.type !== typeFilter) return false;
+            const counts = getHistoryCounts(item);
+            if (!matchesHistoryTypeAndRewatch(item, typeFilter, rewatchFilter, counts)) return false;
             // Year filter
             if (yearFilter !== 'all' && item.year !== parseInt(yearFilter)) return false;
-            // Rewatch filter
-            if (rewatchFilter !== 'all') {
-                const counts = getHistoryCounts(item);
-                if (rewatchFilter === 'original' && counts.rewatchCount > 0) return false;
-                if (rewatchFilter === 'rewatch' && counts.rewatchCount < 1) return false;
-            }
             // Search filter (title, year, overview)
             if (searchTerm) {
                 const titleMatch = item.title && item.title.toLowerCase().includes(searchTerm);
@@ -1042,6 +1050,9 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     filterType.addEventListener('change', () => { currentPage = 1; renderHistory(); });
+    if (filterRewatch) {
+        filterRewatch.addEventListener('change', () => { currentPage = 1; renderHistory(); });
+    }
     filterYear.addEventListener('change', () => { currentPage = 1; renderHistory(); });
     sortBy.addEventListener('change', () => { currentPage = 1; renderHistory(); });
 

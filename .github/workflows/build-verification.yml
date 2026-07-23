@@ -6,6 +6,9 @@ on:
       version:
         required: true
         type: string
+      source_sha:
+        required: true
+        type: string
 
 permissions: 
   contents: read
@@ -19,24 +22,41 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
 
       - name: Create build info file
         id: create-build-info
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          # Create build info file with metadata
-          cat > build_info.json << EOF
-          {
-            "version": "${{ inputs.version }}",
-            "git_commit": "${{ github.sha }}",
-            "build_time": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "build_number": "${{ github.run_number }}",
-            "github_workflow": "${{ github.workflow }}",
-            "github_run_id": "${{ github.run_id }}",
-            "github_run_number": "${{ github.run_number }}"
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          build_info = {
+              "version": os.environ["RELEASE_VERSION"],
+              "git_commit": os.environ["SOURCE_SHA"],
+              "build_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "build_number": os.environ["BUILD_NUMBER"],
+              "github_workflow": os.environ["WORKFLOW_NAME"],
+              "github_run_id": os.environ["RUN_ID"],
+              "github_run_number": os.environ["RUN_NUMBER"],
           }
-          EOF
+          Path("build_info.json").write_text(
+              json.dumps(build_info, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
           
-          echo "build_info_path=build_info.json" >> $GITHUB_OUTPUT
+          echo "build_info_path=build_info.json" >> "$GITHUB_OUTPUT"
           cat build_info.json
 
       - name: Upload build info as artifact
@@ -44,4 +64,3 @@ jobs:
         with:
           name: build-info
           path: build_info.json
-          

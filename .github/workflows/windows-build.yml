@@ -6,6 +6,9 @@ on:
       version:
         required: true
         type: string
+      source_sha:
+        required: true
+        type: string
     secrets:
       SIMKL_CLIENT_ID:
         required: true
@@ -16,6 +19,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -31,7 +36,9 @@ jobs:
           poetry install --no-interaction --sync
 
       - name: Validate release version
-        run: python scripts/validate_release_version.py ${{ inputs.version }}
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python scripts/validate_release_version.py "$env:RELEASE_VERSION"
 
       - name: Download build-info artifact
         uses: actions/download-artifact@v8
@@ -78,8 +85,10 @@ jobs:
           python test_build.py windows
 
       - name: Build Installer with Inno Setup
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          $version = "${{ inputs.version }}"
+          $version = $env:RELEASE_VERSION
           (Get-Content setup.iss) -replace '#define MyAppVersion "[^"]*"', "#define MyAppVersion `"$version`"" | Set-Content setup_temp.iss
           
           $fileContent = Get-Content setup_temp.iss -Raw
@@ -90,16 +99,20 @@ jobs:
           & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' /Q setup_temp.iss
           
       - name: Rename and move installer
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          $version = "${{ inputs.version }}"
-          mkdir -p artifacts
-          Move-Item dist\installer\MPSS_Setup_$version.exe artifacts\MPSS_Setup_$version.exe
+          $version = $env:RELEASE_VERSION
+          New-Item -Path "artifacts" -ItemType Directory -Force
+          Move-Item -LiteralPath "dist\installer\MPSS_Setup_$version.exe" -Destination "artifacts\MPSS_Setup_$version.exe"
 
       - name: Calculate SHA256 for EXE
         id: hash_exe
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          $filePath = "artifacts/MPSS_Setup_${{ inputs.version }}.exe"
+          $filePath = "artifacts/MPSS_Setup_$env:RELEASE_VERSION.exe"
           $hash = (Get-FileHash -Path $filePath -Algorithm SHA256).Hash
           echo "sha256_hash=$hash" >> $env:GITHUB_OUTPUT
           echo "Calculated hash: $hash for file: $filePath"
@@ -107,8 +120,10 @@ jobs:
       - name: Create SHA256 Hash File
         id: create_hash_file
         shell: pwsh
+        env:
+          HASH_VALUE: ${{ steps.hash_exe.outputs.sha256_hash }}
         run: |
-          $hashValue = "${{ steps.hash_exe.outputs.sha256_hash }}"
+          $hashValue = $env:HASH_VALUE
           $tempFilePath = Join-Path $env:RUNNER_TEMP "sha256_hash.txt"
           Set-Content -Path $tempFilePath -Value $hashValue
           echo "hash_file_path=$tempFilePath" >> $env:GITHUB_OUTPUT

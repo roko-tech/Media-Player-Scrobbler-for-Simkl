@@ -156,6 +156,42 @@ def test_scrobbler_does_not_complete_when_backlog_write_fails(monkeypatch):
     assert notifications[-1][1]["critical"] is True
 
 
+def test_failed_backlog_writes_reuse_one_completion_timestamp():
+    payloads = []
+
+    class FailingBacklog:
+        @staticmethod
+        def add(*_args, **kwargs):
+            payloads.append(dict(kwargs["additional_data"]))
+            return None
+
+    scrobbler = MediaScrobbler.__new__(MediaScrobbler)
+    scrobbler.backlog_cleaner = FailingBacklog()
+    scrobbler.current_filepath = "example.mkv"
+    scrobbler.currently_tracking = "Example"
+    scrobbler.watched_at = None
+    scrobbler.last_backlog_attempt_time = {}
+    scrobbler.completed = False
+    scrobbler._log_playback_event = lambda *args, **kwargs: None
+    scrobbler._send_notification = lambda *args, **kwargs: None
+
+    assert not scrobbler._add_to_backlog_due_to_issue(
+        100,
+        "Example",
+        "offline_with_id",
+        {"simkl_id": 100, "type": "movie"},
+    )
+    assert not scrobbler._add_to_backlog_due_to_issue(
+        100,
+        "Example",
+        "offline_with_id",
+        {"simkl_id": 100, "type": "movie"},
+    )
+
+    assert payloads[0]["watched_at"] == payloads[1]["watched_at"]
+    assert scrobbler.watched_at == payloads[0]["watched_at"]
+
+
 def test_backlog_update_rolls_back_when_durable_write_fails(tmp_path, monkeypatch):
     cleaner = BacklogCleaner(tmp_path)
     cleaner.add(100, "Example", {"attempt_count": 0})
@@ -280,6 +316,27 @@ def test_online_completion_is_durable_before_remote_delivery(tmp_path, monkeypat
     assert event["provider_outcomes"][0]["status"] == "accepted"
     assert receipts[0]["event_id"] == delivered_event_ids[0]
     assert receipts[0]["simkl_status"] == "Accepted"
+
+
+def test_starting_new_media_item_clears_previous_completion_timestamp(monkeypatch):
+    class EmptyCache:
+        @staticmethod
+        def get(_key):
+            return None
+
+    scrobbler = MediaScrobbler.__new__(MediaScrobbler)
+    scrobbler.watched_at = "2026-07-15T18:00:00Z"
+    scrobbler.media_cache = EmptyCache()
+    scrobbler._derive_display_season_episode = lambda: None
+    scrobbler._send_notification = lambda *args, **kwargs: None
+    monkeypatch.setattr(
+        "simkl_mps.media_scrobbler.is_internet_connected",
+        lambda: False,
+    )
+
+    scrobbler._start_new_media_item("Second Item", None, "movie")
+
+    assert scrobbler.watched_at is None
 
 
 def test_provider_acceptance_is_not_replayed_when_outcome_audit_initially_fails(
@@ -583,6 +640,109 @@ def test_permanent_simkl_failure_moves_event_out_of_retry_queue(tmp_path, monkey
     assert event["provider_outcomes"][-1]["status"] == "unauthorized"
 
 
+def test_reauthentication_requeues_only_unauthorized_events(tmp_path):
+    ledger = BacklogCleaner(tmp_path)
+    unauthorized_id = ledger.add(100, "Unauthorized", unique_event=True)
+    rejected_id = ledger.add(200, "Rejected", unique_event=True)
+    assert ledger.record_outcome(
+        unauthorized_id,
+        provider="simkl",
+        status="unauthorized",
+        retryable=False,
+        status_code=401,
+    )
+    assert ledger.record_outcome(
+        rejected_id,
+        provider="simkl",
+        status="not_found",
+        retryable=False,
+        status_code=201,
+    )
+    assert ledger.claim_event(unauthorized_id, "crashed-worker") is True
+    assert ledger.fail(unauthorized_id, "invalid token")
+    assert ledger.fail(rejected_id, "not found")
+
+    scrobbler = MediaScrobbler.__new__(MediaScrobbler)
+    scrobbler.client_id = "old-client"
+    scrobbler.access_token = "old-token"
+    scrobbler.testing_mode = True
+    scrobbler._account_type = None
+    scrobbler._account_settings_all = None
+    scrobbler.backlog_cleaner = ledger
+    scrobbler._backlog_wakeup = threading.Event()
+
+    scrobbler.set_credentials("new-client", "new-token")
+
+    pending = ledger.get_pending()
+    assert list(pending) == [unauthorized_id]
+    assert pending[unauthorized_id]["attempt_count"] == 0
+    assert pending[unauthorized_id]["last_attempt_timestamp"] is None
+    assert pending[unauthorized_id]["last_error"] is None
+    assert ledger.get_event(rejected_id)["delivery_state"] == "failed"
+    assert scrobbler._backlog_wakeup.is_set()
+    assert ledger.claim_event(unauthorized_id, "replacement-worker") is True
+
+
+def test_reauthentication_during_unauthorized_attempt_does_not_strand_event(
+    tmp_path,
+    monkeypatch,
+):
+    ledger = BacklogCleaner(tmp_path)
+    event_id = ledger.add(
+        100,
+        "Example",
+        {
+            "type": "movie",
+            "attempt_count": 0,
+            "last_attempt_timestamp": None,
+        },
+        unique_event=True,
+    )
+    scrobbler = MediaScrobbler.__new__(MediaScrobbler)
+    scrobbler.client_id = "old-client"
+    scrobbler.access_token = "old-token"
+    scrobbler.testing_mode = True
+    scrobbler._account_type = None
+    scrobbler._account_settings_all = None
+    scrobbler.backlog_cleaner = ledger
+    scrobbler._processing_lock = threading.Lock()
+    scrobbler._processing_backlog_items = set()
+    scrobbler._backlog_run_lock = threading.Lock()
+    scrobbler._backlog_wakeup = threading.Event()
+    scrobbler._backlog_notification_throttle = {}
+    scrobbler._send_notification = lambda *args, **kwargs: None
+    scrobbler._resolve_backlog_item_identity = lambda key, data: (True, data, None)
+    scrobbler.simkl_id = None
+    scrobbler.media_type = None
+    scrobbler.season = None
+    scrobbler.episode = None
+
+    def unauthorized_after_reauth(*_args, **_kwargs):
+        scrobbler.set_credentials("new-client", "new-token")
+        return HistorySyncResult(
+            ProviderStatus.UNAUTHORIZED,
+            retryable=False,
+            status_code=401,
+            error="old token rejected",
+        )
+
+    monkeypatch.setattr(
+        "simkl_mps.media_scrobbler.is_internet_connected",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "simkl_mps.media_scrobbler.add_to_history",
+        unauthorized_after_reauth,
+    )
+
+    result = scrobbler.process_backlog()
+
+    assert result["attempted"] == 1
+    assert list(ledger.get_pending()) == [event_id]
+    assert ledger.get_event(event_id)["provider_outcomes"][-1]["status"] == "unauthorized"
+    assert scrobbler._backlog_wakeup.is_set()
+
+
 def test_history_add_rolls_back_when_durable_write_fails(tmp_path, monkeypatch):
     manager = WatchHistoryManager(tmp_path)
     monkeypatch.setattr(manager, "_save_history", lambda: False)
@@ -599,6 +759,82 @@ def test_history_add_rolls_back_when_durable_write_fails(tmp_path, monkeypatch):
 
     assert saved is False
     assert manager.history == []
+
+
+def test_watch_history_projection_is_idempotent_by_event_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(WatchHistoryManager, "_ensure_viewer_exists", lambda self: None)
+    event = {
+        "event_id": "7ee88a82-9ea5-4d45-951b-8472e0a5b0c8",
+        "simkl_id": 100,
+        "title": "Example",
+        "type": "movie",
+        "watched_at": "2026-07-23T12:00:00Z",
+    }
+    manager = WatchHistoryManager(tmp_path)
+    assert manager.add_entry(event)
+
+    reopened = WatchHistoryManager(tmp_path)
+    assert reopened.add_entry(event)
+
+    entry = reopened.history[0]
+    assert entry["watch_count"] == 1
+    assert entry["rewatch_count"] == 0
+    assert [watch["event_id"] for watch in entry["watch_events"]] == [event["event_id"]]
+
+
+def test_viewer_projection_cannot_replace_an_inflight_history_add(tmp_path, monkeypatch):
+    monkeypatch.setattr(WatchHistoryManager, "_ensure_viewer_exists", lambda self: None)
+    manager = WatchHistoryManager(tmp_path)
+    save_started = threading.Event()
+    allow_save = threading.Event()
+    viewer_loaded = threading.Event()
+    writer_result = []
+    original_save = manager._save_history
+    original_load = manager._load_history
+
+    def paused_save(create_backup=True):
+        save_started.set()
+        assert allow_save.wait(2)
+        return original_save(create_backup=create_backup)
+
+    def observed_load():
+        if threading.current_thread().name == "history-viewer":
+            viewer_loaded.set()
+        return original_load()
+
+    monkeypatch.setattr(manager, "_save_history", paused_save)
+    monkeypatch.setattr(manager, "_load_history", observed_load)
+
+    writer = threading.Thread(
+        target=lambda: writer_result.append(
+            manager.add_entry(
+                {
+                    "event_id": "d0408a59-8964-41a9-a03b-df0772b451cc",
+                    "simkl_id": 100,
+                    "title": "Example",
+                    "type": "movie",
+                    "watched_at": "2026-07-23T12:00:00Z",
+                }
+            )
+        )
+    )
+    viewer = threading.Thread(target=manager._update_history_data, name="history-viewer")
+    writer.start()
+    assert save_started.wait(2)
+    viewer.start()
+
+    assert not viewer_loaded.wait(0.1)
+    allow_save.set()
+    writer.join(2)
+    viewer.join(2)
+
+    assert not writer.is_alive()
+    assert not viewer.is_alive()
+    assert writer_result == [True]
+    assert len(manager.history) == 1
+    saved = json.loads(manager.history_file.read_text(encoding="utf-8"))
+    assert len(saved) == 1
+    assert saved[0]["watch_events"][0]["event_id"] == "d0408a59-8964-41a9-a03b-df0772b451cc"
 
 
 def test_backlog_retries_past_old_five_attempt_limit(monkeypatch):

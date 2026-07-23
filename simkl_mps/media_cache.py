@@ -8,13 +8,15 @@ import json
 import logging
 import pathlib
 
+from simkl_mps.media_identity import normalize_media_cache_key
+
 logger = logging.getLogger(__name__)
 
 # Bump whenever media *identification* logic changes. The cache is consulted
 # before a fresh search, so a stamped-version mismatch clears it and stale
 # incorrect identifications can't persist. This only clears the filename->id lookup
 # cache -- never watch history, Simkl, or Trakt.
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 
 
 class MediaCache:
@@ -137,7 +139,7 @@ class MediaCache:
         """Get media info by canonical key, with title-key compatibility."""
         if key is None:
             return None
-        normalized_key = str(key).casefold()
+        normalized_key = normalize_media_cache_key(key)
         media_info = self.cache.get(normalized_key)
         if media_info is None and not normalized_key.startswith(('path:', 'title:')):
             media_info = self.cache.get(f"title:{normalized_key}")
@@ -152,7 +154,7 @@ class MediaCache:
             media_info: Dict with raw media details
         """
         filtered_info = self._filter_media_info(media_info)
-        self.cache[key.lower()] = filtered_info
+        self.cache[normalize_media_cache_key(key)] = filtered_info
         self._save_cache()
         
     def update(self, key, new_info_raw):
@@ -182,8 +184,9 @@ class MediaCache:
         Returns:
             bool: True if key was found and removed, False otherwise
         """
-        if key.lower() in self.cache:
-            del self.cache[key.lower()]
+        normalized_key = normalize_media_cache_key(key)
+        if normalized_key in self.cache:
+            del self.cache[normalized_key]
             self._save_cache()
             return True
         return False

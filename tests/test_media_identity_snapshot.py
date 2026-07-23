@@ -1,4 +1,7 @@
+import os
 import time
+
+import pytest
 
 from simkl_mps.media_cache import MediaCache
 from simkl_mps.media_identity import cache_key_for_media
@@ -21,6 +24,22 @@ def test_same_basename_in_different_directories_has_distinct_cache_identity(tmp_
     assert cache.get(first_key)["simkl_id"] == 1
     assert cache.get(second_key)["simkl_id"] == 2
     assert MediaScrobbler._has_media_file_changed(str(first), str(second)) is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX paths are case-sensitive")
+def test_posix_case_distinct_paths_have_distinct_cache_identity(tmp_path):
+    cache = MediaCache(tmp_path)
+    upper = tmp_path / "Series" / "Episode.mkv"
+    lower = tmp_path / "series" / "episode.mkv"
+
+    upper_key = cache_key_for_media(upper)
+    lower_key = cache_key_for_media(lower)
+    cache.set(upper_key, {"simkl_id": 1, "type": "show"})
+    cache.set(lower_key, {"simkl_id": 2, "type": "show"})
+
+    assert upper_key != lower_key
+    assert cache.get(upper_key)["simkl_id"] == 1
+    assert cache.get(lower_key)["simkl_id"] == 2
 
 
 def test_start_new_item_checks_override_before_cached_identity(monkeypatch):

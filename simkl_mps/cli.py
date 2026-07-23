@@ -52,10 +52,27 @@ VERSION = get_version()
 # Removed early exit for version flags - argparse will handle this.
 
 from simkl_mps.simkl_api import pin_auth_flow, get_user_settings # Added get_user_settings
-from simkl_mps.credentials import get_credentials, get_env_file_path
+from simkl_mps.credentials import (
+    bootstrap_credentials,
+    get_credentials,
+    get_env_file_path,
+)
 from simkl_mps.main import SimklScrobbler, APP_DATA_DIR, get_tray_app # Import APP_DATA_DIR for log path display and get_tray_app
+from simkl_mps.runtime_lock import RuntimeInstanceLock
 
 colorama.init()
+
+
+def _bootstrap_credentials_under_runtime_lock():
+    """Run migration only while this process temporarily owns the data store."""
+    runtime_lock = RuntimeInstanceLock(APP_DATA_DIR)
+    if not runtime_lock.acquire():
+        logger.info("Credential migration skipped because a runtime owns the data store.")
+        return True
+    try:
+        return bootstrap_credentials()
+    finally:
+        runtime_lock.release()
 logger = logging.getLogger(__name__)
 
 def _setup_logging(debug=False):
@@ -642,6 +659,9 @@ def main():
     if not hasattr(args, 'command') or not args.command:
         parser.print_help()
         return 0
+
+    if args.command not in {"version", "help"}:
+        _bootstrap_credentials_under_runtime_lock()
         
     # Check for updates only when starting the full background service
     if os.environ.get("SIMKL_TRAY_SUBPROCESS") != "1" and args.command == "start":

@@ -108,6 +108,120 @@ def test_build_payload_uses_exact_local_events_and_remaps_anime(monkeypatch):
     assert anime["seasons"][0]["episodes"][0]["number"] == 6
 
 
+def test_sync_result_correlates_accepted_and_pending_event_ids(tmp_path, monkeypatch):
+    config_file = tmp_path / "trakt_config.json"
+    token_file = tmp_path / "trakt_token.json"
+    state_file = tmp_path / "trakt_sync_state.json"
+    history_file = tmp_path / "watch_history.json"
+    backlog_file = tmp_path / "backlog.json"
+    for name, value in (
+        ("CONFIG_FILE", config_file),
+        ("TOKEN_FILE", token_file),
+        ("STATE_FILE", state_file),
+        ("HISTORY_FILE", history_file),
+        ("SIMKL_BACKLOG_FILE", backlog_file),
+    ):
+        monkeypatch.setattr(trakt_sync, name, value)
+
+    accepted_id = "fcba1ca9-8ba0-4625-b216-45347a89431e"
+    pending_id = "e661aa23-7259-4b4b-9183-53072be556b2"
+    config_file.write_text("{}", encoding="utf-8")
+    token_file.write_text("{}", encoding="utf-8")
+    backlog_file.write_text("{}", encoding="utf-8")
+    state_file.write_text(
+        json.dumps({"synced_through": "2026-07-15T14:00:00Z", "pending": []}),
+        encoding="utf-8",
+    )
+    history_file.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "movie",
+                    "title": "Accepted",
+                    "simkl_id": 100,
+                    "watch_events": [
+                        {"event_id": accepted_id, "watched_at": "2026-07-15T15:00:00Z"}
+                    ],
+                },
+                {
+                    "type": "movie",
+                    "title": "Pending",
+                    "simkl_id": 200,
+                    "watch_events": [
+                        {"event_id": pending_id, "watched_at": "2026-07-15T16:00:00Z"}
+                    ],
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_build_payload(events, _client_id):
+        return (
+            {"movies": [{"watched_at": events[0]["watched_at"], "ids": {"simkl": 100}}], "shows": []},
+            [events[1]],
+        )
+
+    monkeypatch.setattr(trakt_sync, "get_credentials", lambda: {"client_id": "client"})
+    monkeypatch.setattr(trakt_sync, "build_payload", fake_build_payload)
+    monkeypatch.setattr(trakt_sync, "trakt_config", lambda: {})
+    monkeypatch.setattr(trakt_sync, "trakt_token", lambda config: "token")
+    monkeypatch.setattr(
+        trakt_sync,
+        "push_trakt",
+        lambda config, token, payload: (
+            201,
+            {"added": {"movies": 1, "episodes": 0}, "not_found": {}},
+        ),
+    )
+
+    result = trakt_sync.sync_history()
+
+    assert result.accepted_event_ids == (accepted_id,)
+    assert result.pending_event_ids == (pending_id,)
+
+
+def test_aggregate_trakt_result_does_not_attach_pending_legacy_event_to_accepted_id(
+    monkeypatch,
+):
+    watcher = TraktSyncWatcher()
+    result = trakt_sync.SyncResult(
+        False,
+        "one legacy event remains pending",
+        pushed=True,
+        pending=1,
+        accepted_event_ids=("accepted-event",),
+    )
+    monkeypatch.setattr(
+        watcher,
+        "_latest_event",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("aggregate result fell back to the globally latest event")
+        ),
+    )
+
+    assert watcher._event_for_result(result) is None
+
+
+def test_noop_trakt_result_never_falls_back_to_latest_event(monkeypatch):
+    watcher = TraktSyncWatcher()
+    receipts = []
+    monkeypatch.setattr(
+        watcher,
+        "_latest_event",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("no-op result fell back to the globally latest event")
+        ),
+    )
+    watcher.set_result_callback(
+        lambda result, event: receipts.append((result, event))
+    )
+
+    watcher._emit_result(trakt_sync.SyncResult(True, "nothing new"))
+
+    assert receipts == []
+
+
 def test_partial_not_found_retries_only_echoed_event():
     events = [
         {
@@ -527,10 +641,6 @@ def test_watcher_retries_failed_sync_without_another_history_change(monkeypatch)
 
 def test_history_saved_sync_emits_exact_completion_receipt(monkeypatch):
     watcher = TraktSyncWatcher(poll_seconds=0.01, debounce_seconds=0.01)
-    results = [
-        trakt_sync.SyncResult(True, "startup"),
-        trakt_sync.SyncResult(True, "Trakt: +1 episode(s)", pushed=True),
-    ]
     event = {
         "event_id": "8ddf190c-57fd-48cb-838b-8457fd340b83",
         "kind": "episode",
@@ -541,11 +651,25 @@ def test_history_saved_sync_emits_exact_completion_receipt(monkeypatch):
         "watched_at": "2026-07-17T10:00:00Z",
         "is_anime": False,
     }
+    results = [
+        trakt_sync.SyncResult(True, "startup"),
+        trakt_sync.SyncResult(
+            True,
+            "Trakt: +1 episode(s)",
+            pushed=True,
+            accepted_event_ids=(event["event_id"],),
+        ),
+    ]
     receipts = []
 
     monkeypatch.setattr(watcher, "sync_now", lambda: results.pop(0))
     monkeypatch.setattr(watcher, "_mtime", lambda: 1.0)
-    monkeypatch.setattr(watcher, "_latest_event", lambda: event)
+    monkeypatch.setattr(trakt_sync, "load_json", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        trakt_sync,
+        "collect_history_events",
+        lambda *_args, **_kwargs: [event],
+    )
 
     def on_result(result, latest_event):
         receipts.append((result, latest_event))
@@ -553,7 +677,15 @@ def test_history_saved_sync_emits_exact_completion_receipt(monkeypatch):
 
     watcher.set_result_callback(on_result)
     watcher._history_saved.set()
-    watcher._watch_loop()
+    worker = threading.Thread(target=watcher._watch_loop)
+    worker.start()
+    try:
+        worker.join(2)
+        assert not worker.is_alive()
+    finally:
+        watcher._stop.set()
+        watcher._history_saved.set()
+        worker.join(2)
 
     assert len(receipts) == 1
     assert receipts[0][0].ok is True
@@ -587,30 +719,84 @@ def test_completion_event_id_survives_history_flattening():
 
 def test_trakt_outcome_is_recorded_against_same_completion_event(tmp_path, monkeypatch):
     ledger = BacklogCleaner(tmp_path)
-    event_id = ledger.add(100, "Example", unique_event=True)
-    ledger.remove(event_id)
-    watcher = TraktSyncWatcher()
-    event = {
-        "event_id": event_id,
-        "kind": "movie",
-        "title": "Example",
-        "simkl_id": 100,
-        "watched_at": "2026-07-17T10:00:00Z",
-    }
+    accepted_id = ledger.add(100, "Accepted", unique_event=True)
+    newer_id = ledger.add(200, "Newer", unique_event=True)
+    ledger.remove(accepted_id)
+    ledger.remove(newer_id)
+
+    config_file = tmp_path / "trakt_config.json"
+    token_file = tmp_path / "trakt_token.json"
+    history_file = tmp_path / "watch_history.json"
+    config_file.write_text("{}", encoding="utf-8")
+    token_file.write_text("{}", encoding="utf-8")
+    history_file.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "movie",
+                    "title": "Accepted",
+                    "simkl_id": 100,
+                    "watch_events": [
+                        {
+                            "event_id": accepted_id,
+                            "watched_at": "2026-07-17T10:00:00Z",
+                        }
+                    ],
+                },
+                {
+                    "type": "movie",
+                    "title": "Newer",
+                    "simkl_id": 200,
+                    "watch_events": [
+                        {
+                            "event_id": newer_id,
+                            "watched_at": "2026-07-17T11:00:00Z",
+                        }
+                    ],
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    result = trakt_sync.SyncResult(
+        True,
+        "accepted",
+        pushed=True,
+        accepted_event_ids=(accepted_id,),
+    )
     monkeypatch.setattr(trakt_sync, "APP_DATA_DIR", tmp_path)
-    monkeypatch.setattr(watcher, "_latest_event", lambda: event)
-    watcher.set_result_callback(lambda result, latest_event: None)
+    monkeypatch.setattr(trakt_sync, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(trakt_sync, "TOKEN_FILE", token_file)
+    monkeypatch.setattr(trakt_sync, "HISTORY_FILE", history_file)
+    monkeypatch.setattr(trakt_sync, "sync_history", lambda: result)
 
-    watcher._emit_result(trakt_sync.SyncResult(True, "accepted"))
+    watcher = TraktSyncWatcher()
+    assert watcher.sync_now() == result
 
-    outcomes = BacklogCleaner(tmp_path).get_event(event_id)["provider_outcomes"]
-    assert outcomes[-1]["provider"] == "trakt"
-    assert outcomes[-1]["status"] == "accepted"
+    accepted_outcomes = BacklogCleaner(tmp_path).get_event(accepted_id)["provider_outcomes"]
+    newer_outcomes = BacklogCleaner(tmp_path).get_event(newer_id)["provider_outcomes"]
+    assert accepted_outcomes[-1]["provider"] == "trakt"
+    assert accepted_outcomes[-1]["status"] == "accepted"
+    assert newer_outcomes == []
+
+    watcher._record_trakt_outcomes(result)
+    accepted_outcomes = BacklogCleaner(tmp_path).get_event(accepted_id)[
+        "provider_outcomes"
+    ]
+    assert [outcome["provider"] for outcome in accepted_outcomes].count("trakt") == 1
+
+    receipts = []
+    watcher.set_result_callback(lambda sync_result, event: receipts.append((sync_result, event)))
+    watcher._emit_result(result)
+
+    assert receipts[0][0] == result
+    assert receipts[0][1]["event_id"] == accepted_id
 
 
 def test_repeated_trakt_retry_emits_receipt_only_when_outcome_changes(monkeypatch):
     watcher = TraktSyncWatcher()
     event = {
+        "event_id": "8ddf190c-57fd-48cb-838b-8457fd340b83",
         "kind": "episode",
         "title": "Example",
         "simkl_id": 100,
@@ -620,11 +806,26 @@ def test_repeated_trakt_retry_emits_receipt_only_when_outcome_changes(monkeypatc
     }
     receipts = []
 
-    monkeypatch.setattr(watcher, "_latest_event", lambda: event)
+    monkeypatch.setattr(trakt_sync, "load_json", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        trakt_sync,
+        "collect_history_events",
+        lambda *_args, **_kwargs: [event],
+    )
     watcher.set_result_callback(lambda result, latest_event: receipts.append((result, latest_event)))
 
-    pending = trakt_sync.SyncResult(False, "still pending", pending=1)
-    accepted = trakt_sync.SyncResult(True, "recovered")
+    pending = trakt_sync.SyncResult(
+        False,
+        "still pending",
+        pending=1,
+        pending_event_ids=(event["event_id"],),
+    )
+    accepted = trakt_sync.SyncResult(
+        True,
+        "recovered",
+        pushed=True,
+        accepted_event_ids=(event["event_id"],),
+    )
     watcher._emit_result(pending)
     watcher._emit_result(pending)
     watcher._emit_result(accepted)

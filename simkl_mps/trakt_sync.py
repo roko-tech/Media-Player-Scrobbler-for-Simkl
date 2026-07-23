@@ -56,6 +56,8 @@ class SyncResult:
     pushed: bool = False
     pending: int = 0
     retry_after: int = 0
+    accepted_event_ids: tuple = ()
+    pending_event_ids: tuple = ()
 
 
 def load_json(path: Path, default=None):
@@ -385,6 +387,17 @@ def _event_key(event):
     return "|".join(
         str(event.get(key) or "")
         for key in ("kind", "simkl_id", "season", "episode", "watched_at")
+    )
+
+
+def _event_ids(events):
+    """Return stable completion IDs without inventing identities for legacy events."""
+    return tuple(
+        dict.fromkeys(
+            str(event["event_id"])
+            for event in events
+            if event.get("event_id")
+        )
     )
 
 
@@ -751,7 +764,12 @@ def sync_history(since=None, dry_run=False):
         logger.warning(summary)
         state = load_state({}) or {}
         _record_health(state, summary, False, pending=len(unresolved))
-        return SyncResult(False, summary, pending=len(unresolved))
+        return SyncResult(
+            False,
+            summary,
+            pending=len(unresolved),
+            pending_event_ids=_event_ids(unresolved),
+        )
 
     try:
         config = trakt_config()
@@ -760,7 +778,12 @@ def sync_history(since=None, dry_run=False):
         logger.error("Trakt setup or authorization failed: %s", exc)
         summary = "Trakt setup or authorization failed. Open logs for details."
         _record_health(state, summary, False, pending=len(events))
-        return SyncResult(False, summary, pending=len(events))
+        return SyncResult(
+            False,
+            summary,
+            pending=len(events),
+            pending_event_ids=_event_ids(events),
+        )
 
     push_result = push_trakt(config, token, payload)
     if len(push_result) == 2:  # Compatibility for callers/tests using the old shape.
@@ -772,7 +795,12 @@ def sync_history(since=None, dry_run=False):
         summary = "Trakt push failed after retries; state was not advanced."
         logger.error(summary)
         _record_health(state, summary, False, pending=len(events))
-        return SyncResult(False, summary, pending=len(events))
+        return SyncResult(
+            False,
+            summary,
+            pending=len(events),
+            pending_event_ids=_event_ids(events),
+        )
 
     added = (body or {}).get("added", {})
     not_found = (body or {}).get("not_found", {})
@@ -807,10 +835,13 @@ def sync_history(since=None, dry_run=False):
             summary,
             pending=len(events),
             retry_after=retry_after,
+            pending_event_ids=_event_ids(events),
         )
 
     retry_events = unresolved + _not_found_events(events, not_found)
     retry_events = _deduplicate(retry_events)
+    retry_keys = {_event_key(event) for event in retry_events}
+    accepted_events = [event for event in events if _event_key(event) not in retry_keys]
     if not since:
         latest = max((parse_dt(event["watched_at"]) for event in new_events), default=marker)
         save_state({"synced_through": iso(max(marker, latest)), "pending": retry_events})
@@ -837,4 +868,6 @@ def sync_history(since=None, dry_run=False):
         summary,
         pushed=True,
         pending=len(retry_events),
+        accepted_event_ids=_event_ids(accepted_events),
+        pending_event_ids=_event_ids(retry_events),
     )

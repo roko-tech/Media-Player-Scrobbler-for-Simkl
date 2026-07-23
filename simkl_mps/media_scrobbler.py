@@ -103,6 +103,7 @@ class MediaScrobbler:
         self.last_progress_check = 0
         self.completion_threshold = get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
         self.completed = False
+        self.watched_at = None
         self.current_position_seconds = 0
         self.total_duration_seconds = None
         self.current_filepath = None # Store the last known filepath
@@ -664,15 +665,35 @@ class MediaScrobbler:
         )
 
     def set_credentials(self, client_id, access_token, account_type=None, settings_all=None):
-        """Set API credentials."""
+        """Set API credentials and retry events blocked by replaced credentials."""
+        credentials_changed = bool(
+            client_id
+            and access_token
+            and (client_id, access_token) != (self.client_id, self.access_token)
+        )
         self.client_id = client_id
         self.access_token = access_token
         if account_type:
             self._account_type = account_type.strip().lower() if isinstance(account_type, str) else account_type
         if settings_all is not None:
             self._account_settings_all = settings_all
+        if credentials_changed:
+            self._requeue_unauthorized_events()
         if not self._account_type and self.client_id and self.access_token and not self.testing_mode:
             self._refresh_account_type(force=True)
+
+    def _requeue_unauthorized_events(self):
+        requeued = self.backlog_cleaner.requeue_unauthorized()
+        if not requeued:
+            return []
+        logger.info(
+            "Requeued %d completion event(s) after Simkl credentials changed.",
+            len(requeued),
+        )
+        wakeup = getattr(self, "_backlog_wakeup", None)
+        if wakeup is not None:
+            wakeup.set()
+        return requeued
 
     def process_window(self, window_info, player_snapshot=None):
         """Process one player window from a single immutable player snapshot."""
@@ -789,6 +810,7 @@ class MediaScrobbler:
         self.state = PLAYING
         self.previous_state = STOPPED
         self.completed = False
+        self.watched_at = None
         self.current_position_seconds = 0
         self.total_duration_seconds = None
         self.estimated_duration = None
@@ -1216,6 +1238,7 @@ class MediaScrobbler:
         self.simkl_id = None
         self.movie_name = None
         self.completed = False # Reset completion for the next item
+        self.watched_at = None
         self.current_position_seconds = 0
         self.total_duration_seconds = None
         self.current_filepath = None
@@ -2244,6 +2267,7 @@ class MediaScrobbler:
             watched_at = getattr(self, 'watched_at', None)
             if not watched_at:
                 watched_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+                self.watched_at = watched_at
             backlog_data_payload['watched_at'] = watched_at
 
         item_key = self.backlog_cleaner.add(
@@ -2586,7 +2610,8 @@ class MediaScrobbler:
                     logger.info(f"[Backlog] Item '{display_title}' (Key: {item_key}) already being processed. Skipping.")
                     continue
                 self._processing_backlog_items.add(item_key)
-            
+
+            event_claimed = False
             try:
                 attempt_count = item_data.get("attempt_count", 0)
                 last_attempt_ts = item_data.get("last_attempt_timestamp")
@@ -2596,6 +2621,20 @@ class MediaScrobbler:
                     if current_time - last_attempt_ts < retry_delay:
                         logger.debug(f"[Backlog] Item '{display_title}' (Key: {item_key}) in retry cooldown. Skipping.")
                         continue
+
+                claim_event = getattr(self.backlog_cleaner, "claim_event", None)
+                if callable(claim_event):
+                    claim_owner = getattr(self, "_backlog_claim_owner", None)
+                    if not claim_owner:
+                        claim_owner = f"{os.getpid()}:{id(self)}"
+                        self._backlog_claim_owner = claim_owner
+                    if not claim_event(item_key, claim_owner):
+                        logger.debug(
+                            "[Backlog] Event %s is leased by another worker.",
+                            item_key,
+                        )
+                        continue
+                    event_claimed = True
 
                 if item_key in accepted_simkl_events:
                     attempted_this_cycle += 1
@@ -2730,11 +2769,17 @@ class MediaScrobbler:
 
                 sync_api_error = None
                 sync_retryable = True
+                credentials_used = (self.client_id, self.access_token)
                 try:
                     logger.info(f"[Backlog] Syncing '{title_to_sync}' (ID: {simkl_id_to_sync}, Type: {media_type_to_sync}) to Simkl.")
                     
                     # Retries preserve the original automatic-completion intent.
-                    sync_result = add_to_history(payload, self.client_id, self.access_token, allow_rewatch=False)
+                    sync_result = add_to_history(
+                        payload,
+                        credentials_used[0],
+                        credentials_used[1],
+                        allow_rewatch=False,
+                    )
                     outcome_saved = self._record_simkl_outcome(item_key, sync_result)
                     if self._simkl_history_result_accepted(sync_result):
                         logger.info(f"[Backlog] Successfully synced '{title_to_sync}' to Simkl.")
@@ -2838,6 +2883,8 @@ class MediaScrobbler:
                         })
                     else:
                         self.backlog_cleaner.fail(item_key, sync_api_error)
+                        if credentials_used != (self.client_id, self.access_token):
+                            self._requeue_unauthorized_events()
                     self._emit_completion_receipt(
                         item_key,
                         title_to_sync,
@@ -2852,6 +2899,11 @@ class MediaScrobbler:
                     failure_this_cycle = True
 
             finally:
+                if event_claimed:
+                    self.backlog_cleaner.release_event_claim(
+                        item_key,
+                        self._backlog_claim_owner,
+                    )
                 with self._processing_lock:
                     if item_key in self._processing_backlog_items:
                         self._processing_backlog_items.remove(item_key)
@@ -3059,13 +3111,14 @@ class MediaScrobbler:
     def stop_offline_sync_thread(self, timeout=2):
         """Stop and join the completion queue worker before deleting its store."""
         if not hasattr(self, "_backlog_stop"):
-            return
+            return True
         self._backlog_stop.set()
         if hasattr(self, "_backlog_wakeup"):
             self._backlog_wakeup.set()
         worker = getattr(self, "_offline_sync_thread", None)
         if worker and worker.is_alive() and worker is not threading.current_thread():
             worker.join(timeout=timeout)
+        return not worker or not worker.is_alive()
 
     def cache_media_info(self, original_title_key, simkl_id, display_name, media_type='movie',
                          season=None, episode=None, year=None, runtime_minutes=None,

@@ -36,6 +36,7 @@ from simkl_mps.main import APP_DATA_DIR, APP_NAME
 # Import settings functions
 from simkl_mps.config_manager import get_setting, set_setting, DEFAULT_THRESHOLD
 from simkl_mps.app_paths import AppPathManifest
+from simkl_mps.media_identity import cache_key_for_media
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
 
     def _show_info_dialog(self, title, message):
         """Display an informational dialog and wait for the user to dismiss it."""
+        result = [False]
         try:
 
             def show_dialog():
@@ -219,6 +221,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                     root.lift()
                     root.focus_force()
                     messagebox.showinfo(title, message, parent=root)
+                    result[0] = True
                     root.destroy()
                 except Exception as dialog_err:
                     logger.error(f"Error showing info dialog: {dialog_err}")
@@ -228,6 +231,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             thread.join()
         except Exception as e:
             logger.error(f"Error launching info dialog: {e}")
+        return result[0]
 
 
     def __init__(self):
@@ -869,19 +873,24 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         )
 
     def show_setup_health(self, _=None, first_run=False):
-        self._show_info_dialog(
+        return bool(self._show_info_dialog(
             "First-Run Setup" if first_run else "Setup & Health",
             self._build_setup_health_text(first_run=first_run),
-        )
-        return 0
+        ))
+
+    def _mark_first_run_complete(self):
+        """Persist first-run completion in a platform-specific implementation."""
+        return True
 
     def _show_first_run_setup_if_needed(self):
         if not self.is_first_run:
-            return 0
-        try:
-            return self.show_setup_health(first_run=True)
-        finally:
-            self.is_first_run = False
+            return False
+        if not self.show_setup_health(first_run=True):
+            return False
+        if not self._mark_first_run_complete():
+            return False
+        self.is_first_run = False
+        return True
 
     def _copy_text_to_clipboard(self, text):
         def copy_with_root(root):
@@ -974,6 +983,15 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         webbrowser.open("https://trakt.tv/")
         return 0
 
+    def _cleanup_failed_monitoring_start(self):
+        if not self.scrobbler:
+            return False
+        try:
+            return self.scrobbler.stop() is False
+        except Exception:
+            logger.exception("Failed to clean up runtime after tray startup error.")
+            return True
+
     def start_monitoring(self, _=None):
         """Start the scrobbler monitoring"""
         # Check if this is a manual start (from the menu) vs. autostart
@@ -1033,7 +1051,9 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                     logger.info("Monitoring started from tray")
                     return True
                 else:
-                    self.monitoring_active = False
+                    self.monitoring_active = (
+                        self._cleanup_failed_monitoring_start()
+                    )
                     self.update_status("error", "Failed to start")
                     self.show_notification(
                         "simkl-mps Error",
@@ -1042,13 +1062,16 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                     logger.error("Failed to start monitoring from tray app")
                     return False
             except Exception as e:
-                self.monitoring_active = False
+                self.monitoring_active = self._cleanup_failed_monitoring_start()
                 self.update_status("error", str(e))
                 logger.exception("Exception during start_monitoring in tray app")
-                self.show_notification(
-                    "simkl-mps Error",
-                    f"Error starting monitoring: {e}"
-                )
+                try:
+                    self.show_notification(
+                        "simkl-mps Error",
+                        f"Error starting monitoring: {e}"
+                    )
+                except Exception:
+                    logger.exception("Could not display tray startup error.")
                 return False
         return True
 
@@ -1058,7 +1081,13 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             logger.info("Stop monitoring requested from tray.")
             # Ensure scrobbler exists before trying to stop
             if self.scrobbler:
-                self.scrobbler.stop()
+                if self.scrobbler.stop() is False:
+                    logger.error("Monitoring workers did not stop before the timeout.")
+                    self.show_notification(
+                        "simkl-mps Error",
+                        "Monitoring could not stop cleanly. Check the logs and try again.",
+                    )
+                    return False
             else:
                 logger.warning("Stop monitoring called, but scrobbler instance is None.")
             self.monitoring_active = False
@@ -1524,10 +1553,20 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             logger.info("Clear all data cancelled by user")
             return 0
 
+        should_exit = False
         try:
             if self.scrobbler and hasattr(self.scrobbler, 'stop'):
-                self.scrobbler.stop()
+                if self.scrobbler.stop() is False:
+                    logger.error(
+                        "Clear all data aborted because application workers are still alive."
+                    )
+                    self.show_notification(
+                        "simkl-mps Error",
+                        "Could not stop all background workers. No application data was removed.",
+                    )
+                    return 0
 
+            should_exit = True
             result = AppPathManifest(APP_DATA_DIR).purge()
 
             media_scrobbler = self._get_media_scrobbler()
@@ -1569,7 +1608,8 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                 f"Failed to clear all data: {exc}",
             )
         finally:
-            self.exit_app()
+            if should_exit:
+                self.exit_app()
         return 0
 
     def _set_current_media_override(self, scope):
@@ -1715,12 +1755,10 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             
             # Add filepath-based cache key if available
             if current_filepath:
-                filepath_cache_key = os.path.basename(current_filepath).lower()
-                cache_keys_to_clear.append(filepath_cache_key)
+                cache_keys_to_clear.append(cache_key_for_media(current_filepath))
                 
             # Add title-based cache key
-            title_cache_key = current_title.lower()
-            cache_keys_to_clear.append(title_cache_key)
+            cache_keys_to_clear.append(cache_key_for_media(title=current_title))
               # Clear cache entries for this media
             cleared_entries = 0
             if hasattr(actual_scrobbler, 'media_cache'):

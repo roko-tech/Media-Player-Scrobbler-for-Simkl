@@ -15,11 +15,16 @@ permissions:
   contents: write
   id-token: write  
 
+concurrency:
+  group: release-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   prepare-release:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get_version.outputs.version }}
+      source_sha: ${{ steps.verify_release_ref.outputs.source_sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -28,29 +33,65 @@ jobs:
 
       - name: Determine version
         id: get_version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
         run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_type }}" == "tag" ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          elif [[ "${{ github.event_name }}" == "release" ]]; then
+          if [[ "$EVENT_NAME" == "push" && "$REF_TYPE" == "tag" ]]; then
             VERSION=${GITHUB_REF#refs/tags/v}
           else
-            VERSION=${{ github.event.inputs.version }}
+            VERSION="$DISPATCH_VERSION"
           fi
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          if [ -z "$VERSION" ] || [[ "$VERSION" == *$'\n'* ]] || [[ "$VERSION" == *$'\r'* ]]; then
+            echo "::error::Release version must be a non-empty single-line value."
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Using version: $VERSION"
+
+      - name: Verify immutable release tag and source
+        id: verify_release_ref
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.get_version.outputs.version }}
+          WORKFLOW_REF: ${{ github.ref }}
+          TRIGGER_SHA: ${{ github.sha }}
+        run: |
+          TAG_NAME="v$RELEASE_VERSION"
+          EXPECTED_REF="refs/tags/$TAG_NAME"
+
+          if [ "$WORKFLOW_REF" != "$EXPECTED_REF" ]; then
+            echo "::error::Release builds must run from the existing tag $TAG_NAME. For a manual run, select that tag as the workflow ref."
+            exit 1
+          fi
+
+          git fetch --force origin "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
+          TAG_SHA=$(git rev-parse "refs/tags/$TAG_NAME^{commit}")
+          CHECKED_OUT_SHA=$(git rev-parse HEAD)
+
+          if [ "$TAG_SHA" != "$CHECKED_OUT_SHA" ] || [ "$TAG_SHA" != "$TRIGGER_SHA" ]; then
+            echo "::error::Tag $TAG_NAME, the checked-out commit, and github.sha do not match."
+            exit 1
+          fi
+
+          echo "source_sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
+          echo "Verified $TAG_NAME at immutable source commit $TAG_SHA"
 
   build-verification:
     needs: prepare-release
     uses: ./.github/workflows/build-verification.yml
     with:
       version: ${{ needs.prepare-release.outputs.version }}
+      source_sha: ${{ needs.prepare-release.outputs.source_sha }}
 
   build-python-package:
     needs: prepare-release
     uses: ./.github/workflows/publish-pypi.yml
     with:
       version: ${{ needs.prepare-release.outputs.version }}
+      source_sha: ${{ needs.prepare-release.outputs.source_sha }}
       build: true
       publish: false
     secrets:
@@ -61,6 +102,7 @@ jobs:
     uses: ./.github/workflows/windows-build.yml
     with:
       version: ${{ needs.prepare-release.outputs.version }}
+      source_sha: ${{ needs.prepare-release.outputs.source_sha }}
     secrets:
       SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
 
@@ -69,6 +111,7 @@ jobs:
     uses: ./.github/workflows/create-release.yml
     with:
       version: ${{ needs.prepare-release.outputs.version }}
+      source_sha: ${{ needs.prepare-release.outputs.source_sha }}
     secrets:
       RELEASE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -77,6 +120,7 @@ jobs:
     uses: ./.github/workflows/publish-pypi.yml
     with:
       version: ${{ needs.prepare-release.outputs.version }}
+      source_sha: ${{ needs.prepare-release.outputs.source_sha }}
       build: false
       publish: true
     secrets:
@@ -86,14 +130,92 @@ jobs:
     needs: [prepare-release, create-github-release, publish-pypi]
     runs-on: ubuntu-latest
     steps:
-      - name: Publish fully assembled release
+      - name: Checkout verified release source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare-release.outputs.source_sha }}
+
+      - name: Download expected Windows installer
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-installer
+          path: expected-installer
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Reverify and publish fully assembled release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
           TAG_NAME: v${{ needs.prepare-release.outputs.version }}
         run: |
-          IS_DRAFT=$(gh release view "$TAG_NAME" --repo "${{ github.repository }}" --json isDraft --jq .isDraft)
+          set -euo pipefail
+
+          git fetch --force origin "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
+          TAG_SHA=$(git rev-parse "refs/tags/$TAG_NAME^{commit}")
+          if [ "$TAG_SHA" != "$SOURCE_SHA" ] || [ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]; then
+            echo "::error::Release tag moved after the build; refusing publication."
+            exit 1
+          fi
+
+          mapfile -t EXPECTED_INSTALLERS < <(find expected-installer -type f -name '*.exe' -print)
+          if [ "${#EXPECTED_INSTALLERS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one Windows installer artifact, found ${#EXPECTED_INSTALLERS[@]}."
+            exit 1
+          fi
+          EXPECTED_INSTALLER="${EXPECTED_INSTALLERS[0]}"
+          INSTALLER_FILENAME=$(basename "$EXPECTED_INSTALLER")
+          BUNDLE_FILENAME="${INSTALLER_FILENAME}.sigstore.bundle"
+          CERT_IDENTITY="https://github.com/$REPOSITORY/.github/workflows/create-release.yml@refs/tags/$TAG_NAME"
+          CERT_ISSUER="https://token.actions.githubusercontent.com"
+
+          IS_DRAFT=$(gh release view "$TAG_NAME" --repo "$REPOSITORY" --json isDraft --jq .isDraft)
           if [ "$IS_DRAFT" != "true" ]; then
             echo "::error::Release $TAG_NAME is not a draft; refusing an ambiguous promotion."
             exit 1
           fi
-          gh release edit "$TAG_NAME" --repo "${{ github.repository }}" --draft=false
+
+          VERIFY_DIR=$(mktemp -d)
+          gh release download "$TAG_NAME" \
+            --repo "$REPOSITORY" \
+            --dir "$VERIFY_DIR" \
+            --pattern "$INSTALLER_FILENAME" \
+            --pattern "$BUNDLE_FILENAME" \
+            --pattern "verify.md"
+
+          if ! cmp --silent "$EXPECTED_INSTALLER" "$VERIFY_DIR/$INSTALLER_FILENAME"; then
+            echo "::error::Draft release installer differs from this run's verified build artifact."
+            exit 1
+          fi
+          cosign verify-blob \
+            --bundle "$VERIFY_DIR/$BUNDLE_FILENAME" \
+            --certificate-identity "$CERT_IDENTITY" \
+            --certificate-oidc-issuer "$CERT_ISSUER" \
+            "$VERIFY_DIR/$INSTALLER_FILENAME"
+
+          EXPECTED_HASH=$(sha256sum "$EXPECTED_INSTALLER" | awk '{print $1}')
+          EXPECTED_ROW=$(printf '| `%s` | `%s`' "$INSTALLER_FILENAME" "$EXPECTED_HASH")
+          RELEASE_BODY=$(gh release view "$TAG_NAME" --repo "$REPOSITORY" --json body --jq .body)
+          if ! grep -Fq "<!-- simkl-mps-source-sha:$SOURCE_SHA -->" <<< "$RELEASE_BODY"; then
+            echo "::error::Draft release notes are not bound to the verified source SHA."
+            exit 1
+          fi
+          if ! grep -Fq "$EXPECTED_ROW" <<< "$RELEASE_BODY"; then
+            echo "::error::Draft release notes do not contain the verified installer checksum."
+            exit 1
+          fi
+          if ! grep -Fq -- "--certificate-identity \"$CERT_IDENTITY\"" "$VERIFY_DIR/verify.md" ||
+             ! grep -Fq -- "--certificate-oidc-issuer \"$CERT_ISSUER\"" "$VERIFY_DIR/verify.md"; then
+            echo "::error::Draft verification guide is not bound to the expected signer."
+            exit 1
+          fi
+
+          IS_DRAFT=$(gh release view "$TAG_NAME" --repo "$REPOSITORY" --json isDraft --jq .isDraft)
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::Release $TAG_NAME changed state during final verification."
+            exit 1
+          fi
+          gh release edit "$TAG_NAME" --repo "$REPOSITORY" --draft=false
