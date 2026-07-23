@@ -436,3 +436,22 @@ def test_pyinstaller_build_does_not_kill_running_user_processes():
     spec = (REPO_ROOT / "simkl-mps.spec").read_text(encoding="utf-8")
 
     assert "taskkill" not in spec.lower()
+
+
+def test_windows_release_build_isolates_poetry_from_synced_environment():
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "windows-build.yml"
+    ).read_text(encoding="utf-8")
+
+    assert 'POETRY_VIRTUALENVS_IN_PROJECT: "true"' in workflow
+    assert 'python -m pip install "poetry==2.4.1"' in workflow
+    assert "poetry config virtualenvs.create false" not in workflow
+    assert "poetry install --no-interaction --sync" not in workflow
+    assert "poetry sync --no-interaction" in workflow
+    assert "pip install pyinstaller" not in workflow
+    assert (
+        'poetry run python scripts/validate_release_version.py "$env:RELEASE_VERSION"'
+        in workflow
+    )
+    assert "poetry run python -m PyInstaller --clean simkl-mps.spec" in workflow
+    assert "poetry run python test_build.py windows" in workflow

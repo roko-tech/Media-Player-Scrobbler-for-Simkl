@@ -4,7 +4,7 @@
 #define MyAppURL "https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl"
 #define MyAppExeName "MPSS"
 #define MyAppTrayName "MPS for Simkl"
-#define MyAppVersion "2.5.0"
+#define MyAppVersion "2.5.1"
 #define MyAppDescription "Automatically track and scrobble media you watch to SIMKL"
 #define MyAppCopyright "Copyright (C) 2025 kavin"
 #define MyAppUpdateURL "https://github.com/roko-tech/Media-Player-Scrobbler-for-Simkl/releases"
