@@ -36,7 +36,7 @@ def test_package_import_is_passive(tmp_path):
         [
             sys.executable,
             "-c",
-            "import simkl_mps; assert simkl_mps.__version__ == '2.4.1'",
+            "import simkl_mps; assert simkl_mps.__version__ == '2.5.0'",
         ],
         cwd=tmp_path,
         env=_profile_environment(profile),
