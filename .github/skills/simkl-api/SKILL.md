@@ -1,6 +1,6 @@
 ---
 name: simkl-api
-description: "Use when: implementing, debugging, or extending features that interact with the Simkl API. Provides a step-by-step workflow for authentication, searching, scrobbling, and syncing media data."
+description: "Use when: implementing, debugging, or extending features that interact with the Simkl API. Provides the endpoint, authentication, scrobbling, and sync reference for this project."
 ---
 
 # Simkl API Implementation Skill
@@ -34,39 +34,38 @@ Choose the flow based on the client type:
 
 ---
 
-## Implementation Workflow
+## Implementation Reference
 
-Follow these steps when adding a new Simkl API feature:
+Resolve authentication before building requests; the rest is reference by topic.
 
-### Step 1: Define the Goal & Endpoint
-Identify the required action and find the corresponding endpoint in the API reference:
+### Endpoints
 - **Search**: `/search/file` (for filenames) or `/search/{type}` (text).
 - **Scrobble**: `/scrobble/start`, `/scrobble/pause`, `/scrobble/stop`.
 - **Sync**: `/sync/history` (mark watched), `/sync/add-to-list` (watchlist status).
 - **Details**: `/tv/{id}`, `/anime/{id}`, `/movies/{id}`.
 
-### Step 2: Handle Authentication
+### Authentication
 Ensure the `access_token` is valid. If implementing a new auth flow:
 1. Generate the authorization URL (with `client_id`, `redirect_uri`, etc.).
 2. Handle the redirect/callback to obtain the `code`.
 3. Exchange the `code` for an `access_token` via `POST /oauth/token`.
 
-### Step 3: Construct the Request
+### Request Shape
 Build the request following the "Connection Basics" above. 
 - **Example URL**: `https://api.simkl.com/sync/activities?client_id=XYZ&app-name=mps&app-version=1.0`
 - **Example Header**: `Authorization: Bearer <token>`
 
-### Step 4: Implement Media Resolution
+### Media Resolution
 If you have a filename or external ID:
 1. Use `/search/file` to get a Simkl ID.
 2. If you have an IMDb/TMDB ID, use `/redirect` to resolve it to a Simkl ID.
 3. Use the resolved ID for all subsequent scrobble/sync calls.
 
-### Step 5: Implement the Action
+### Scrobbling and Sync
 - **For Scrobbling**: Implement the state machine (Playing $\rightarrow$ Paused $\rightarrow$ Stopped).
 - **For Syncing**: Map local status (e.g., "Completed") to Simkl status (`completed`, `watching`, `plantowatch`, `hold`, `dropped`).
 
-### Step 6: Validation & Error Handling
+### Errors and Validation
 - **Rate Limits**: Handle `429 Too Many Requests` with exponential backoff.
 - **Auth Errors**: Handle `401 Unauthorized` by triggering the re-authentication flow.
 - **Data Validation**: Verify that the response JSON matches the expected shape for the specific media type (Movie vs TV vs Anime).

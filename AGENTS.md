@@ -10,7 +10,7 @@ Core quick-start
 Important locations
 - **Source:** `simkl_mps/` — main application modules (monitoring, scrobbling, players).
 - **Players:** `simkl_mps/players/` — per-player integrations; follow the `get_position_duration()` interface.
-- **Simkl API:** `simkl_mps/simkl_api.py` and docs at `simklapi.txt`.
+- **Simkl API:** `simkl_mps/simkl_api.py` (the client) and the `simkl-api` skill (endpoint reference).
 - **Docs & guides:** `docs/` (platform guides, configuration, troubleshooting).
 
 Agent-specific files
@@ -22,9 +22,3 @@ Agent best practices
 - **Link, don't duplicate:** Refer to `docs/` or existing files for details; include only the minimal facts an agent needs.
 - **Use skills:** The `simkl-api` skill contains the canonical API checklist — invoke it for API work.
 - **Run tests early:** Use `poetry run pytest` before proposing code changes that modify behavior.
-
-Suggested next customizations
-- Create a small `agent` that can run build+tests and open failing test traces.
-- Add a `quickstart.agent.md` with platform-specific run steps for Windows (most contributors use Windows).
-
-If you'd like, I can create the suggested agent files next.
